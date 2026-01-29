@@ -5,7 +5,8 @@ import 'dart:typed_data';
 // Or maybe higher precision for the DDA.
 // SubPolygon.h mentiones FIXED_POINT_SHIFT which is likely 8 or 16.
 
-const int fixedPointShift = 12; // 12 bits for fraction is usually good for rasterization
+const int fixedPointShift =
+    12; // 12 bits for fraction is usually good for rasterization
 const int fixedPointScale = 1 << fixedPointShift;
 const int fixedPointMask = fixedPointScale - 1;
 

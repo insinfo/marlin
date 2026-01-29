@@ -1,6 +1,8 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import '../lib/src/edge_flag/rasterizer.dart';
+
 const int W = 512;
 const int H = 512;
 
@@ -18,6 +20,11 @@ void main() {
     _Raster('scanline_analytic (Skia-like mask)', rasterScanlineAnalytic),
     _Raster('aet_sub4 (Marlin-like)', rasterAetSub4),
     _Raster('edge_flag_sub4 (Kallio-like PoC)', rasterEdgeFlagSub4),
+    // Updated Implementations
+    _Raster('SLEFA 8x (EvenOdd)', (p, w, h, o) => rasterSlefa(p, w, h, o, 8, FillRule.evenOdd)),
+    _Raster('SLEFA 8x (NonZero)', (p, w, h, o) => rasterSlefa(p, w, h, o, 8, FillRule.nonZero)),
+    _Raster('SLEFA 16x (EvenOdd)', (p, w, h, o) => rasterSlefa(p, w, h, o, 16, FillRule.evenOdd)),
+    _Raster('SLEFA 32x (EvenOdd)', (p, w, h, o) => rasterSlefa(p, w, h, o, 32, FillRule.evenOdd)),
   ];
 
   // Warmup
@@ -432,6 +439,20 @@ int rasterEdgeFlagSub4(List<math.Point<double>> poly, int w, int h, Uint8List ou
       }
     }
   }
+
+  return _checksum(out);
+}
+
+
+int rasterSlefa(List<math.Point<double>> poly, int w, int h, Uint8List out, int samples, FillRule rule) {
+  final vertices = Float64List(poly.length * 2);
+  for (int i = 0; i < poly.length; i++) {
+    vertices[i * 2] = poly[i].x;
+    vertices[i * 2 + 1] = poly[i].y;
+  }
+
+  final rasterizer = ScanlineEdgeFlagRasterizer(w, h, samples: samples);
+  rasterizer.rasterize(vertices, rule, outputBuffer: out);
 
   return _checksum(out);
 }
