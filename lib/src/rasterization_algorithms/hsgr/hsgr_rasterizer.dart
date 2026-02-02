@@ -1,113 +1,25 @@
 /// ============================================================================
-/// HSGR — Hilbert-Space Guided Rasterization
+/// HSGR — Hilbert-Space Guided Rasterization (versão otimizada)
 /// ============================================================================
 ///
-/// Percorre pixels em ordem Hilbert para maior localidade de cache.
-/// Para AA: usa distâncias assinadas às arestas e mistura racional.
-///
-/// Inclui:
-/// - drawTriangle()
-/// - drawPolygon() com triangulação (ear clipping) para polígonos simples
-///
+/// Otimizações principais:
+/// - Hilbert em *tiles* (ex.: 32x32) para evitar varrer bbox padded gigante.
+/// - Path Hilbert pré-computado/cacheado (sem `sync*`/List por pixel).
+/// - Atualização incremental das arestas por 4 direções (R/L/D/U).
+/// - Culling por tile (fora / totalmente dentro).
+/// - AA barato por distância assinada mínima às arestas:
+///   alpha = clamp(minDist + 0.5, 0..1)
 /// ============================================================================
 
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-/// Função de borda incremental (Ax + By + C)
-class EdgeFunction {
-  final double a, b, c;
-  final double deltaX;
-  final double deltaY;
-  final double normalLength;
+@pragma('vm:prefer-inline')
+double _cross2(double ax, double ay, double bx, double by) => ax * by - ay * bx;
 
-  EdgeFunction._(this.a, this.b, this.c)
-      : deltaX = a,
-        deltaY = b,
-        normalLength = math.sqrt(a * a + b * b);
-
-  factory EdgeFunction.fromPoints(double x1, double y1, double x2, double y2) {
-    // edge(x,y) = (y1 - y2)x + (x2 - x1)y + (x1*y2 - x2*y1)
-    final a = (y1 - y2);
-    final b = (x2 - x1);
-    final c = (x1 * y2 - x2 * y1);
-    return EdgeFunction._(a, b, c);
-  }
-
-  double evaluate(double x, double y) => a * x + b * y + c;
-}
-
-/// Curva de Hilbert (ordem N => size = 2^N)
-class HilbertCurve {
-  final int order;
-  final int size;
-
-  HilbertCurve(this.order) : size = 1 << order;
-
-  /// Itera todos os pontos (x,y) em [0..size) em ordem Hilbert.
-  /// Implementação via mapeamento índice->(x,y) (d2xy), sem recursão.
-  Iterable<List<int>> points() sync* {
-    final n = size;
-    final total = n * n;
-    for (int d = 0; d < total; d++) {
-      yield _d2xy(n, d);
-    }
-  }
-
-  static List<int> _d2xy(int n, int d) {
-    int t = d;
-    int x = 0;
-    int y = 0;
-
-    for (int s = 1; s < n; s <<= 1) {
-      final rx = 1 & (t >> 1);
-      final ry = 1 & (t ^ rx);
-
-      final rotated = _rot(s, x, y, rx, ry);
-      x = rotated[0];
-      y = rotated[1];
-
-      x += s * rx;
-      y += s * ry;
-
-      t >>= 2;
-    }
-
-    return [x, y];
-  }
-
-  static List<int> _rot(int s, int x, int y, int rx, int ry) {
-    if (ry == 0) {
-      if (rx == 1) {
-        x = s - 1 - x;
-        y = s - 1 - y;
-      }
-      // swap x,y
-      final t = x;
-      x = y;
-      y = t;
-    }
-    return [x, y];
-  }
-}
-
-/// Função de cobertura racional
-double computeRationalCoverage(
-  List<double> signedDistances, {
-  double k = 2.0,
-  double m = 2.0,
-}) {
-  double coverage = 1.0;
-
-  for (final d in signedDistances) {
-    final absD = d.abs().clamp(0.0, 10.0);
-    final kd = k * absD;
-    final kdm = math.pow(kd, m);
-    final weight = 1.0 / (1.0 + kdm);
-    coverage *= weight;
-  }
-
-  return coverage;
+@pragma('vm:prefer-inline')
+double _triArea2(double x1, double y1, double x2, double y2, double x3, double y3) {
+  return _cross2(x2 - x1, y2 - y1, x3 - x1, y3 - y1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +32,7 @@ class _P {
   const _P(this.x, this.y);
 }
 
+@pragma('vm:prefer-inline')
 double _cross(_P a, _P b, _P c) {
   final abx = b.x - a.x;
   final aby = b.y - a.y;
@@ -136,6 +49,7 @@ double _signedArea(List<_P> pts) {
   return s * 0.5;
 }
 
+@pragma('vm:prefer-inline')
 bool _pointInTriangle(_P p, _P a, _P b, _P c) {
   final s1 = _cross(a, b, p);
   final s2 = _cross(b, c, p);
@@ -162,12 +76,11 @@ List<List<double>> _triangulateEarClipping(List<double> vertices) {
       pts.removeLast();
     }
   }
-
   if (pts.length < 3) return const [];
 
   // garantir CCW
   if (_signedArea(pts) < 0) {
-    pts = pts.reversed.toList(); // <- correção: não existe pts.reverse()
+    pts = pts.reversed.toList();
   }
 
   final idx = List<int>.generate(pts.length, (i) => i);
@@ -191,7 +104,6 @@ List<List<double>> _triangulateEarClipping(List<double> vertices) {
       // convexidade (para CCW deve ser > 0)
       final crossVal = (pNext.x - pCurr.x) * (pPrev.y - pCurr.y) -
           (pNext.y - pCurr.y) * (pPrev.x - pCurr.x);
-
       if (crossVal <= eps) continue;
 
       bool hasPointInside = false;
@@ -240,6 +152,83 @@ List<List<double>> _triangulateEarClipping(List<double> vertices) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HILBERT PATH (cacheado) — TILE ORDER
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _HilbertPathCache {
+  static final Map<int, Uint32List> _cache = <int, Uint32List>{};
+
+  /// Retorna uma lista com (x | (y<<16) | (dir<<30)).
+  /// dir: 0=right, 1=left, 2=down, 3=up (dir do ponto anterior -> atual).
+  static Uint32List getPath(int order) {
+    return _cache.putIfAbsent(order, () => _build(order));
+  }
+
+  static Uint32List _build(int order) {
+    final n = 1 << order;
+    final total = n * n;
+    final out = Uint32List(total);
+
+    int prevX = 0;
+    int prevY = 0;
+
+    for (int d = 0; d < total; d++) {
+      final packedXY = _d2xyPacked(n, d);
+      final x = packedXY & 0xFFFF;
+      final y = (packedXY >> 16) & 0xFFFF;
+
+      int dir = 0;
+      if (d != 0) {
+        if (x == prevX + 1) {
+          dir = 0; // right
+        } else if (x == prevX - 1) {
+          dir = 1; // left
+        } else if (y == prevY + 1) {
+          dir = 2; // down
+        } else {
+          dir = 3; // up
+        }
+      }
+
+      out[d] = packedXY | (dir << 30);
+      prevX = x;
+      prevY = y;
+    }
+
+    return out;
+  }
+
+  @pragma('vm:prefer-inline')
+  static int _d2xyPacked(int n, int d) {
+    int t = d;
+    int x = 0;
+    int y = 0;
+
+    for (int s = 1; s < n; s <<= 1) {
+      final rx = 1 & (t >> 1);
+      final ry = 1 & (t ^ rx);
+
+      // rot
+      if (ry == 0) {
+        if (rx == 1) {
+          x = s - 1 - x;
+          y = s - 1 - y;
+        }
+        final tmp = x;
+        x = y;
+        y = tmp;
+      }
+
+      x += s * rx;
+      y += s * ry;
+      t >>= 2;
+    }
+
+    return (x & 0xFFFF) | ((y & 0xFFFF) << 16);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RASTERIZADOR HSGR
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -249,7 +238,14 @@ class HSGRRasterizer {
 
   late final Uint32List _buffer;
 
-  HSGRRasterizer({required this.width, required this.height}) {
+  /// tileOrder padrão: 5 => 32x32.
+  final int tileOrder;
+
+  HSGRRasterizer({
+    required this.width,
+    required this.height,
+    this.tileOrder = 5,
+  }) {
     _buffer = Uint32List(width * height);
   }
 
@@ -259,7 +255,6 @@ class HSGRRasterizer {
 
   Uint32List get buffer => _buffer;
 
-  /// Desenha um polígono via triangulação (ear clipping).
   void drawPolygon(List<double> vertices, int color) {
     if (vertices.length < 6) return;
 
@@ -284,118 +279,169 @@ class HSGRRasterizer {
     }
   }
 
-  /// Desenha um triângulo usando traversal Hilbert
   void drawTriangle(
     double x1, double y1,
     double x2, double y2,
     double x3, double y3,
     int color,
   ) {
-    final minX = math.min(x1, math.min(x2, x3)).floor().clamp(0, width - 1);
-    final maxX = math.max(x1, math.max(x2, x3)).ceil().clamp(0, width - 1);
-    final minY = math.min(y1, math.min(y2, y3)).floor().clamp(0, height - 1);
-    final maxY = math.max(y1, math.max(y2, y3)).ceil().clamp(0, height - 1);
+    final area2 = _triArea2(x1, y1, x2, y2, x3, y3);
+    if (area2.abs() < 1e-9) return;
 
-    final bboxWidth = maxX - minX + 1;
-    final bboxHeight = maxY - minY + 1;
-    final bboxSize = math.max(bboxWidth, bboxHeight);
+    // CCW
+    if (area2 < 0) {
+      final tx = x2; final ty = y2;
+      x2 = x3; y2 = y3;
+      x3 = tx; y3 = ty;
+    }
 
-    // order = ceil(log2(bboxSize))
-    final order =
-        (math.log(bboxSize) / math.ln2).ceil().clamp(1, 10);
-    final hilbert = HilbertCurve(order);
+    final minX = math.min(x1, math.min(x2, x3)).floor();
+    final maxX = math.max(x1, math.max(x2, x3)).ceil();
+    final minY = math.min(y1, math.min(y2, y3)).floor();
+    final maxY = math.max(y1, math.max(y2, y3)).ceil();
 
-    final edges = [
-      EdgeFunction.fromPoints(x1, y1, x2, y2),
-      EdgeFunction.fromPoints(x2, y2, x3, y3),
-      EdgeFunction.fromPoints(x3, y3, x1, y1),
-    ];
+    final cMinX = minX < 0 ? 0 : (minX >= width ? width - 1 : minX);
+    final cMaxX = maxX < 0 ? 0 : (maxX >= width ? width - 1 : maxX);
+    final cMinY = minY < 0 ? 0 : (minY >= height ? height - 1 : minY);
+    final cMaxY = maxY < 0 ? 0 : (maxY >= height ? height - 1 : maxY);
 
-    final normalLengths = edges.map((e) => e.normalLength).toList();
+    if (cMinX > cMaxX || cMinY > cMaxY) return;
 
-    var prevX = -1, prevY = -1;
-    final edgeValues = [0.0, 0.0, 0.0];
+    // Edge f = a*x + b*y + c (no centro do pixel)
+    final a0 = (y1 - y2), b0 = (x2 - x1), c0 = (x1 * y2 - x2 * y1);
+    final a1 = (y2 - y3), b1 = (x3 - x2), c1 = (x2 * y3 - x3 * y2);
+    final a2 = (y3 - y1), b2 = (x1 - x3), c2 = (x3 * y1 - x1 * y3);
 
-    for (final coords in hilbert.points()) {
-      final localX = coords[0];
-      final localY = coords[1];
+    final invLen0 = 1.0 / math.sqrt(a0 * a0 + b0 * b0);
+    final invLen1 = 1.0 / math.sqrt(a1 * a1 + b1 * b1);
+    final invLen2 = 1.0 / math.sqrt(a2 * a2 + b2 * b2);
 
-      final globalX = minX + localX;
-      final globalY = minY + localY;
+    final tOrder = tileOrder.clamp(1, 10);
+    final tSize = 1 << tOrder;
+    final path = _HilbertPathCache.getPath(tOrder);
 
-      if (globalX > maxX || globalY > maxY) continue;
+    for (int ty = cMinY; ty <= cMaxY; ty += tSize) {
+      final tileH = math.min(tSize, cMaxY - ty + 1);
 
-      final px = globalX + 0.5;
-      final py = globalY + 0.5;
+      for (int tx = cMinX; tx <= cMaxX; tx += tSize) {
+        final tileW = math.min(tSize, cMaxX - tx + 1);
 
-      if (prevX >= 0) {
-        final dx = globalX - prevX;
-        final dy = globalY - prevY;
+        // corners (centro do pixel do canto)
+        final xL = tx + 0.5;
+        final xR = (tx + tileW - 1) + 0.5;
+        final yT = ty + 0.5;
+        final yB = (ty + tileH - 1) + 0.5;
 
-        for (int e = 0; e < 3; e++) {
-          edgeValues[e] += edges[e].deltaX * dx + edges[e].deltaY * dy;
-        }
-      } else {
-        for (int e = 0; e < 3; e++) {
-          edgeValues[e] = edges[e].evaluate(px, py);
-        }
-      }
+        // AB
+        final f0_00 = a0 * xL + b0 * yT + c0;
+        final f0_10 = a0 * xR + b0 * yT + c0;
+        final f0_01 = a0 * xL + b0 * yB + c0;
+        final f0_11 = a0 * xR + b0 * yB + c0;
+        final f0min = math.min(math.min(f0_00, f0_10), math.min(f0_01, f0_11));
+        final f0max = math.max(math.max(f0_00, f0_10), math.max(f0_01, f0_11));
+        if (f0max < 0) continue;
 
-      prevX = globalX;
-      prevY = globalY;
+        // BC
+        final f1_00 = a1 * xL + b1 * yT + c1;
+        final f1_10 = a1 * xR + b1 * yT + c1;
+        final f1_01 = a1 * xL + b1 * yB + c1;
+        final f1_11 = a1 * xR + b1 * yB + c1;
+        final f1min = math.min(math.min(f1_00, f1_10), math.min(f1_01, f1_11));
+        final f1max = math.max(math.max(f1_00, f1_10), math.max(f1_01, f1_11));
+        if (f1max < 0) continue;
 
-      // Teste de inclusão robusto ao winding:
-      bool allPositive = true;
-      bool allNegative = true;
-      for (final v in edgeValues) {
-        if (v < 0) allPositive = false;
-        if (v > 0) allNegative = false;
-        if (!allPositive && !allNegative) break;
-      }
+        // CA
+        final f2_00 = a2 * xL + b2 * yT + c2;
+        final f2_10 = a2 * xR + b2 * yT + c2;
+        final f2_01 = a2 * xL + b2 * yB + c2;
+        final f2_11 = a2 * xR + b2 * yB + c2;
+        final f2min = math.min(math.min(f2_00, f2_10), math.min(f2_01, f2_11));
+        final f2max = math.max(math.max(f2_00, f2_10), math.max(f2_01, f2_11));
+        if (f2max < 0) continue;
 
-      final idx = globalY * width + globalX;
-
-      if (allPositive || allNegative) {
-        _buffer[idx] = color;
-      } else {
-        bool anyClose = false;
-        final signedDistances = <double>[];
-
-        for (int e = 0; e < 3; e++) {
-          final dist = edgeValues[e] / normalLengths[e];
-          signedDistances.add(dist);
-          if (dist.abs() < 1.5) anyClose = true;
-        }
-
-        if (anyClose) {
-          final coverage = computeRationalCoverage(signedDistances);
-          if (coverage > 0.01) {
-            _blendPixelByIndex(idx, color, (coverage * 255).toInt());
+        // totalmente dentro
+        if (f0min >= 0 && f1min >= 0 && f2min >= 0) {
+          for (int y = 0; y < tileH; y++) {
+            final rowStart = (ty + y) * width + tx;
+            _buffer.fillRange(rowStart, rowStart + tileW, color);
           }
+          continue;
+        }
+
+        // parcial: inicial no (0,0)
+        double fAB = a0 * (tx + 0.5) + b0 * (ty + 0.5) + c0;
+        double fBC = a1 * (tx + 0.5) + b1 * (ty + 0.5) + c1;
+        double fCA = a2 * (tx + 0.5) + b2 * (ty + 0.5) + c2;
+
+        for (int i = 0; i < path.length; i++) {
+          final packed = path[i];
+
+          if (i != 0) {
+            final dir = packed >> 30;
+            if (dir == 0) {
+              fAB += a0; fBC += a1; fCA += a2;
+            } else if (dir == 1) {
+              fAB -= a0; fBC -= a1; fCA -= a2;
+            } else if (dir == 2) {
+              fAB += b0; fBC += b1; fCA += b2;
+            } else {
+              fAB -= b0; fBC -= b1; fCA -= b2;
+            }
+          }
+
+          final ox = packed & 0xFFFF;
+          final oy = (packed >> 16) & 0x3FFF;
+          if (ox >= tileW || oy >= tileH) continue;
+
+          final x = tx + ox;
+          final y = ty + oy;
+          final idx = y * width + x;
+
+          if (fAB >= 0 && fBC >= 0 && fCA >= 0) {
+            _buffer[idx] = color;
+            continue;
+          }
+
+          final d0 = fAB * invLen0;
+          final d1 = fBC * invLen1;
+          final d2 = fCA * invLen2;
+          final minD = math.min(d0, math.min(d1, d2));
+
+          double alpha = minD + 0.5;
+
+          if (alpha <= 0) continue;
+          if (alpha >= 1) {
+            _buffer[idx] = color;
+            continue;
+          }
+
+          _blendPixelByIndex(idx, color, (alpha * 255).toInt());
         }
       }
     }
   }
 
-  void _blendPixelByIndex(int idx, int foreground, int alpha) {
-    if (alpha >= 255) {
-      _buffer[idx] = foreground;
+  @pragma('vm:prefer-inline')
+  void _blendPixelByIndex(int idx, int fg, int alpha255) {
+    if (alpha255 <= 0) return;
+    if (alpha255 >= 255) {
+      _buffer[idx] = fg;
       return;
     }
 
+    final a = alpha255 + 1; // 1..256
+    final inv = 256 - a;
+
     final bg = _buffer[idx];
-    final fgR = (foreground >> 16) & 0xFF;
-    final fgG = (foreground >> 8) & 0xFF;
-    final fgB = foreground & 0xFF;
-    final bgR = (bg >> 16) & 0xFF;
-    final bgG = (bg >> 8) & 0xFF;
-    final bgB = bg & 0xFF;
 
-    final invA = 255 - alpha;
-    final r = (fgR * alpha + bgR * invA) ~/ 255;
-    final g = (fgG * alpha + bgG * invA) ~/ 255;
-    final b = (fgB * alpha + bgB * invA) ~/ 255;
+    final rb = bg & 0x00FF00FF;
+    final gb = bg & 0x0000FF00;
+    final rf = fg & 0x00FF00FF;
+    final gf = fg & 0x0000FF00;
 
-    _buffer[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
+    final r = ((rf * a + rb * inv) >> 8) & 0x00FF00FF;
+    final g = ((gf * a + gb * inv) >> 8) & 0x0000FF00;
+
+    _buffer[idx] = 0xFF000000 | r | g;
   }
 }
