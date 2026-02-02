@@ -7,12 +7,12 @@ foco em construir um renderizador 2D de alta performace
 para renderizar formas e testos (SVG) para imagens 2D PNG
 
 ## Referências obrigatórias (base conceitual)
-- OpenL-2601290031.md (artigo “Scanline edge‑flag algorithm for antialiasing”).
+- pesquisa\Scanline edge-flag algorithm for antialiasing.md (artigo “Scanline edge‑flag algorithm for antialiasing”).
 - SLEFA_1_0_1 (código C++ original e docs do autor).
 - SLEFA_QT_comparisons (dados de desempenho comparativo).
 
 ## 1) Leitura e extração dos requisitos
-1. Ler o artigo (OpenL-2601290031.md):
+1. Ler o artigo (pesquisa\Scanline edge-flag algorithm for antialiasing.md):
    - Entender o fluxo geral: marcação de bordas → varredura por scanline → máscara de cobertura.
    - Identificar variantes: even‑odd vs non‑zero, buffer full‑height vs scanline‑oriented, padrões de amostragem (n‑rooks), otimizações listadas.
 2. Inspecionar SLEFA_1_0_1:

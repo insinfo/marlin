@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import '../lib/src/edge_flag/rasterizer.dart';
+import '../lib/src/rasterization_algorithms/edge_flag/rasterizer.dart';
 
 const int W = 512;
 const int H = 512;

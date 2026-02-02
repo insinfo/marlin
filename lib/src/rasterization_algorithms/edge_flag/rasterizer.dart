@@ -1,5 +1,4 @@
 import 'dart:typed_data';
-import 'package:logging/logging.dart';
 import 'common.dart';
 import 'edge.dart';
 import 'edge_table.dart';

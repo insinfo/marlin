@@ -1,6 +1,6 @@
 import 'package:test/test.dart';
-import 'dart:io';
-import '../lib/src/edge_flag/rasterizer.dart';
+
+import '../lib/src/rasterization_algorithms/edge_flag/rasterizer.dart';
 
 void main() {
   test('Render Triangle EvenOdd 8x', () {
