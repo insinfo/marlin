@@ -1,4 +1,3 @@
-import 'common.dart';
 
 class Edge {
   int yStart; // Start Scanline (inclusive)
