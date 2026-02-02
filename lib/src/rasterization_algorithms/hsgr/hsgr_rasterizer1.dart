@@ -1,7 +1,7 @@
 /// ============================================================================
 /// HSGR — Hilbert-Space Guided Rasterization
 /// ============================================================================
-///
+/// esta verção não esta renderizando poligonos difernte de triangulos 
 /// Usa curvas de preenchimento de espaço (Hilbert) para traversar pixels
 /// de forma a maximizar localidade de cache.
 ///
