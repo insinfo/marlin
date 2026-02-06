@@ -1,7 +1,3 @@
-/// ============================================================================
-/// RASTERIZATION BENCHMARK
-/// ============================================================================
-///
 /// Benchmark comparativo de todos os métodos de rasterização implementados.
 ///
 /// Uso:
@@ -37,15 +33,20 @@ List<double> createTriangle(double cx, double cy, double size) {
 List<double> createSquare(double cx, double cy, double size) {
   final half = size / 2;
   return [
-    cx - half, cy - half,
-    cx + half, cy - half,
-    cx + half, cy + half,
-    cx - half, cy + half,
+    cx - half,
+    cy - half,
+    cx + half,
+    cy - half,
+    cx + half,
+    cy + half,
+    cx - half,
+    cy + half,
   ];
 }
 
 /// Estrela de 5 pontas
-List<double> createStar(double cx, double cy, double outerRadius, double innerRadius) {
+List<double> createStar(
+    double cx, double cy, double outerRadius, double innerRadius) {
   final vertices = <double>[];
   const numPoints = 5;
   const angleStep = 3.14159265 / numPoints;
@@ -63,12 +64,18 @@ List<double> createStar(double cx, double cy, double outerRadius, double innerRa
 /// Polígono complexo (hexágono irregular)
 List<double> createComplexPolygon(double cx, double cy, double size) {
   return [
-    cx + size * 0.8, cy,
-    cx + size * 0.4, cy + size * 0.7,
-    cx - size * 0.3, cy + size * 0.6,
-    cx - size * 0.9, cy,
-    cx - size * 0.5, cy - size * 0.5,
-    cx + size * 0.2, cy - size * 0.8,
+    cx + size * 0.8,
+    cy,
+    cx + size * 0.4,
+    cy + size * 0.7,
+    cx - size * 0.3,
+    cy + size * 0.6,
+    cx - size * 0.9,
+    cy,
+    cx - size * 0.5,
+    cy - size * 0.5,
+    cx + size * 0.2,
+    cy - size * 0.8,
   ];
 }
 
@@ -102,7 +109,8 @@ class BenchmarkResult {
   }
 }
 
-typedef RasterizeFunc = FutureOr<void> Function(List<double> vertices, int color);
+typedef RasterizeFunc = FutureOr<void> Function(
+    List<double> vertices, int color);
 
 /// Benchmark padrão (chama rasterize() por polígono)
 Future<BenchmarkResult> runBenchmark(
@@ -139,7 +147,8 @@ Future<BenchmarkResult> runBenchmark(
   return BenchmarkResult(name, totalMs / measureIterations, polyPerSec);
 }
 
-typedef RasterizeBatchFunc = FutureOr<void> Function(List<List<double>> polygons, int color);
+typedef RasterizeBatchFunc = FutureOr<void> Function(
+    List<List<double>> polygons, int color);
 
 /// Benchmark em batch (acumula todos os polígonos e executa um flush/resolução 1x por iteração)
 Future<BenchmarkResult> runBenchmarkBatch(
@@ -172,7 +181,8 @@ Future<BenchmarkResult> runBenchmarkBatch(
   return BenchmarkResult(name, totalMs / measureIterations, polyPerSec);
 }
 
-Future<void> saveImage(String name, Uint32List buffer, int width, int height) async {
+Future<void> saveImage(
+    String name, Uint32List buffer, int width, int height) async {
   final dir = Directory('output/rasterization_benchmark');
   await dir.create(recursive: true);
 
@@ -205,7 +215,8 @@ Future<void> main() async {
 
   print('╔══════════════════════════════════════════════════════════════════╗');
   print('║         MARLIN RASTERIZATION METHODS BENCHMARK                   ║');
-  print('║         Resolution: ${width}x${height}, Iterations: $iterations              ║');
+  print(
+      '║         Resolution: ${width}x${height}, Iterations: $iterations              ║');
   print('╚══════════════════════════════════════════════════════════════════╝');
   print('');
 
@@ -275,9 +286,61 @@ Future<void> main() async {
         marlin.clear(0xFFFFFFFF);
       },
     ));
-    await saveImage('Marlin', marlin.buffer.buffer.asUint32List(), width, height);
+    await saveImage(
+        'Marlin', marlin.buffer.buffer.asUint32List(), width, height);
   } catch (e) {
     print('  Marlin failed: $e');
+  }
+
+  // ─── SCANLINE_EO ────────────────────────────────────────────────────────
+  print('Testing SCANLINE_EO (Scanline no AA)...');
+  try {
+    final scanline = ScanlineRasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'SCANLINE_EO',
+      (vertices, color) => scanline.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => scanline.clear(0xFFFFFFFF),
+    ));
+    await saveImage('SCANLINE_EO', scanline.buffer, width, height);
+  } catch (e) {
+    print('  SCANLINE_EO failed: $e');
+  }
+
+  // ─── SSAA ──────────────────────────────────────────────────────────────
+  print('Testing SSAA (RGSS 8x8)...');
+  try {
+    final ssaa = SSAARasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'SSAA 8x8',
+      (vertices, color) => ssaa.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => ssaa.clear(0xFFFFFFFF),
+    ));
+    await saveImage('SSAA', ssaa.buffer, width, height);
+  } catch (e) {
+    print('  SSAA failed: $e');
+  }
+
+  // ─── WAVELET_HAAR ──────────────────────────────────────────────────────
+  print('Testing WAVELET_HAAR...');
+  try {
+    final wavelet = WaveletHaarRasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'WAVELET_HAAR',
+      (vertices, color) => wavelet.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => wavelet.clear(0xFFFFFFFF),
+    ));
+    await saveImage('WAVELET_HAAR', wavelet.buffer, width, height);
+  } catch (e) {
+    print('  WAVELET_HAAR failed: $e');
   }
 
   // ─── DAA ────────────────────────────────────────────────────────────────
@@ -327,9 +390,12 @@ Future<void> main() async {
       (vertices, color) {
         if (vertices.length >= 6) {
           dbsr.drawTriangle(
-            vertices[0], vertices[1],
-            vertices[2], vertices[3],
-            vertices[4], vertices[5],
+            vertices[0],
+            vertices[1],
+            vertices[2],
+            vertices[3],
+            vertices[4],
+            vertices[5],
             color,
           );
         }
@@ -533,7 +599,8 @@ Future<void> main() async {
       iterations,
       clear: () => b2dScalarParallel.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v1_Scalar_Isolates', b2dScalarParallel.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v1_Scalar_Isolates', b2dScalarParallel.buffer, width, height);
 
     // 4. SIMD + Isolates
     final b2dParallel = b2d1.Blend2DRasterizer(
@@ -553,7 +620,8 @@ Future<void> main() async {
       iterations,
       clear: () => b2dParallel.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v1_SIMD_Isolates', b2dParallel.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v1_SIMD_Isolates', b2dParallel.buffer, width, height);
   } catch (e) {
     print('  BLEND2D v1 failed: $e');
   }
@@ -580,13 +648,15 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v2 (Imm Scalar)',
-      (vertices, color) => v2ScalarImmediate!.drawPolygon(vertices, color, flushNow: true),
+      (vertices, color) =>
+          v2ScalarImmediate!.drawPolygon(vertices, color, flushNow: true),
       polygons,
       warmup,
       iterations,
       clear: () => v2ScalarImmediate!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Imm_Scalar', v2ScalarImmediate.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v2_Imm_Scalar', v2ScalarImmediate.buffer, width, height);
 
     v2SimdImmediate = b2d2.Blend2DRasterizer2(
       width,
@@ -595,13 +665,15 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v2 (Imm SIMD)',
-      (vertices, color) => v2SimdImmediate!.drawPolygon(vertices, color, flushNow: true),
+      (vertices, color) =>
+          v2SimdImmediate!.drawPolygon(vertices, color, flushNow: true),
       polygons,
       warmup,
       iterations,
       clear: () => v2SimdImmediate!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Imm_SIMD', v2SimdImmediate.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v2_Imm_SIMD', v2SimdImmediate.buffer, width, height);
 
     // -------------------------
     // BATCHED (addPolygon em todos + flush 1x)
@@ -624,7 +696,8 @@ Future<void> main() async {
       iterations,
       clear: () => v2ScalarBatched!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Batch_Scalar', v2ScalarBatched.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v2_Batch_Scalar', v2ScalarBatched.buffer, width, height);
 
     v2SimdBatched = b2d2.Blend2DRasterizer2(
       width,
@@ -644,7 +717,8 @@ Future<void> main() async {
       iterations,
       clear: () => v2SimdBatched!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Batch_SIMD', v2SimdBatched.buffer, width, height);
+    await saveImage(
+        'BLEND2D_v2_Batch_SIMD', v2SimdBatched.buffer, width, height);
 
     // -------------------------
     // BATCHED + ISOLATES (pool persistente)
@@ -672,7 +746,8 @@ Future<void> main() async {
       iterations,
       clear: () => v2ScalarBatchedIso!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Batch_Scalar_Isolates', v2ScalarBatchedIso.buffer, width, height);
+    await saveImage('BLEND2D_v2_Batch_Scalar_Isolates',
+        v2ScalarBatchedIso.buffer, width, height);
 
     v2SimdBatchedIso = b2d2.Blend2DRasterizer2(
       width,
@@ -697,23 +772,37 @@ Future<void> main() async {
       iterations,
       clear: () => v2SimdBatchedIso!.clear(0xFFFFFFFF),
     ));
-    await saveImage('BLEND2D_v2_Batch_SIMD_Isolates', v2SimdBatchedIso.buffer, width, height);
+    await saveImage('BLEND2D_v2_Batch_SIMD_Isolates', v2SimdBatchedIso.buffer,
+        width, height);
   } catch (e) {
     print('  BLEND2D v2.0 failed: $e');
   } finally {
     // encerra isolates do pool (se tiver)
-    try { await v2ScalarImmediate?.dispose(); } catch (_) {}
-    try { await v2SimdImmediate?.dispose(); } catch (_) {}
-    try { await v2ScalarBatched?.dispose(); } catch (_) {}
-    try { await v2SimdBatched?.dispose(); } catch (_) {}
-    try { await v2ScalarBatchedIso?.dispose(); } catch (_) {}
-    try { await v2SimdBatchedIso?.dispose(); } catch (_) {}
+    try {
+      await v2ScalarImmediate?.dispose();
+    } catch (_) {}
+    try {
+      await v2SimdImmediate?.dispose();
+    } catch (_) {}
+    try {
+      await v2ScalarBatched?.dispose();
+    } catch (_) {}
+    try {
+      await v2SimdBatched?.dispose();
+    } catch (_) {}
+    try {
+      await v2ScalarBatchedIso?.dispose();
+    } catch (_) {}
+    try {
+      await v2SimdBatchedIso?.dispose();
+    } catch (_) {}
   }
 
   // ─── SKIA_SCANLINE ──────────────────────────────────────────────────────
   print('Testing SKIA_SCANLINE (Various configs)...');
   try {
-    final skiaScalar = SkiaRasterizer(width: width, height: height, useSimd: false);
+    final skiaScalar =
+        SkiaRasterizer(width: width, height: height, useSimd: false);
     results.add(await runBenchmark(
       'SKIA (Scalar)',
       (vertices, color) => skiaScalar.drawPolygon(vertices, color),
@@ -724,7 +813,8 @@ Future<void> main() async {
     ));
     await saveImage('SKIA_Scalar', skiaScalar.buffer, width, height);
 
-    final skiaSimd = SkiaRasterizer(width: width, height: height, useSimd: true);
+    final skiaSimd =
+        SkiaRasterizer(width: width, height: height, useSimd: true);
     results.add(await runBenchmark(
       'SKIA (SIMD)',
       (vertices, color) => skiaSimd.drawPolygon(vertices, color),

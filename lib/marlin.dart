@@ -20,6 +20,9 @@
 /// - **BLEND2D** - Blend2D-like rasterizer
 /// - **SKIA_SCANLINE** - Skia-like scanline rasterizer
 /// - **EDGE_FLAG_AA** - Edge Flag Anti-Aliasing
+/// - **SCANLINE_EO** - Scanline fill sem AA
+/// - **SSAA** - Supersampling de alta densidade
+/// - **WAVELET_HAAR** - Wavelet Rasterization (Haar)
 ///
 library marlin;
 
@@ -31,14 +34,27 @@ export 'src/rasterization_algorithms/dbsr/dbsr_rasterizer.dart' hide Edge;
 export 'src/rasterization_algorithms/epl_aa/epl_aa_rasterizer.dart';
 export 'src/rasterization_algorithms/qcs/qcs_rasterizer.dart';
 export 'src/rasterization_algorithms/rhbd/rhbd_rasterizer.dart';
-export 'src/rasterization_algorithms/amcad/amcad_rasterizer.dart' hide kFixedBits, kFixedOne;
+export 'src/rasterization_algorithms/amcad/amcad_rasterizer.dart'
+    hide kFixedBits, kFixedOne;
 export 'src/rasterization_algorithms/hsgr/hsgr_rasterizer.dart';
 export 'src/rasterization_algorithms/sweep_sdf/sweep_sdf_rasterizer.dart';
 export 'src/rasterization_algorithms/scdt/scdt_rasterizer.dart';
 export 'src/rasterization_algorithms/scp_aed/scp_aed_rasterizer.dart';
 export 'src/rasterization_algorithms/blend2d/blend2d_rasterizer.dart';
-export 'src/rasterization_algorithms/skia_scanline/skia_scanline_rasterizer.dart' hide kFixedBits, kFixedOne, kFixedHalf, kFixedMask, kSubpixelBits, kSubpixelCount, kSubpixelMask;
-export 'src/rasterization_algorithms/edge_flag_aa/edge_flag_aa_rasterizer.dart' hide ScanEdge;
+export 'src/rasterization_algorithms/skia_scanline/skia_scanline_rasterizer.dart'
+    hide
+        kFixedBits,
+        kFixedOne,
+        kFixedHalf,
+        kFixedMask,
+        kSubpixelBits,
+        kSubpixelCount,
+        kSubpixelMask;
+export 'src/rasterization_algorithms/edge_flag_aa/edge_flag_aa_rasterizer.dart'
+    hide ScanEdge;
+export 'src/rasterization_algorithms/blaze_fast/blaze_fast_rasterizer.dart';
+export 'src/rasterization_algorithms/ultra_quality/ssaa_rasterizer.dart';
+export 'src/rasterization_algorithms/wavelet_haar/wavelet_haar_rasterizer.dart';
 
 // SVG Support
 export 'src/svg/svg_parser.dart';

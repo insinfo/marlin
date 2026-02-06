@@ -38,6 +38,12 @@ const int kMicroCellSize = 4;
 const int kFixedBits = 8;
 const int kFixedOne = 1 << kFixedBits;
 
+/// Largura do filtro AA (em pixels)
+const double kAAWidth = 0.5;
+
+/// EPS para tratar “ponto em cima da aresta” (evita linhas/oscilações)
+const double kEdgeEps = 1e-6;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LOOK-UP TABLE DE COBERTURA ANALÍTICA
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,6 +52,7 @@ const int kFixedOne = 1 << kFixedBits;
 class AnalyticCoverageLUT {
   static const int phiBins = 256;
   static const int angleBins = 64;
+  static const double tRange = 3.0;
 
   final Uint8List _table;
 
@@ -55,17 +62,20 @@ class AnalyticCoverageLUT {
 
   void _precompute() {
     for (int p = 0; p < phiBins; p++) {
-      // φ normalizado: [-1, +1] em unidades de pixel
-      final phi = ((p - phiBins ~/ 2) / (phiBins / 2.0)).clamp(-1.0, 1.0);
+      // t em [-tRange, +tRange]
+      final tBase = -tRange + (2.0 * tRange) * (p / (phiBins - 1));
 
       for (int a = 0; a < angleBins; a++) {
-        // Ângulo do gradiente (afeta suavidade através do index)
+        final theta = (a / (angleBins - 1)) * math.pi;
 
-        // Aproximação de Padé da integral: tanh para smoothstep
-        // C ≈ 0.5 - 0.5 * tanh(φ / (||∇φ|| * w))
-        // Com w = 0.5 para filtro de reconstrução típico
-        final w = 0.5;
-        final coverage = 0.5 - 0.5 * _tanh(phi / w);
+        // Aproxima footprint do pixel na direção do gradiente
+        final footprint =
+            (math.cos(theta).abs() + math.sin(theta).abs()).clamp(1e-6, 1e9);
+
+        final t = tBase / footprint;
+
+        // Cobertura suave
+        final coverage = 0.5 - 0.5 * _tanh(t);
 
         _table[p * angleBins + a] = (coverage * 255).round().clamp(0, 255);
       }
@@ -80,79 +90,28 @@ class AnalyticCoverageLUT {
     return x * (27.0 + x2) / (27.0 + 9.0 * x2);
   }
 
-  /// Obtém cobertura para φ e ângulo
-  int getCoverage(double phi, double angle) {
-    // Índice de φ
-    final pIdx = ((phi + 1.0) * 0.5 * (phiBins - 1)).round().clamp(0, phiBins - 1);
+  /// Obtém cobertura para φ e ângulo, escalando por ||grad|| e largura AA
+  int getCoverage(double phi, double angle, double gradMag) {
+    final gm = (gradMag.abs() < 1e-9) ? 1.0 : gradMag.abs();
 
-    // Índice de ângulo
+    // t = phi/(||grad||*w)
+    final t = (phi / (gm * kAAWidth)).clamp(-tRange, tRange);
+
+    final pIdx = (((t + tRange) / (2.0 * tRange)) * (phiBins - 1))
+        .round()
+        .clamp(0, phiBins - 1);
+
     final normalizedAngle = angle.abs() % math.pi;
-    final aIdx = ((normalizedAngle / math.pi) * (angleBins - 1)).round().clamp(0, angleBins - 1);
+    final aIdx = ((normalizedAngle / math.pi) * (angleBins - 1))
+        .round()
+        .clamp(0, angleBins - 1);
 
-    return _table[pIdx * angleBins + aIdx];
+    var c = _table[pIdx * angleBins + aIdx];
+
+    if (c <= 2) return 0;
+    if (c >= 253) return 255;
+    return c;
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// COEFICIENTES DE SDF QUADRÁTICA LOCAL
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Coeficientes de Taylor de ordem 2 para SDF local
-/// φ(x,y) ≈ φ₀ + ∇φ·x + ½xᵀHx
-/// Onde H é a matriz Hessiana
-class LocalSDF {
-  final double phi0; // Valor no centro do tile
-  final double gradX; // ∂φ/∂x
-  final double gradY; // ∂φ/∂y
-  final double hessXX; // ∂²φ/∂x²
-  final double hessXY; // ∂²φ/∂x∂y
-  final double hessYY; // ∂²φ/∂y²
-
-  LocalSDF({
-    required this.phi0,
-    required this.gradX,
-    required this.gradY,
-    this.hessXX = 0,
-    this.hessXY = 0,
-    this.hessYY = 0,
-  });
-
-  /// Avalia SDF em um ponto local (coordenadas relativas ao centro)
-  double evaluate(double dx, double dy) {
-    return phi0 +
-        gradX * dx +
-        gradY * dy +
-        0.5 * (hessXX * dx * dx + 2 * hessXY * dx * dy + hessYY * dy * dy);
-  }
-
-  /// Ângulo do gradiente
-  double get gradientAngle => math.atan2(gradY, gradX);
-
-  /// Magnitude do gradiente
-  double get gradientMagnitude => math.sqrt(gradX * gradX + gradY * gradY);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MORTON CODES PARA LOCALIDADE ESPACIAL
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Codifica coordenadas (x, y) em Morton code (Z-order curve)
-int encodeMorton(int x, int y) {
-  int z = 0;
-  for (int i = 0; i < 16; i++) {
-    z |= ((x & (1 << i)) << i) | ((y & (1 << i)) << (i + 1));
-  }
-  return z;
-}
-
-/// Decodifica Morton code para (x, y)
-List<int> decodeMorton(int z) {
-  int x = 0, y = 0;
-  for (int i = 0; i < 16; i++) {
-    x |= ((z >> (2 * i)) & 1) << i;
-    y |= ((z >> (2 * i + 1)) & 1) << i;
-  }
-  return [x, y];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,6 +126,29 @@ double rUnion(double phi1, double phi2) {
 /// Interseção C¹ contínua: φ_intersect = φ₁ + φ₂ + √(φ₁² + φ₂²)
 double rIntersect(double phi1, double phi2) {
   return phi1 + phi2 + math.sqrt(phi1 * phi1 + phi2 * phi2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SDF RESULT
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _SdfResult {
+  final double phi;
+  final double unsignedDist;
+  final bool inside;
+  final double gradX;
+  final double gradY;
+
+  const _SdfResult({
+    required this.phi,
+    required this.unsignedDist,
+    required this.inside,
+    required this.gradX,
+    required this.gradY,
+  });
+
+  double get gradMag => math.sqrt(gradX * gradX + gradY * gradY);
+  double get angle => math.atan2(gradY, gradX);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,20 +205,10 @@ class AMCADRasterizer {
     final tileMinY = (minY / kMicroCellSize).floor().clamp(0, tilesY - 1);
     final tileMaxY = (maxY / kMicroCellSize).ceil().clamp(0, tilesY - 1);
 
-    // Processar tiles em ordem Morton para cache
-    final mortonMin = encodeMorton(tileMinX, tileMinY);
-    final mortonMax = encodeMorton(tileMaxX, tileMaxY);
-
-    for (int m = mortonMin; m <= mortonMax; m++) {
-      final coords = decodeMorton(m);
-      final tx = coords[0];
-      final ty = coords[1];
-
-      if (tx < tileMinX || tx > tileMaxX || ty < tileMinY || ty > tileMaxY) {
-        continue;
+    for (int ty = tileMinY; ty <= tileMaxY; ty++) {
+      for (int tx = tileMinX; tx <= tileMaxX; tx++) {
+        _processTile(tx, ty, vertices, color);
       }
-
-      _processTile(tx, ty, vertices, color);
     }
   }
 
@@ -249,23 +221,15 @@ class AMCADRasterizer {
     final centerX = tileX + kMicroCellSize / 2.0;
     final centerY = tileY + kMicroCellSize / 2.0;
 
-    // Calcular SDF local no centro do tile
-    final localSDF = _computeLocalSDF(centerX, centerY, vertices);
+    final c = _signedDistanceAndGrad(centerX, centerY, vertices);
 
-    // Fase 1: Teste rápido de tile totalmente dentro ou fora
-    final phiMin = localSDF.phi0 -
-        localSDF.gradientMagnitude * kMicroCellSize * 0.707;
-    final phiMax = localSDF.phi0 +
-        localSDF.gradientMagnitude * kMicroCellSize * 0.707;
+    final halfDiag = kMicroCellSize * 0.7071067811865476;
+    final safe = halfDiag + kAAWidth;
 
-    if (phiMax < 0) {
-      // Tile totalmente dentro: fill sólido
-      _fillTile(tileX, tileY, color, 255);
-      return;
-    }
-
-    if (phiMin > 0) {
-      // Tile totalmente fora: skip
+    if (c.unsignedDist > safe) {
+      if (c.inside) {
+        _fillTile(tileX, tileY, color, 255);
+      }
       return;
     }
 
@@ -282,77 +246,104 @@ class AMCADRasterizer {
         final pixelCenterX = globalX + 0.5;
         final pixelCenterY = globalY + 0.5;
 
-        // Avaliar SDF no centro do pixel
-        final dx = pixelCenterX - centerX;
-        final dy = pixelCenterY - centerY;
-        final phi = localSDF.evaluate(dx, dy);
+        final s = _signedDistanceAndGrad(pixelCenterX, pixelCenterY, vertices);
 
-        // Lookup de cobertura
-        final coverage = _coverageLUT.getCoverage(phi, localSDF.gradientAngle);
+        final coverage = _coverageLUT.getCoverage(s.phi, s.angle, s.gradMag);
 
-        if (coverage > 0) {
+        if (coverage != 0) {
           _blendPixel(globalX, globalY, color, coverage);
         }
       }
     }
   }
 
-  /// Calcula coeficientes de SDF local para um ponto
-  LocalSDF _computeLocalSDF(
-      double centerX, double centerY, List<double> vertices) {
+  _SdfResult _signedDistanceAndGrad(double x, double y, List<double> vertices) {
     final n = vertices.length ~/ 2;
 
-    // Calcular SDF como mínimo das distâncias às arestas
-    double minDist = double.infinity;
-    double bestGradX = 0, bestGradY = 0;
+    double minDist2 = double.infinity;
+    double bestCx = 0.0, bestCy = 0.0;
+    double bestEx = 1.0, bestEy = 0.0;
+
+    bool inside = false;
+
+    int j = n - 1;
+    double xj = vertices[j * 2];
+    double yj = vertices[j * 2 + 1];
 
     for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x1 = vertices[i * 2];
-      final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[j * 2];
-      final y2 = vertices[j * 2 + 1];
+      final xi = vertices[i * 2];
+      final yi = vertices[i * 2 + 1];
 
-      // Distância ponto-segmento
-      final dx = x2 - x1;
-      final dy = y2 - y1;
-      final len2 = dx * dx + dy * dy;
+      final intersects =
+          ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (intersects) inside = !inside;
 
-      if (len2 < 1e-10) continue;
+      final ex = xi - xj;
+      final ey = yi - yj;
+      final len2 = ex * ex + ey * ey;
 
-      // Projeção do ponto no segmento
-      final t = ((centerX - x1) * dx + (centerY - y1) * dy) / len2;
-      final tClamped = t.clamp(0.0, 1.0);
+      if (len2 > 1e-12) {
+        var t = ((x - xj) * ex + (y - yj) * ey) / len2;
+        if (t < 0.0)
+          t = 0.0;
+        else if (t > 1.0) t = 1.0;
 
-      final projX = x1 + tClamped * dx;
-      final projY = y1 + tClamped * dy;
+        final cx = xj + t * ex;
+        final cy = yj + t * ey;
 
-      // Distância assinada (normal apontando para fora)
-      final distX = centerX - projX;
-      final distY = centerY - projY;
-      var dist = math.sqrt(distX * distX + distY * distY);
+        final dx = x - cx;
+        final dy = y - cy;
+        final d2 = dx * dx + dy * dy;
 
-      // Determinar sinal usando cross product
-      final cross = dx * (centerY - y1) - dy * (centerX - x1);
-      if (cross > 0) dist = -dist;
-
-      if (dist.abs() < minDist.abs()) {
-        minDist = dist;
-        // Gradiente aponta para fora do polígono
-        if (dist.abs() > 1e-6) {
-          bestGradX = distX / dist.abs();
-          bestGradY = distY / dist.abs();
-        } else {
-          bestGradX = dy / math.sqrt(len2);
-          bestGradY = -dx / math.sqrt(len2);
+        if (d2 < minDist2) {
+          minDist2 = d2;
+          bestCx = cx;
+          bestCy = cy;
+          bestEx = ex;
+          bestEy = ey;
         }
+      }
+
+      j = i;
+      xj = xi;
+      yj = yi;
+    }
+
+    final unsignedDist = math.sqrt(minDist2);
+    final onEdge = unsignedDist <= kEdgeEps;
+    if (onEdge) {
+      inside = true;
+    }
+
+    final phi = inside ? -unsignedDist : unsignedDist;
+
+    double gx, gy;
+
+    if (unsignedDist > 1e-9) {
+      gx = (x - bestCx) / unsignedDist;
+      gy = (y - bestCy) / unsignedDist;
+
+      if (inside) {
+        gx = -gx;
+        gy = -gy;
+      }
+    } else {
+      final el = math.sqrt(bestEx * bestEx + bestEy * bestEy);
+      if (el > 1e-12) {
+        gx = bestEy / el;
+        gy = -bestEx / el;
+      } else {
+        gx = 1.0;
+        gy = 0.0;
       }
     }
 
-    return LocalSDF(
-      phi0: minDist,
-      gradX: bestGradX,
-      gradY: bestGradY,
+    return _SdfResult(
+      phi: phi,
+      unsignedDist: unsignedDist,
+      inside: inside,
+      gradX: gx,
+      gradY: gy,
     );
   }
 
