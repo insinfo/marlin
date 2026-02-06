@@ -389,15 +389,7 @@ Future<void> main() async {
       'DBSR',
       (vertices, color) {
         if (vertices.length >= 6) {
-          dbsr.drawTriangle(
-            vertices[0],
-            vertices[1],
-            vertices[2],
-            vertices[3],
-            vertices[4],
-            vertices[5],
-            color,
-          );
+          dbsr.drawPolygon(vertices, color);
         }
       },
       polygons,

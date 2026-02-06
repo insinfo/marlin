@@ -103,22 +103,18 @@ int fractionToTernaryIndex(int fixedPointFrac) {
   // Divisão por 85 ≈ 256/3 usando multiplicação recíproca
 
   // t0 = floor(frac * 3 / 256) = 0, 1, ou 2
-  final t0 = ((fixedPointFrac * 3) >> 8);
 
   // Resto após subtrair t0 * (256/3) ≈ t0 * 85
-  final rem1 = fixedPointFrac - (t0 * 85);
 
   // t1 = floor(rem1 * 3 / 85) ≈ floor(rem1 * 3 / 85)
-  final t1 = ((rem1 * 3) >> 8) * 3;
 
   // Resto após t1
-  final rem2 = rem1 - (t1 * 28); // 28 ≈ 85/3
 
   // t2 = floor(rem2 * 3 / 28)
-  final t2 = ((rem2 * 3) >> 8) * 9;
 
   // Índice final (cada trit já mapeado para 0..2)
-  return (t0.clamp(0, 2) * 9 + t1.clamp(0, 2) * 3 + t2.clamp(0, 2)).clamp(0, 26);
+  final idx = (fixedPointFrac * 27) >> 8;
+  return idx.clamp(0, 26);
 }
 
 /// Versão simplificada: converte fração double para índice ternário
@@ -218,10 +214,13 @@ class SCDTRasterizer {
       final xFixed0 = (x0 * 256).toInt();
       // ignore: unused_local_variable (xFixed1 not used but kept for reference)
       final _ = (x1 * 256).toInt();
-      final yMin = y0.ceil();
-      final yMax = y1.floor();
+      // Usar centros de scanline (y + 0.5) para evitar artefatos horizontais
+      var yMin = (y0 - 0.5).ceil();
+      var yMax = (y1 - 0.5).floor();
 
       if (yMin > yMax) continue;
+      if (yMin < 0) yMin = 0;
+      if (yMax >= height) yMax = height - 1;
 
       // Slope em ponto fixo
       final dy = y1 - y0;
@@ -235,8 +234,9 @@ class SCDTRasterizer {
         edgeTable[yMin] = [];
       }
 
+      final scanY = yMin + 0.5;
       edgeTable[yMin]!.add(EdgeState(
-        xFixed: xFixed0 + ((yMin - y0) * slopeFixed).toInt(),
+        xFixed: xFixed0 + ((scanY - y0) * slopeFixed).toInt(),
         yMax: yMax,
         direction: dir,
         slopeFixed: slopeFixed,
@@ -279,9 +279,12 @@ class SCDTRasterizer {
         final edge = activeEdges[e];
         final currentX = edge.xFixed >> 8; // Parte inteira
         final frac = edge.xFixed & 0xFF; // Parte fracionária Q0.8
+        // Epsilon subpixel para estabilizar bordas (evita dupla contagem)
+        final fracAdj = (windingNumber != 0)
+            ? (frac - 1).clamp(0, 255)
+            : (frac + 1).clamp(0, 255);
 
         if (windingNumber != 0 && currentX > prevX + 1) {
-
           for (int x = prevX + 1; x < currentX && x < width; x++) {
             final idx = y * stride + x * 3;
             _subpixelBuffer[idx + 0] = colorR;
@@ -292,7 +295,7 @@ class SCDTRasterizer {
 
         // Pixel de borda: lookup ternário O(1)
         if (currentX >= 0 && currentX < width) {
-          final ternIdx = fractionToTernaryIndexDouble(frac / 256.0);
+          final ternIdx = fractionToTernaryIndex(fracAdj);
           final bufBase = y * stride + currentX * 3;
 
           if (windingNumber != 0) {
@@ -301,19 +304,37 @@ class SCDTRasterizer {
             final covR = 255 - _lut.getR(ternIdx);
             final covG = 255 - _lut.getG(ternIdx);
             final covB = 255 - _lut.getB(ternIdx);
-            
-            _subpixelBuffer[bufBase + 0] = ((colorR * covR + _subpixelBuffer[bufBase + 0] * (255 - covR)) >> 8).clamp(0, 255);
-            _subpixelBuffer[bufBase + 1] = ((colorG * covG + _subpixelBuffer[bufBase + 1] * (255 - covG)) >> 8).clamp(0, 255);
-            _subpixelBuffer[bufBase + 2] = ((colorB * covB + _subpixelBuffer[bufBase + 2] * (255 - covB)) >> 8).clamp(0, 255);
+
+            _subpixelBuffer[bufBase + 0] = ((colorR * covR +
+                        _subpixelBuffer[bufBase + 0] * (255 - covR)) >>
+                    8)
+                .clamp(0, 255);
+            _subpixelBuffer[bufBase + 1] = ((colorG * covG +
+                        _subpixelBuffer[bufBase + 1] * (255 - covG)) >>
+                    8)
+                .clamp(0, 255);
+            _subpixelBuffer[bufBase + 2] = ((colorB * covB +
+                        _subpixelBuffer[bufBase + 2] * (255 - covB)) >>
+                    8)
+                .clamp(0, 255);
           } else {
             // Entrando na forma: cobertura direta
             final covR = _lut.getR(ternIdx);
             final covG = _lut.getG(ternIdx);
             final covB = _lut.getB(ternIdx);
 
-            _subpixelBuffer[bufBase + 0] = ((colorR * covR + _subpixelBuffer[bufBase + 0] * (255 - covR)) >> 8).clamp(0, 255);
-            _subpixelBuffer[bufBase + 1] = ((colorG * covG + _subpixelBuffer[bufBase + 1] * (255 - covG)) >> 8).clamp(0, 255);
-            _subpixelBuffer[bufBase + 2] = ((colorB * covB + _subpixelBuffer[bufBase + 2] * (255 - covB)) >> 8).clamp(0, 255);
+            _subpixelBuffer[bufBase + 0] = ((colorR * covR +
+                        _subpixelBuffer[bufBase + 0] * (255 - covR)) >>
+                    8)
+                .clamp(0, 255);
+            _subpixelBuffer[bufBase + 1] = ((colorG * covG +
+                        _subpixelBuffer[bufBase + 1] * (255 - covG)) >>
+                    8)
+                .clamp(0, 255);
+            _subpixelBuffer[bufBase + 2] = ((colorB * covB +
+                        _subpixelBuffer[bufBase + 2] * (255 - covB)) >>
+                    8)
+                .clamp(0, 255);
           }
         }
 

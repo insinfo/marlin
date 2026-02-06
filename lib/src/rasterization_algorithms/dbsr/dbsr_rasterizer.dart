@@ -196,12 +196,42 @@ class DBSRRasterizer {
     double y3,
     int color,
   ) {
-    // Criar arestas
-    final edges = [
-      Edge.fromPoints(x1, y1, x2, y2),
-      Edge.fromPoints(x2, y2, x3, y3),
-      Edge.fromPoints(x3, y3, x1, y1),
-    ];
+    // Garantir orientação CCW (normais apontam para fora)
+    final area = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1);
+    if (area == 0) return; // Degenerado
+    if (area < 0) {
+      final tx = x2;
+      final ty = y2;
+      x2 = x3;
+      y2 = y3;
+      x3 = tx;
+      y3 = ty;
+    }
+
+    // Pré-calcular arestas (normais e d) — evita alocações
+    final dx1 = x2 - x1;
+    final dy1 = y2 - y1;
+    final len1 = math.sqrt(dx1 * dx1 + dy1 * dy1);
+    if (len1 == 0) return;
+    final nx1 = dy1 / len1;
+    final ny1 = -dx1 / len1;
+    final d1 = nx1 * x1 + ny1 * y1;
+
+    final dx2 = x3 - x2;
+    final dy2 = y3 - y2;
+    final len2 = math.sqrt(dx2 * dx2 + dy2 * dy2);
+    if (len2 == 0) return;
+    final nx2 = dy2 / len2;
+    final ny2 = -dx2 / len2;
+    final d2 = nx2 * x2 + ny2 * y2;
+
+    final dx3 = x1 - x3;
+    final dy3 = y1 - y3;
+    final len3 = math.sqrt(dx3 * dx3 + dy3 * dy3);
+    if (len3 == 0) return;
+    final nx3 = dy3 / len3;
+    final ny3 = -dx3 / len3;
+    final d3 = nx3 * x3 + ny3 * y3;
 
     // Bounding box
     final minX = math.min(x1, math.min(x2, x3)).floor().clamp(0, width - 1);
@@ -225,15 +255,51 @@ class DBSRRasterizer {
 
         // Subpixel R (esquerda)
         final centerR = x + _subpixelR;
-        int weightR = _computeSubpixelWeight(edges, centerR, centerY);
+        int weightR = _computeSubpixelWeight3(
+          centerR,
+          centerY,
+          nx1,
+          ny1,
+          d1,
+          nx2,
+          ny2,
+          d2,
+          nx3,
+          ny3,
+          d3,
+        );
 
         // Subpixel G (centro)
         final centerG = x + _subpixelG;
-        int weightG = _computeSubpixelWeight(edges, centerG, centerY);
+        int weightG = _computeSubpixelWeight3(
+          centerG,
+          centerY,
+          nx1,
+          ny1,
+          d1,
+          nx2,
+          ny2,
+          d2,
+          nx3,
+          ny3,
+          d3,
+        );
 
         // Subpixel B (direita)
         final centerB = x + _subpixelB;
-        int weightB = _computeSubpixelWeight(edges, centerB, centerY);
+        int weightB = _computeSubpixelWeight3(
+          centerB,
+          centerY,
+          nx1,
+          ny1,
+          d1,
+          nx2,
+          ny2,
+          d2,
+          nx3,
+          ny3,
+          d3,
+        );
 
         // ─── BLENDING ───────────────────────────────────────────────
         if (weightR > 0) {
@@ -260,27 +326,239 @@ class DBSRRasterizer {
     }
   }
 
-  /// Calcula o peso de um subpixel considerando todas as arestas
-  int _computeSubpixelWeight(List<Edge> edges, double px, double py) {
+  /// Desenha um polígono (concavo/convexo) com AA subpixel
+  void drawPolygon(List<double> vertices, int color) {
+    if (vertices.length < 6) return; // Mínimo 3 vértices
+
+    final n = vertices.length ~/ 2;
+
+    // Bounding box
+    var minX = vertices[0];
+    var maxX = vertices[0];
+    var minY = vertices[1];
+    var maxY = vertices[1];
+    for (int i = 1; i < n; i++) {
+      final x = vertices[i * 2];
+      final y = vertices[i * 2 + 1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+
+    final minXi = minX.floor().clamp(0, width - 1);
+    final maxXi = maxX.ceil().clamp(0, width - 1);
+    final minYi = minY.floor().clamp(0, height - 1);
+    final maxYi = maxY.ceil().clamp(0, height - 1);
+
+    // Pré-calcular arestas (normais e d) sem alocação de objetos
+    final edgeCount = n;
+    final edgeX1 = List<double>.filled(edgeCount, 0.0);
+    final edgeY1 = List<double>.filled(edgeCount, 0.0);
+    final edgeX2 = List<double>.filled(edgeCount, 0.0);
+    final edgeY2 = List<double>.filled(edgeCount, 0.0);
+    final edgeNx = List<double>.filled(edgeCount, 0.0);
+    final edgeNy = List<double>.filled(edgeCount, 0.0);
+    final edgeD = List<double>.filled(edgeCount, 0.0);
+
+    for (int i = 0; i < n; i++) {
+      final j = (i + 1) % n;
+      final x1 = vertices[i * 2];
+      final y1 = vertices[i * 2 + 1];
+      final x2 = vertices[j * 2];
+      final y2 = vertices[j * 2 + 1];
+
+      final dx = x2 - x1;
+      final dy = y2 - y1;
+      final len = math.sqrt(dx * dx + dy * dy);
+      if (len == 0) continue;
+
+      final nx = dy / len;
+      final ny = -dx / len;
+      final d = nx * x1 + ny * y1;
+
+      edgeX1[i] = x1;
+      edgeY1[i] = y1;
+      edgeX2[i] = x2;
+      edgeY2[i] = y2;
+      edgeNx[i] = nx;
+      edgeNy[i] = ny;
+      edgeD[i] = d;
+    }
+
+    // Extrair canais de cor
+    final colorR = (color >> 16) & 0xFF;
+    final colorG = (color >> 8) & 0xFF;
+    final colorB = color & 0xFF;
+
+    for (int y = minYi; y <= maxYi; y++) {
+      final centerY = y + 0.5;
+
+      for (int x = minXi; x <= maxXi; x++) {
+        final baseIdx = (y * width + x) * 3;
+
+        // Subpixel R (esquerda)
+        final centerR = x + _subpixelR;
+        final weightR = _computeSubpixelWeightPolygon(
+          centerR,
+          centerY,
+          edgeCount,
+          edgeX1,
+          edgeY1,
+          edgeX2,
+          edgeY2,
+          edgeNx,
+          edgeNy,
+          edgeD,
+        );
+
+        // Subpixel G (centro)
+        final centerG = x + _subpixelG;
+        final weightG = _computeSubpixelWeightPolygon(
+          centerG,
+          centerY,
+          edgeCount,
+          edgeX1,
+          edgeY1,
+          edgeX2,
+          edgeY2,
+          edgeNx,
+          edgeNy,
+          edgeD,
+        );
+
+        // Subpixel B (direita)
+        final centerB = x + _subpixelB;
+        final weightB = _computeSubpixelWeightPolygon(
+          centerB,
+          centerY,
+          edgeCount,
+          edgeX1,
+          edgeY1,
+          edgeX2,
+          edgeY2,
+          edgeNx,
+          edgeNy,
+          edgeD,
+        );
+
+        if (weightR > 0) {
+          final existing = _subpixelBuffer[baseIdx + 0];
+          _subpixelBuffer[baseIdx + 0] =
+              ((colorR * weightR + existing * (255 - weightR)) ~/ 255)
+                  .clamp(0, 255);
+        }
+
+        if (weightG > 0) {
+          final existing = _subpixelBuffer[baseIdx + 1];
+          _subpixelBuffer[baseIdx + 1] =
+              ((colorG * weightG + existing * (255 - weightG)) ~/ 255)
+                  .clamp(0, 255);
+        }
+
+        if (weightB > 0) {
+          final existing = _subpixelBuffer[baseIdx + 2];
+          _subpixelBuffer[baseIdx + 2] =
+              ((colorB * weightB + existing * (255 - weightB)) ~/ 255)
+                  .clamp(0, 255);
+        }
+      }
+    }
+  }
+
+  /// Desenha um retângulo
+  void drawRect(double x, double y, double w, double h, int color) {
+    final vertices = <double>[x, y, x + w, y, x + w, y + h, x, y + h];
+    drawPolygon(vertices, color);
+  }
+
+  /// Calcula o peso de um subpixel considerando três arestas
+  @pragma('vm:prefer-inline')
+  int _computeSubpixelWeight3(
+    double px,
+    double py,
+    double nx1,
+    double ny1,
+    double d1,
+    double nx2,
+    double ny2,
+    double d2,
+    double nx3,
+    double ny3,
+    double d3,
+  ) {
     // Para cada aresta, calculamos a distância assinada.
     // O peso final é o MÍNIMO dos pesos individuais (interseção das meias-
     // planos).
-    int minWeight = 255;
+    final dist1 = nx1 * px + ny1 * py - d1;
+    int minWeight = _distanceLUT.getWeight((dist1 * _fixedOne).toInt());
 
-    for (final edge in edges) {
-      // Distância assinada ao longo da normal
-      final dist = edge.signedDistance(px, py);
+    final dist2 = nx2 * px + ny2 * py - d2;
+    final weight2 = _distanceLUT.getWeight((dist2 * _fixedOne).toInt());
+    if (weight2 < minWeight) minWeight = weight2;
 
-      // Converter para ponto fixo e usar LUT
-      final fixedDist = (dist * _fixedOne).toInt();
-      final weight = _distanceLUT.getWeight(fixedDist);
-
-      if (weight < minWeight) {
-        minWeight = weight;
-      }
-    }
+    final dist3 = nx3 * px + ny3 * py - d3;
+    final weight3 = _distanceLUT.getWeight((dist3 * _fixedOne).toInt());
+    if (weight3 < minWeight) minWeight = weight3;
 
     return minWeight;
+  }
+
+  /// Peso por subpixel para polígonos arbitrários (winding + distância mínima)
+  @pragma('vm:prefer-inline')
+  int _computeSubpixelWeightPolygon(
+    double px,
+    double py,
+    int edgeCount,
+    List<double> edgeX1,
+    List<double> edgeY1,
+    List<double> edgeX2,
+    List<double> edgeY2,
+    List<double> edgeNx,
+    List<double> edgeNy,
+    List<double> edgeD,
+  ) {
+    int winding = 0;
+    double minAbs = double.infinity;
+
+    for (int i = 0; i < edgeCount; i++) {
+      final x1 = edgeX1[i];
+      final y1 = edgeY1[i];
+      final x2 = edgeX2[i];
+      final y2 = edgeY2[i];
+
+      // Winding (Non-Zero Rule)
+      if (y1 <= py) {
+        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) {
+          winding++;
+        }
+      } else {
+        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) {
+          winding--;
+        }
+      }
+
+      // Distância assinada à linha da aresta
+      final dist = edgeNx[i] * px + edgeNy[i] * py - edgeD[i];
+      final absDist = dist.abs();
+      if (absDist < minAbs) minAbs = absDist;
+    }
+
+    final inside = winding != 0;
+    final signedDist = inside ? -minAbs : minAbs;
+    return _distanceLUT.getWeight((signedDist * _fixedOne).toInt());
+  }
+
+  @pragma('vm:prefer-inline')
+  double _isLeft(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    return (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1);
   }
 
   /// Converte buffer de subpixels para buffer de pixels ARGB

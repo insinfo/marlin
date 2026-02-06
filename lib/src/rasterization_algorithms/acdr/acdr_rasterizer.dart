@@ -76,6 +76,7 @@ class AcdrProcessedEdge {
 ///   B (Esq↔Top):  1 − ½·(1−x_top)·(1−y_in)  — pixel menos triângulo
 ///   C (Bot↔Dir):  ½·x_bot·y_out               — triângulo
 ///   D (Bot↔Top):  ½·(x_in + x_out)           — faixa vertical
+// ignore: unused_element
 enum Topology { a, b, c, d, full, none }
 
 /// Evento de aresta numa scanline — usado para ordenação
@@ -110,6 +111,22 @@ class ACDRRasterizer {
   final int width;
   final int height;
 
+  /// Habilita integração subpixel em Y (melhora AA em arestas horizontais).
+  /// Pode ser desativado para máxima performance.
+  final bool enableSubpixelY;
+
+  /// Corrige spans onde xLeft e xRight caem no mesmo pixel.
+  /// Pode ser desativado se quiser comportamento legado.
+  final bool enableSinglePixelSpanFix;
+
+  /// Supersampling vertical barato (2 taps) para suavizar bordas horizontais.
+  /// Pode ser desativado para máxima performance.
+  final bool enableVerticalSupersample;
+
+  /// Número de amostras verticais quando enableVerticalSupersample = true.
+  /// Valores recomendados: 2 ou 4.
+  final int verticalSampleCount;
+
   /// Buffer de cobertura — Float64List para evitar boxing
   /// Cada elemento é a cobertura do pixel correspondente em [0, 1]
   late final Float64List coverageBuffer;
@@ -118,7 +135,14 @@ class ACDRRasterizer {
   /// Índice: scanline Y → lista de eventos nessa scanline
   final List<List<EdgeEvent>> _scanlineEvents;
 
-  ACDRRasterizer({required this.width, required this.height})
+  ACDRRasterizer({
+    required this.width,
+    required this.height,
+    this.enableSubpixelY = true,
+    this.enableSinglePixelSpanFix = true,
+    this.enableVerticalSupersample = true,
+    this.verticalSampleCount = 4,
+  })
       : _scanlineEvents = List.generate(height, (_) => []) {
     coverageBuffer = Float64List(width * height);
   }
@@ -176,7 +200,7 @@ class ACDRRasterizer {
   ///
   /// Eventos são ORDENADOS por X dentro de cada scanline usando
   /// inserção direta (mais eficiente que sort para listas pequenas).
-  void _buildScanlineEvents(List<AcdrProcessedEdge> edges) {
+  void _buildScanlineEvents(List<AcdrProcessedEdge> edges, double yOffset) {
     // Limpar eventos anteriores
     for (int y = 0; y < height; y++) {
       _scanlineEvents[y].clear();
@@ -185,11 +209,11 @@ class ACDRRasterizer {
     for (int e = 0; e < edges.length; e++) {
       final edge = edges[e];
       // Calcular range de scanlines cujos centros (y + 0.5) estão dentro da aresta
-    final yStart = (edge.yMin - 0.5).ceil().toInt().clamp(0, height - 1);
-    final yEnd = (edge.yMax - 0.5).floor().toInt().clamp(0, height - 1);
+      final yStart = (edge.yMin - yOffset).ceil().toInt().clamp(0, height - 1);
+      final yEnd = (edge.yMax - yOffset).floor().toInt().clamp(0, height - 1);
 
-    for (int y = yStart; y <= yEnd; y++) {
-      final scanY = y + 0.5;
+      for (int y = yStart; y <= yEnd; y++) {
+        final scanY = y + yOffset;
 
         // Verificar se está dentro do range da aresta
         if (scanY < edge.yMin || scanY >= edge.yMax) continue;
@@ -221,6 +245,7 @@ class ACDRRasterizer {
   ///
   /// Usa apenas comparações — sem branches no caminho crítico quando
   /// compilado com AOT (Dart compila isso eficientemente).
+  // ignore: unused_element
   static Topology _classifyTopology(
     double yEntry,
     double yExit,
@@ -278,6 +303,7 @@ class ACDRRasterizer {
   ///   Topo B: 2 subtrações + 1 multiplicação + 1 shift
   ///   Topo C: 1 multiplicação + 1 shift
   ///   Topo D: 1 adição + 1 shift
+  // ignore: unused_element
   static double computeTopologySeed(
     double yEntry,
     double yExit,
@@ -338,48 +364,84 @@ class ACDRRasterizer {
     final edges = _preprocessEdges(vertices);
     if (edges.isEmpty) return coverageBuffer;
 
-    // Fase 2: Construir eventos
-    _buildScanlineEvents(edges);
+    final sampleOffsets = enableVerticalSupersample
+      ? (verticalSampleCount <= 2
+        ? const <double>[0.25, 0.75]
+        : const <double>[0.125, 0.375, 0.625, 0.875])
+      : const <double>[0.5];
+    final sampleWeight = 1.0 / sampleOffsets.length;
 
-    // Fase 3-5: Rasterizar por scanline
-    for (int scanY = 0; scanY < height; scanY++) {
-      final events = _scanlineEvents[scanY];
-      if (events.length < 2) continue;
+    for (final yOffset in sampleOffsets) {
+      // Fase 2: Construir eventos
+      _buildScanlineEvents(edges, yOffset);
 
-      // Processar pares de eventos (regra even-odd)
-      for (int p = 0; p + 1 < events.length; p += 2) {
-        final leftEvent = events[p];
-        final rightEvent = events[p + 1];
+      // Fase 3-5: Rasterizar por scanline
+      for (int scanY = 0; scanY < height; scanY++) {
+        final events = _scanlineEvents[scanY];
+        if (events.length < 2) continue;
 
-        final xLeft = leftEvent.x;
-        final xRight = rightEvent.x;
+        // Processar pares de eventos (regra even-odd)
+        for (int p = 0; p + 1 < events.length; p += 2) {
+          final leftEvent = events[p];
+          final rightEvent = events[p + 1];
 
-        if (xRight <= xLeft) continue; // Aresta degenerada
+          final xLeft = leftEvent.x;
+          final xRight = rightEvent.x;
 
-        final pxLeft = xLeft.floor().clamp(0, width - 1);
-        final pxRight = xRight.floor().clamp(0, width - 1);
+          // Epsilon para evitar dupla contagem em interseções exatas
+          final xLeftAdj = xLeft + 1e-6;
+          final xRightAdj = xRight - 1e-6;
 
-        // ── PIXEL DE BORDA ESQUERDA ──────────────────────────────────
-        _rasterizeLeftBorder(scanY, pxLeft, xLeft, edges[leftEvent.edgeIndex]);
+          if (xRightAdj <= xLeftAdj) continue; // Aresta degenerada
 
-        // ── PIXEL DE BORDA DIREITA ───────────────────────────────────
-        if (pxRight != pxLeft) {
+          final pxLeft = xLeftAdj.floor().clamp(0, width - 1);
+          final pxRight = xRightAdj.floor().clamp(0, width - 1);
+
+          // ── SPAN EM UM ÚNICO PIXEL ───────────────────────────────────
+          if (enableSinglePixelSpanFix && pxRight == pxLeft) {
+            final coverage = _rasterizeSinglePixelSpan(
+              scanY,
+              pxLeft,
+              xLeftAdj,
+              xRightAdj,
+              edges[leftEvent.edgeIndex],
+              edges[rightEvent.edgeIndex],
+            );
+            if (coverage > 0.0) {
+              coverageBuffer[scanY * width + pxLeft] +=
+                  coverage * sampleWeight;
+            }
+            continue;
+          }
+
+          // ── PIXEL DE BORDA ESQUERDA ──────────────────────────────────
+          _rasterizeLeftBorder(
+            scanY,
+            pxLeft,
+            xLeftAdj,
+            edges[leftEvent.edgeIndex],
+            sampleWeight,
+          );
+
+          // ── PIXEL DE BORDA DIREITA ───────────────────────────────────
           _rasterizeRightBorder(
             scanY,
             pxRight,
-            xRight,
+            xRightAdj,
             edges[rightEvent.edgeIndex],
+            sampleWeight,
           );
-        }
 
-        // ── PIXELS INTERNOS — FILL O(1) amortizado ──────────────────
-        // Todos os pixels entre as bordas são completamente cobertos.
-        final fillStart = (pxLeft + 1).clamp(0, width);
-        final fillEnd = pxRight.clamp(0, width);
+          // ── PIXELS INTERNOS — FILL O(1) amortizado ──────────────────
+          // Todos os pixels entre as bordas são completamente cobertos.
+          final fillStart = (pxLeft + 1).clamp(0, width);
+          final fillEnd = pxRight.clamp(0, width);
 
-        if (fillEnd > fillStart) {
-          for (int px = fillStart; px < fillEnd; px++) {
-            coverageBuffer[scanY * width + px] = 1.0;
+          if (fillEnd > fillStart) {
+            final rowOffset = scanY * width;
+            for (int px = fillStart; px < fillEnd; px++) {
+              coverageBuffer[rowOffset + px] += sampleWeight;
+            }
           }
         }
       }
@@ -402,56 +464,26 @@ class ACDRRasterizer {
     int px,
     double xIntersection,
     AcdrProcessedEdge edge,
+    double sampleWeight,
   ) {
-    final fracX = xIntersection - px; // Posição subpixel [0, 1)
-
-    // Cobertura básica: fração à direita da interseção
-    // coverage = 1.0 - fracX (para aresta vertical pura)
-    //
-    // REFINAMENTO SUBPIXEL ACDR:
-    // A aresta tem uma inclinação, então a linha não é vertical dentro do pixel.
-    // Calculamos os pontos de entrada/saída locais e classificamos a topologia.
-
-    final slopeDyDx = edge.slopeDyDx; // dy/dx
-
-    // Ponto de entrada local no pixel (coordenadas [0,1]×[0,1])
-    // A aresta cruza x = fracX na altura y = 0.5 (centro da scanline)
-    const yAtEntry = 0.5; // Centro da scanline em coords locais
-
-    // Ponto onde a aresta cruza o lado direito do pixel (x = 1.0)
-    // Δx = 1.0 - fracX, então Δy = Δx * slopeDyDx
-    final yAtExit = yAtEntry + (1.0 - fracX) * slopeDyDx;
-
-    // Classificar topologia e calcular cobertura
-    final xEntry = fracX;
-    const xExit = 1.0;
-    final yEntry = yAtEntry.clamp(0.0, 1.0);
-    final yExit = yAtExit.clamp(0.0, 1.0);
-
-    final topo = _classifyTopology(yEntry, yExit, xEntry, xExit);
-    var coverage = computeTopologySeed(yEntry, yExit, xEntry, xExit, topo);
-
-    // Para borda esquerda, a cobertura é a COMPLEMENTAR
-    // (queremos a área à direita da interseção)
-    if (topo == Topology.a || topo == Topology.d) {
-      coverage = 1.0 - fracX;
-    } else {
-      coverage = (1.0 - fracX).clamp(0.0, 1.0);
+    if (!enableSubpixelY) {
+      final fracX = xIntersection - px;
+      var coverage = (1.0 - fracX).clamp(0.0, 1.0);
+      coverageBuffer[scanY * width + px] += coverage * sampleWeight;
+      return;
     }
 
-    // Ajuste fino com slope para qualidade subpixel
-    // O pixel não é apenas cortado verticalmente — a aresta tem ângulo
-    // Correção: adiciona/subtrai a contribuição do ângulo
-    if (slopeDyDx.abs() < 10.0) {
-      // Evitar overflow para arestas quase horizontais
-      // Para arestas com slope moderado, a correção é proporcional ao slope
-      // e à fração quadrada da posição (segunda ordem)
-      final correction = 0.5 * slopeDyDx * (1.0 - fracX) * (1.0 - fracX);
-      // A correção é adicionada com sinal dependente da direção
-      coverage = (coverage - correction * 0.3).clamp(0.0, 1.0);
-    }
+    final slopeDxDy = edge.slopeDxDy; // dx/dy
+    final xTop = xIntersection - 0.5 * slopeDxDy;
+    final xBottom = xIntersection + 0.5 * slopeDxDy;
 
-    coverageBuffer[scanY * width + px] += coverage;
+    final u0 = xTop - px;
+    final u1 = xBottom - px;
+
+    // Fração à direita da aresta = 1 - clamp(u,0,1)
+    final leftArea = 1.0 - _integrateClamped01(u0, u1);
+    coverageBuffer[scanY * width + px] +=
+      leftArea.clamp(0.0, 1.0) * sampleWeight;
   }
 
   /// Rasteriza o pixel de borda DIREITO de um span.
@@ -464,25 +496,95 @@ class ACDRRasterizer {
     int px,
     double xIntersection,
     AcdrProcessedEdge edge,
+    double sampleWeight,
   ) {
-    final fracX = xIntersection - px; // Posição subpixel [0, 1)
-
-    // Cobertura básica: fração à esquerda da interseção
-    var coverage = fracX;
-
-    // Refinamento subpixel com slope
-    final slopeDyDx = edge.slopeDyDx;
-    if (slopeDyDx.abs() < 10.0) {
-      final correction = 0.5 * slopeDyDx * fracX * fracX;
-      coverage = (coverage + correction * 0.3).clamp(0.0, 1.0);
+    if (!enableSubpixelY) {
+      final fracX = xIntersection - px;
+      coverageBuffer[scanY * width + px] +=
+          fracX.clamp(0.0, 1.0) * sampleWeight;
+      return;
     }
 
-    coverageBuffer[scanY * width + px] += coverage;
+    final slopeDxDy = edge.slopeDxDy; // dx/dy
+    final xTop = xIntersection - 0.5 * slopeDxDy;
+    final xBottom = xIntersection + 0.5 * slopeDxDy;
+
+    final u0 = xTop - px;
+    final u1 = xBottom - px;
+
+    final rightArea = _integrateClamped01(u0, u1);
+    coverageBuffer[scanY * width + px] +=
+      rightArea.clamp(0.0, 1.0) * sampleWeight;
+  }
+
+  double _rasterizeSinglePixelSpan(
+    int scanY,
+    int px,
+    double xLeft,
+    double xRight,
+    AcdrProcessedEdge leftEdge,
+    AcdrProcessedEdge rightEdge,
+  ) {
+    if (!enableSubpixelY) {
+      return (xRight - xLeft).clamp(0.0, 1.0);
+    }
+
+    // Integrar largura entre duas arestas dentro do mesmo pixel
+    final xLeftTop = xLeft - 0.5 * leftEdge.slopeDxDy;
+    final xLeftBottom = xLeft + 0.5 * leftEdge.slopeDxDy;
+    final xRightTop = xRight - 0.5 * rightEdge.slopeDxDy;
+    final xRightBottom = xRight + 0.5 * rightEdge.slopeDxDy;
+
+    final uL0 = xLeftTop - px;
+    final uL1 = xLeftBottom - px;
+    final uR0 = xRightTop - px;
+    final uR1 = xRightBottom - px;
+
+    final areaLeft = _integrateClamped01(uL0, uL1);
+    final areaRight = _integrateClamped01(uR0, uR1);
+
+    final coverage = (areaRight - areaLeft).clamp(0.0, 1.0);
+    return coverage;
   }
 
   /// Limpa o buffer de cobertura para reutilização
   void clear() {
     coverageBuffer.fillRange(0, coverageBuffer.length, 0.0);
+  }
+}
+
+@pragma('vm:prefer-inline')
+double _integrateLinear(double u0, double du, double a, double b) {
+  // ∫_a^b (u0 + du*t) dt
+  return u0 * (b - a) + 0.5 * du * (b * b - a * a);
+}
+
+/// Integra clamp(u, 0, 1) no intervalo [0,1], onde u(y) é linear.
+@pragma('vm:prefer-inline')
+double _integrateClamped01(double u0, double u1) {
+  if (u0 <= 0.0 && u1 <= 0.0) return 0.0;
+  if (u0 >= 1.0 && u1 >= 1.0) return 1.0;
+  if (u0 == u1) return u0.clamp(0.0, 1.0);
+
+  final du = u1 - u0;
+  if (du > 0.0) {
+    final y0 = (0.0 - u0) / du;
+    final y1 = (1.0 - u0) / du;
+    final a = y0.clamp(0.0, 1.0);
+    final b = y1.clamp(0.0, 1.0);
+    var integral = 0.0;
+    if (b > a) integral += _integrateLinear(u0, du, a, b);
+    if (y1 < 1.0) integral += (1.0 - b);
+    return integral;
+  } else {
+    final y1 = (1.0 - u0) / du; // du < 0
+    final y0 = (0.0 - u0) / du;
+    final a = y1.clamp(0.0, 1.0);
+    final b = y0.clamp(0.0, 1.0);
+    var integral = 0.0;
+    if (y1 > 0.0) integral += a;
+    if (b > a) integral += _integrateLinear(u0, du, a, b);
+    return integral;
   }
 }
 

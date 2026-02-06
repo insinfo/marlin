@@ -73,6 +73,9 @@ class FluxRenderer {
 
   /// A primitiva fundamental: Rasteriza um triângulo usando a técnica de
   /// Fluxo Diferencial.
+  ///
+  /// Observação: Triângulos são resolvidos imediatamente. Para polígonos
+  /// triangulados, usamos a versão em lote para evitar costuras internas.
   void drawTriangle(
     double x1,
     double y1,
@@ -90,11 +93,7 @@ class FluxRenderer {
     final fx3 = (x3 * _one).toInt();
     final fy3 = (y3 * _one).toInt();
 
-    // 2. Processar as 3 arestas. A ordem não importa para o acumulador,
-    // mas a orientação (sentido) define o preenchimento (winding).
-    _rasterizeEdge(fx1, fy1, fx2, fy2);
-    _rasterizeEdge(fx2, fy2, fx3, fy3);
-    _rasterizeEdge(fx3, fy3, fx1, fy1);
+    _rasterizeTriangleEdges(fx1, fy1, fx2, fy2, fx3, fy3);
 
     // 3. Resolver (integrar) a área afetada
     final minX = math.min(x1, math.min(x2, x3)).floor().clamp(0, width - 1);
@@ -103,6 +102,22 @@ class FluxRenderer {
     final maxY = math.max(y1, math.max(y2, y3)).ceil().clamp(0, height - 1);
 
     _resolveArea(minX, maxX, minY, maxY, color);
+  }
+
+  @pragma('vm:prefer-inline')
+  void _rasterizeTriangleEdges(
+    int fx1,
+    int fy1,
+    int fx2,
+    int fy2,
+    int fx3,
+    int fy3,
+  ) {
+    // Processar as 3 arestas. A ordem não importa para o acumulador,
+    // mas a orientação (sentido) define o preenchimento (winding).
+    _rasterizeEdge(fx1, fy1, fx2, fy2);
+    _rasterizeEdge(fx2, fy2, fx3, fy3);
+    _rasterizeEdge(fx3, fy3, fx1, fy1);
   }
 
   /// O Coração do Algoritmo: Rasterização de Aresta via Diferença de Fluxo.
@@ -148,51 +163,60 @@ class FluxRenderer {
     final currentYFixed = yStart << _shift;
     var currentX = x1 + (((currentYFixed - y1) * xStep) >> _shift);
 
+    // Clipping vertical rápido (evita branch por scanline)
+    var yMin = yStart;
+    var yMax = yEnd;
+    if (yMin < 0) {
+      currentX += xStep * (-yMin);
+      yMin = 0;
+    }
+    if (yMax >= height) {
+      yMax = height - 1;
+    }
+    if (yMin > yMax) return;
+
     // Ponteiro para o buffer (linha atual)
-    var rowOffset = yStart * width;
+    var rowOffset = yMin * width;
 
     // Loop Crítico: Executado para cada linha que a aresta cruza.
     // Deve ser o mais leve possível.
-    for (int y = yStart; y <= yEnd; y++) {
-      if (y >= height) break;
-      if (y >= 0) {
-        // currentX está em Q16.16.
-        // pixelIndex é a parte inteira.
-        final pixelX = currentX >> _shift;
+    for (int y = yMin; y <= yMax; y++) {
+      // currentX está em Q16.16.
+      // pixelIndex é a parte inteira.
+      final pixelX = currentX >> _shift;
 
-        // Parte fracionária determina a cobertura AA.
-        // Se x = 10.25 (0x000A4000), cobre 75% do pixel 10 e empurra fluxo
-        // para o 11.
-        //
-        // Mas espere! A matemática do "Fluxo" é diferente.
-        // Estamos calculando a derivada da área.
-        // A altura da fatia nesta scanline é 1.0 (ou _one em fixed point).
-        // Contribuição para pixelX: (1.0 - frac) * dir
-        // Contribuição para pixelX+1: (frac) * dir
-        // O valor armazenado é a "Altura Acumulada" que será integrada
-        // horizontalmente depois.
+      // Parte fracionária determina a cobertura AA.
+      // Se x = 10.25 (0x000A4000), cobre 75% do pixel 10 e empurra fluxo
+      // para o 11.
+      //
+      // Mas espere! A matemática do "Fluxo" é diferente.
+      // Estamos calculando a derivada da área.
+      // A altura da fatia nesta scanline é 1.0 (ou _one em fixed point).
+      // Contribuição para pixelX: (1.0 - frac) * dir
+      // Contribuição para pixelX+1: (frac) * dir
+      // O valor armazenado é a "Altura Acumulada" que será integrada
+      // horizontalmente depois.
 
-        final frac = currentX & _mask;
+      final frac = currentX & _mask;
 
-        // Área coberta à esquerda da aresta no pixel X
-        // Area = (1.0 - frac) * Height(1) * Direction
-        final val = ((_one - frac) * dir);
+      // Área coberta à esquerda da aresta no pixel X
+      // Area = (1.0 - frac) * Height(1) * Direction
+      final val = ((_one - frac) * dir);
 
-        if (pixelX >= 0 && pixelX < width) {
-          _fluxBuffer[rowOffset + pixelX] += val;
-        }
+      if (pixelX >= 0 && pixelX < width) {
+        _fluxBuffer[rowOffset + pixelX] += val;
+      }
 
-        // A diferença (correção) é aplicada no próximo pixel para manter
-        // a integral correta
-        if (pixelX + 1 >= 0 && pixelX + 1 < width) {
-          // O fluxo total muda em 'dir * _one'.
-          // No pixel anterior aplicamos 'val'.
-          // No próximo, precisamos completar a diferença.
-          // Delta total esperado ao cruzar a borda é 'dir * _one'.
-          // Buffer[x] += val
-          // Buffer[x+1] += (dir * _one) - val
-          _fluxBuffer[rowOffset + pixelX + 1] += (dir * _one) - val;
-        }
+      // A diferença (correção) é aplicada no próximo pixel para manter
+      // a integral correta
+      if (pixelX + 1 >= 0 && pixelX + 1 < width) {
+        // O fluxo total muda em 'dir * _one'.
+        // No pixel anterior aplicamos 'val'.
+        // No próximo, precisamos completar a diferença.
+        // Delta total esperado ao cruzar a borda é 'dir * _one'.
+        // Buffer[x] += val
+        // Buffer[x+1] += (dir * _one) - val
+        _fluxBuffer[rowOffset + pixelX + 1] += (dir * _one) - val;
       }
 
       // Avançar para a próxima scanline
@@ -278,28 +302,73 @@ class FluxRenderer {
   /// Retorna o buffer de pixels
   Uint32List get buffer => _pixelBuffer;
 
-  /// Desenha um polígono (decomposição em triângulos via fan)
+  /// Desenha um polígono (arestas apenas, sem triangulação)
+  /// para evitar artefatos em polígonos côncavos.
   void drawPolygon(List<double> vertices, int color) {
     if (vertices.length < 6) return; // Mínimo 3 vértices
 
     final n = vertices.length ~/ 2;
-    final x0 = vertices[0];
-    final y0 = vertices[1];
 
-    // Fan triangulation
-    for (int i = 1; i < n - 1; i++) {
+    // Bounding box do polígono
+    var minX = vertices[0];
+    var maxX = vertices[0];
+    var minY = vertices[1];
+    var maxY = vertices[1];
+    for (int i = 1; i < n; i++) {
+      final x = vertices[i * 2];
+      final y = vertices[i * 2 + 1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+
+    // Rasteriza as arestas do contorno
+    for (int i = 0; i < n; i++) {
+      final j = (i + 1) % n;
       final x1 = vertices[i * 2];
       final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[(i + 1) * 2];
-      final y2 = vertices[(i + 1) * 2 + 1];
+      final x2 = vertices[j * 2];
+      final y2 = vertices[j * 2 + 1];
 
-      drawTriangle(x0, y0, x1, y1, x2, y2, color);
+      final fx1 = (x1 * _one).toInt();
+      final fy1 = (y1 * _one).toInt();
+      final fx2 = (x2 * _one).toInt();
+      final fy2 = (y2 * _one).toInt();
+
+      _rasterizeEdge(fx1, fy1, fx2, fy2);
     }
+
+    final minXi = minX.floor().clamp(0, width - 1);
+    final maxXi = maxX.ceil().clamp(0, width - 1);
+    final minYi = minY.floor().clamp(0, height - 1);
+    final maxYi = maxY.ceil().clamp(0, height - 1);
+
+    _resolveArea(minXi, maxXi, minYi, maxYi, color);
   }
 
-  /// Desenha um retângulo
+  /// Desenha um retângulo (arestas diretas, sem diagonal interna)
   void drawRect(double x, double y, double w, double h, int color) {
-    drawTriangle(x, y, x + w, y, x + w, y + h, color);
-    drawTriangle(x, y, x + w, y + h, x, y + h, color);
+    final x1 = x;
+    final y1 = y;
+    final x2 = x + w;
+    final y2 = y + h;
+
+    final fx1 = (x1 * _one).toInt();
+    final fy1 = (y1 * _one).toInt();
+    final fx2 = (x2 * _one).toInt();
+    final fy2 = (y2 * _one).toInt();
+
+    _rasterizeEdge(fx1, fy1, fx2, fy1);
+    _rasterizeEdge(fx2, fy1, fx2, fy2);
+    _rasterizeEdge(fx2, fy2, fx1, fy2);
+    _rasterizeEdge(fx1, fy2, fx1, fy1);
+
+    final minX = math.min(x1, x2).floor().clamp(0, width - 1);
+    final maxX = math.max(x1, x2).ceil().clamp(0, width - 1);
+    final minY = math.min(y1, y2).floor().clamp(0, height - 1);
+    final maxY = math.max(y1, y2).ceil().clamp(0, height - 1);
+
+    _resolveArea(minX, maxX, minY, maxY, color);
   }
 }
