@@ -305,22 +305,22 @@ class DBSRRasterizer {
         if (weightR > 0) {
           final existing = _subpixelBuffer[baseIdx + 0];
           _subpixelBuffer[baseIdx + 0] =
-              ((colorR * weightR + existing * (255 - weightR)) ~/ 255).clamp(
-                  0, 255);
+              ((colorR * weightR + existing * (255 - weightR)) ~/ 255)
+                  .clamp(0, 255);
         }
 
         if (weightG > 0) {
           final existing = _subpixelBuffer[baseIdx + 1];
           _subpixelBuffer[baseIdx + 1] =
-              ((colorG * weightG + existing * (255 - weightG)) ~/ 255).clamp(
-                  0, 255);
+              ((colorG * weightG + existing * (255 - weightG)) ~/ 255)
+                  .clamp(0, 255);
         }
 
         if (weightB > 0) {
           final existing = _subpixelBuffer[baseIdx + 2];
           _subpixelBuffer[baseIdx + 2] =
-              ((colorB * weightB + existing * (255 - weightB)) ~/ 255).clamp(
-                  0, 255);
+              ((colorB * weightB + existing * (255 - weightB)) ~/ 255)
+                  .clamp(0, 255);
         }
       }
     }
@@ -351,15 +351,12 @@ class DBSRRasterizer {
     final minYi = minY.floor().clamp(0, height - 1);
     final maxYi = maxY.ceil().clamp(0, height - 1);
 
-    // Pré-calcular arestas (normais e d) sem alocação de objetos
+    // Pré-calcular arestas sem alocação de objetos
     final edgeCount = n;
     final edgeX1 = List<double>.filled(edgeCount, 0.0);
     final edgeY1 = List<double>.filled(edgeCount, 0.0);
     final edgeX2 = List<double>.filled(edgeCount, 0.0);
     final edgeY2 = List<double>.filled(edgeCount, 0.0);
-    final edgeNx = List<double>.filled(edgeCount, 0.0);
-    final edgeNy = List<double>.filled(edgeCount, 0.0);
-    final edgeD = List<double>.filled(edgeCount, 0.0);
 
     for (int i = 0; i < n; i++) {
       final j = (i + 1) % n;
@@ -368,22 +365,10 @@ class DBSRRasterizer {
       final x2 = vertices[j * 2];
       final y2 = vertices[j * 2 + 1];
 
-      final dx = x2 - x1;
-      final dy = y2 - y1;
-      final len = math.sqrt(dx * dx + dy * dy);
-      if (len == 0) continue;
-
-      final nx = dy / len;
-      final ny = -dx / len;
-      final d = nx * x1 + ny * y1;
-
       edgeX1[i] = x1;
       edgeY1[i] = y1;
       edgeX2[i] = x2;
       edgeY2[i] = y2;
-      edgeNx[i] = nx;
-      edgeNy[i] = ny;
-      edgeD[i] = d;
     }
 
     // Extrair canais de cor
@@ -407,9 +392,6 @@ class DBSRRasterizer {
           edgeY1,
           edgeX2,
           edgeY2,
-          edgeNx,
-          edgeNy,
-          edgeD,
         );
 
         // Subpixel G (centro)
@@ -422,9 +404,6 @@ class DBSRRasterizer {
           edgeY1,
           edgeX2,
           edgeY2,
-          edgeNx,
-          edgeNy,
-          edgeD,
         );
 
         // Subpixel B (direita)
@@ -437,9 +416,6 @@ class DBSRRasterizer {
           edgeY1,
           edgeX2,
           edgeY2,
-          edgeNx,
-          edgeNy,
-          edgeD,
         );
 
         if (weightR > 0) {
@@ -514,12 +490,9 @@ class DBSRRasterizer {
     List<double> edgeY1,
     List<double> edgeX2,
     List<double> edgeY2,
-    List<double> edgeNx,
-    List<double> edgeNy,
-    List<double> edgeD,
   ) {
     int winding = 0;
-    double minAbs = double.infinity;
+    double minDistSq = double.infinity;
 
     for (int i = 0; i < edgeCount; i++) {
       final x1 = edgeX1[i];
@@ -538,13 +511,34 @@ class DBSRRasterizer {
         }
       }
 
-      // Distância assinada à linha da aresta
-      final dist = edgeNx[i] * px + edgeNy[i] * py - edgeD[i];
-      final absDist = dist.abs();
-      if (absDist < minAbs) minAbs = absDist;
+      // Distância à aresta como SEGMENTO (evita "linhas fantasmas" fora do polígono)
+      final vx = x2 - x1;
+      final vy = y2 - y1;
+      final vv = vx * vx + vy * vy;
+
+      double t;
+      if (vv <= 1e-12) {
+        t = 0.0;
+      } else {
+        t = ((px - x1) * vx + (py - y1) * vy) / vv;
+        if (t < 0.0) {
+          t = 0.0;
+        } else if (t > 1.0) {
+          t = 1.0;
+        }
+      }
+
+      final cx = x1 + vx * t;
+      final cy = y1 + vy * t;
+      final dx = px - cx;
+      final dy = py - cy;
+      final distSq = dx * dx + dy * dy;
+
+      if (distSq < minDistSq) minDistSq = distSq;
     }
 
     final inside = winding != 0;
+    final minAbs = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
     final signedDist = inside ? -minAbs : minAbs;
     return _distanceLUT.getWeight((signedDist * _fixedOne).toInt());
   }

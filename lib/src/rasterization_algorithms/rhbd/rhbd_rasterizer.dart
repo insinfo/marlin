@@ -127,24 +127,9 @@ class FixedEdge {
 class Tile {
   final int x, y; // Posição do tile em coordenadas de tile
 
-  /// Buffer A: acumulação de área local (soma em cada pixel)
-  final Float32List areaBuffer;
+  Tile(this.x, this.y);
 
-  /// Buffer X: acumulação de cobertura infinita à direita
-  final Float32List coverBuffer;
-
-  /// Lista de arestas que afetam este tile
-  final List<FixedEdge> edges = [];
-
-  Tile(this.x, this.y)
-      : areaBuffer = Float32List(kTileSize * kTileSize),
-        coverBuffer = Float32List(kTileSize);
-
-  void clear() {
-    areaBuffer.fillRange(0, areaBuffer.length, 0.0);
-    coverBuffer.fillRange(0, coverBuffer.length, 0.0);
-    edges.clear();
-  }
+  void clear() {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,157 +174,194 @@ class RHBDRasterizer {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    double minX = double.infinity;
+    double minY = double.infinity;
+    double maxX = double.negativeInfinity;
+    double maxY = double.negativeInfinity;
+    final edgeX1 = List<double>.filled(n, 0.0);
+    final edgeY1 = List<double>.filled(n, 0.0);
+    final edgeX2 = List<double>.filled(n, 0.0);
+    final edgeY2 = List<double>.filled(n, 0.0);
 
-    // 1. Criar arestas em ponto fixo
-    final edges = <FixedEdge>[];
     for (int i = 0; i < n; i++) {
       final j = (i + 1) % n;
-      final x0 = vertices[i * 2];
-      final y0 = vertices[i * 2 + 1];
-      final x1 = vertices[j * 2];
-      final y1 = vertices[j * 2 + 1];
+      final x1 = vertices[i * 2];
+      final y1 = vertices[i * 2 + 1];
+      final x2 = vertices[j * 2];
+      final y2 = vertices[j * 2 + 1];
 
-      // Ignorar arestas horizontais
-      if ((y1 - y0).abs() < 0.001) continue;
+      edgeX1[i] = x1;
+      edgeY1[i] = y1;
+      edgeX2[i] = x2;
+      edgeY2[i] = y2;
 
-      edges.add(FixedEdge.fromDouble(x0, y0, x1, y1));
+      if (x1 < minX) minX = x1;
+      if (x1 > maxX) maxX = x1;
+      if (y1 < minY) minY = y1;
+      if (y1 > maxY) maxY = y1;
     }
 
-    // 2. Binning: distribuir arestas para tiles
-    for (final edge in edges) {
-      for (int ty = 0; ty < tilesY; ty++) {
-        for (int tx = 0; tx < tilesX; tx++) {
-          if (edge.intersectsTile(tx, ty, kTileSize)) {
-            _tiles[ty][tx].edges.add(edge);
+    final minXi = minX.floor().clamp(0, width - 1);
+    final maxXi = maxX.ceil().clamp(0, width - 1);
+    final minYi = minY.floor().clamp(0, height - 1);
+    final maxYi = maxY.ceil().clamp(0, height - 1);
+
+    final minTileX = (minXi ~/ kTileSize).clamp(0, tilesX - 1);
+    final maxTileX = (maxXi ~/ kTileSize).clamp(0, tilesX - 1);
+    final minTileY = (minYi ~/ kTileSize).clamp(0, tilesY - 1);
+    final maxTileY = (maxYi ~/ kTileSize).clamp(0, tilesY - 1);
+
+    // Processar por tiles dentro da bbox do polígono.
+    for (int ty = minTileY; ty <= maxTileY; ty++) {
+      final tileY0 = ty * kTileSize;
+      final tileY1 = math.min(tileY0 + kTileSize - 1, height - 1);
+      final yStart = math.max(tileY0, minYi);
+      final yEnd = math.min(tileY1, maxYi);
+
+      for (int tx = minTileX; tx <= maxTileX; tx++) {
+        final tileX0 = tx * kTileSize;
+        final tileX1 = math.min(tileX0 + kTileSize - 1, width - 1);
+        final xStart = math.max(tileX0, minXi);
+        final xEnd = math.min(tileX1, maxXi);
+
+        for (int y = yStart; y <= yEnd; y++) {
+          final cy = y + 0.5;
+
+          for (int x = xStart; x <= xEnd; x++) {
+            final cx = x + 0.5;
+            final alpha = _computePixelAlpha(
+              n,
+              edgeX1,
+              edgeY1,
+              edgeX2,
+              edgeY2,
+              cx,
+              cy,
+            );
+
+            if (alpha > 0) {
+              _blendPixel(x, y, color, alpha);
+            }
           }
         }
       }
     }
+  }
 
-    // 3. Processar cada tile que tem arestas
-    for (int ty = 0; ty < tilesY; ty++) {
-      for (int tx = 0; tx < tilesX; tx++) {
-        final tile = _tiles[ty][tx];
-        if (tile.edges.isNotEmpty) {
-          _processTile(tile, color);
+  @pragma('vm:prefer-inline')
+  int _computePixelAlpha(
+    int edgeCount,
+    List<double> edgeX1,
+    List<double> edgeY1,
+    List<double> edgeX2,
+    List<double> edgeY2,
+    double px,
+    double py,
+  ) {
+    int winding = 0;
+    double minDistSq = double.infinity;
+
+    for (int i = 0; i < edgeCount; i++) {
+      final x1 = edgeX1[i];
+      final y1 = edgeY1[i];
+      final x2 = edgeX2[i];
+      final y2 = edgeY2[i];
+
+      if (y1 <= py) {
+        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) {
+          winding++;
+        }
+      } else {
+        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) {
+          winding--;
         }
       }
-    }
-  }
 
-  /// Processa um tile usando acumulação de arestas
-  void _processTile(Tile tile, int color) {
-    final tilePixelX = tile.x * kTileSize;
-    final tilePixelY = tile.y * kTileSize;
-
-    // Para cada aresta que afeta o tile
-    for (final edge in tile.edges) {
-      _rasterizeEdgeInTile(tile, edge, tilePixelX, tilePixelY);
+      final distSq = _distanceToSegmentSq(x1, y1, x2, y2, px, py);
+      if (distSq < minDistSq) minDistSq = distSq;
     }
 
-    // Integrar e aplicar cor
-    _integrateTile(tile, tilePixelX, tilePixelY, color);
+    final inside = winding != 0;
+    final minDist = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
+    final signedDist = inside ? -minDist : minDist;
+
+    if (signedDist <= -0.5) return 255;
+    if (signedDist >= 0.5) return 0;
+
+    final t = (0.5 - signedDist).clamp(0.0, 1.0);
+    final coverage = t * t * (3.0 - 2.0 * t);
+    return (coverage * 255).round().clamp(0, 255);
   }
 
-  /// Rasteriza uma aresta dentro de um tile, acumulando no buffer
-  void _rasterizeEdgeInTile(
-      Tile tile, FixedEdge edge, int tilePixelX, int tilePixelY) {
-    // Range de scanlines dentro do tile
-    final tileTop = tilePixelY * kFracOne;
-    final tileBottom = (tilePixelY + kTileSize) * kFracOne;
+  @pragma('vm:prefer-inline')
+  double _distanceToSegmentSq(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    final vx = x2 - x1;
+    final vy = y2 - y1;
+    final wx = px - x1;
+    final wy = py - y1;
+    final vv = vx * vx + vy * vy;
 
-    final yStart = math.max(edge.y0, tileTop);
-    final yEnd = math.min(edge.y1, tileBottom);
-
-    if (yStart >= yEnd) return;
-
-    // Iterar por linhas fracionárias
-    // Convertemos para linhas de pixel inteiras
-    final pixelYStart = (yStart ~/ kFracOne) - tilePixelY;
-    final pixelYEnd = ((yEnd + kFracOne - 1) ~/ kFracOne) - tilePixelY;
-
-    for (int localY = math.max(0, pixelYStart);
-        localY < math.min(kTileSize, pixelYEnd);
-        localY++) {
-      final scanY = (tilePixelY + localY) * kFracOne + kFracHalf;
-
-      // Skip se fora da aresta
-      if (scanY < edge.y0 || scanY >= edge.y1) continue;
-
-      // Calcular X na intersecção
-      final xFixed = edge.xAtY(scanY);
-      final xPixel = xFixed ~/ kFracOne;
-      final xFrac = xFixed & (kFracOne - 1);
-
-      final localX = xPixel - tilePixelX;
-
-      if (localX >= 0 && localX < kTileSize) {
-        // Contribuição fracionária no pixel da interseção
-        final coverage = (kFracOne - xFrac).toDouble() / kFracOne;
-        tile.areaBuffer[localY * kTileSize + localX] += coverage * edge.dir;
-
-        // Contribuição de cobertura infinita para pixels à direita
-        if (localX + 1 < kTileSize) {
-          tile.coverBuffer[localY] += edge.dir.toDouble();
-        }
-      } else if (localX < 0) {
-        // Aresta está à esquerda do tile: afeta toda a linha
-        tile.coverBuffer[localY] += edge.dir.toDouble();
-      }
+    if (vv <= 1e-12) {
+      return wx * wx + wy * wy;
     }
+
+    var t = (wx * vx + wy * vy) / vv;
+    if (t < 0.0) {
+      t = 0.0;
+    } else if (t > 1.0) {
+      t = 1.0;
+    }
+
+    final cx = x1 + vx * t;
+    final cy = y1 + vy * t;
+    final dx = px - cx;
+    final dy = py - cy;
+    return dx * dx + dy * dy;
   }
 
-  /// Integra o buffer de acumulação e aplica cor ao framebuffer
-  void _integrateTile(Tile tile, int tilePixelX, int tilePixelY, int color) {
+  @pragma('vm:prefer-inline')
+  double _isLeft(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    return (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1);
+  }
+
+  @pragma('vm:prefer-inline')
+  void _blendPixel(int x, int y, int color, int alpha) {
+    if (alpha <= 0) return;
+
+    final idx = y * width + x;
+    if (alpha >= 255) {
+      _framebuffer[idx] = color;
+      return;
+    }
+
+    final bg = _framebuffer[idx];
     final colorR = (color >> 16) & 0xFF;
     final colorG = (color >> 8) & 0xFF;
     final colorB = color & 0xFF;
+    final bgR = (bg >> 16) & 0xFF;
+    final bgG = (bg >> 8) & 0xFF;
+    final bgB = bg & 0xFF;
 
-    for (int localY = 0; localY < kTileSize; localY++) {
-      final globalY = tilePixelY + localY;
-      if (globalY >= height) break;
+    final invA = 255 - alpha;
+    final r = (colorR * alpha + bgR * invA) ~/ 255;
+    final g = (colorG * alpha + bgG * invA) ~/ 255;
+    final b = (colorB * alpha + bgB * invA) ~/ 255;
 
-      // Soma prefixo horizontal
-      double accumulator = 0.0;
-
-      for (int localX = 0; localX < kTileSize; localX++) {
-        final globalX = tilePixelX + localX;
-        if (globalX >= width) break;
-
-        // Somar área local
-        accumulator += tile.areaBuffer[localY * kTileSize + localX];
-
-        // Adicionar cobertura de colunas anteriores
-        if (localX == 0) {
-          accumulator += tile.coverBuffer[localY];
-        }
-
-        // Cobertura final (clamp 0..1, winding rule)
-        var coverage = accumulator.abs().clamp(0.0, 1.0);
-
-        if (coverage > 0.001) {
-          final idx = globalY * width + globalX;
-          final alpha = (coverage * 255).toInt();
-
-          if (alpha >= 255) {
-            _framebuffer[idx] = 0xFF000000 | (colorR << 16) | (colorG << 8) | colorB;
-          } else {
-            // Blend
-            final bg = _framebuffer[idx];
-            final bgR = (bg >> 16) & 0xFF;
-            final bgG = (bg >> 8) & 0xFF;
-            final bgB = bg & 0xFF;
-
-            final invA = 255 - alpha;
-            final r = (colorR * alpha + bgR * invA) ~/ 255;
-            final g = (colorG * alpha + bgG * invA) ~/ 255;
-            final b = (colorB * alpha + bgB * invA) ~/ 255;
-
-            _framebuffer[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-          }
-        }
-      }
-    }
+    _framebuffer[idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
   }
 
   Uint32List get buffer => _framebuffer;
