@@ -158,12 +158,12 @@ class CoverageLUT2D {
     }
 
     // Índices na tabela
-    final thetaIdx =
-        ((normalizedTheta / (math.pi / 2)) * (thetaBins - 1)).round().clamp(
-            0, thetaBins - 1);
-    final distIdx =
-        (((signedDist + 1.25) / 2.5) * (distBins - 1)).round().clamp(
-            0, distBins - 1);
+    final thetaIdx = ((normalizedTheta / (math.pi / 2)) * (thetaBins - 1))
+        .round()
+        .clamp(0, thetaBins - 1);
+    final distIdx = (((signedDist + 1.25) / 2.5) * (distBins - 1))
+        .round()
+        .clamp(0, distBins - 1);
 
     return _table[thetaIdx * distBins + distIdx];
   }
@@ -200,7 +200,8 @@ class EplProcessedEdge {
     required this.invLength,
   });
 
-  factory EplProcessedEdge.fromPoints(double x1, double y1, double x2, double y2) {
+  factory EplProcessedEdge.fromPoints(
+      double x1, double y1, double x2, double y2) {
     final dx = x2 - x1;
     final dy = y2 - y1;
     final len = math.sqrt(dx * dx + dy * dy);
@@ -321,28 +322,37 @@ class EPLRasterizer {
   /// Computa a cobertura de um pixel usando a aresta dominante
   int _computePixelCoverage(
       List<EplProcessedEdge> edges, double centerX, double centerY) {
-    // Encontrar a aresta dominante (menor distância absoluta)
+    final centerInside = _isPointInsideWinding(edges, centerX, centerY);
+
+    // Encontrar a aresta dominante pela menor distância ao SEGMENTO
+    // (não à linha infinita), para evitar artefatos longe da borda real.
     EplProcessedEdge? dominantEdge;
-    double minAbsDist = double.infinity;
-    double secondMinAbsDist = double.infinity;
+    double minDistSq = double.infinity;
+    double secondMinDistSq = double.infinity;
 
     for (final edge in edges) {
-      final dist = edge.signedDistance(centerX, centerY);
-      final absDist = dist.abs();
+      final distSq = _distanceToSegmentSq(edge, centerX, centerY);
 
-      if (absDist < minAbsDist) {
-        secondMinAbsDist = minAbsDist;
-        minAbsDist = absDist;
+      if (distSq < minDistSq) {
+        secondMinDistSq = minDistSq;
+        minDistSq = distSq;
         dominantEdge = edge;
-      } else if (absDist < secondMinAbsDist) {
-        secondMinAbsDist = absDist;
+      } else if (distSq < secondMinDistSq) {
+        secondMinDistSq = distSq;
       }
     }
 
     if (dominantEdge == null) return 0;
 
+    // Pixel longe da borda: classificação binária robusta.
+    if (minDistSq > 0.55 * 0.55) {
+      return centerInside ? 255 : 0;
+    }
+
     // Verificar casos patológicos
-    final isPathological = secondMinAbsDist < 0.6 ||
+    final secondMinDist =
+        secondMinDistSq.isFinite ? math.sqrt(secondMinDistSq) : double.infinity;
+    final isPathological = secondMinDist < 0.6 ||
         dominantEdge.isNearEndpoint(centerX, centerY, 1.0);
 
     if (isPathological) {
@@ -352,19 +362,20 @@ class EPLRasterizer {
 
     // Caso normal: usar LUT
     final signedDist = dominantEdge.signedDistance(centerX, centerY);
+    var coverage = _coverageLUT.getCoverage(dominantEdge.theta, signedDist);
 
-    // Se o centro está claramente fora, retornar 0
-    if (signedDist > 0.5) return 0;
+    // Alinhar o lado "inside" da LUT com a classificação global do polígono.
+    final lineInside = signedDist <= 0.0;
+    if (lineInside != centerInside) {
+      coverage = 255 - coverage;
+    }
 
-    // Se o centro está claramente dentro, retornar 255
-    if (signedDist < -0.5) return 255;
-
-    // Usar LUT para cobertura de semi-plano
-    return _coverageLUT.getCoverage(dominantEdge.theta, signedDist);
+    return coverage.clamp(0, 255);
   }
 
   /// Fallback: supersampling 4×4 para pixels problemáticos
-  int _supersample4x4(List<EplProcessedEdge> edges, double pixelX, double pixelY) {
+  int _supersample4x4(
+      List<EplProcessedEdge> edges, double pixelX, double pixelY) {
     int count = 0;
 
     for (int sy = 0; sy < 4; sy++) {
@@ -373,20 +384,74 @@ class EPLRasterizer {
       for (int sx = 0; sx < 4; sx++) {
         final x = pixelX + (sx + 0.5) / 4;
 
-        // Verificar se está dentro de todas as arestas
-        bool inside = true;
-        for (final edge in edges) {
-          if (edge.signedDistance(x, y) > 0) {
-            inside = false;
-            break;
-          }
-        }
-
-        if (inside) count++;
+        if (_isPointInsideWinding(edges, x, y)) count++;
       }
     }
 
     return (count * 255) ~/ 16;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool _isPointInsideWinding(
+      List<EplProcessedEdge> edges, double px, double py) {
+    int winding = 0;
+
+    for (final edge in edges) {
+      final x1 = edge.x1;
+      final y1 = edge.y1;
+      final x2 = edge.x2;
+      final y2 = edge.y2;
+
+      if (y1 <= py) {
+        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) {
+          winding++;
+        }
+      } else {
+        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) {
+          winding--;
+        }
+      }
+    }
+
+    return winding != 0;
+  }
+
+  @pragma('vm:prefer-inline')
+  double _isLeft(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    return (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1);
+  }
+
+  @pragma('vm:prefer-inline')
+  double _distanceToSegmentSq(EplProcessedEdge edge, double px, double py) {
+    final vx = edge.x2 - edge.x1;
+    final vy = edge.y2 - edge.y1;
+    final wx = px - edge.x1;
+    final wy = py - edge.y1;
+
+    final vv = vx * vx + vy * vy;
+    if (vv <= 1e-12) {
+      return wx * wx + wy * wy;
+    }
+
+    var t = (wx * vx + wy * vy) / vv;
+    if (t < 0.0) {
+      t = 0.0;
+    } else if (t > 1.0) {
+      t = 1.0;
+    }
+
+    final cx = edge.x1 + vx * t;
+    final cy = edge.y1 + vy * t;
+    final dx = px - cx;
+    final dy = py - cy;
+    return dx * dx + dy * dy;
   }
 
   /// Aplica blending de um pixel

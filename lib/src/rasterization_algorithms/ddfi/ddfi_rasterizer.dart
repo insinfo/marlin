@@ -149,7 +149,9 @@ class FluxRenderer {
     // Início e Fim (Scanlines inteiras)
     // Otimização: bitwise shift para dividir por _one
     final yStart = (y1 + _mask) >> _shift; // Ceil
-    final yEnd = y2 >> _shift; // Floor
+    // Intervalo semiaberto em Y: inclui topo, exclui base.
+    // Isso evita dupla contagem em vértices compartilhados.
+    final yEnd = (y2 - 1) >> _shift;
 
     if (yStart > yEnd) return; // Aresta subpixel dentro da mesma linha
 
@@ -229,6 +231,11 @@ class FluxRenderer {
   /// Converte o buffer de derivadas em cores visíveis.
   /// Otimizado para processar apenas a área afetada (Bounding Box).
   void _resolveArea(int minX, int maxX, int minY, int maxY, int colorArgb) {
+    // _rasterizeEdge pode escrever em pixelX e pixelX+1.
+    // Expandimos 1px horizontal para integrar/limpar todo o fluxo local.
+    final resolveMinX = math.max(0, minX - 1);
+    final resolveMaxX = math.min(width - 1, maxX + 1);
+
     // Extrair canais de cor
     final a = (colorArgb >> 24) & 0xFF;
     final r = (colorArgb >> 16) & 0xFF;
@@ -243,7 +250,7 @@ class FluxRenderer {
       final rowOffset = y * width;
       int accumulatedCoverage = 0; // O integrador começa em 0 na esquerda
 
-      for (int x = minX; x <= maxX; x++) {
+      for (int x = resolveMinX; x <= resolveMaxX; x++) {
         final idx = rowOffset + x;
 
         // 1. INTEGRAÇÃO (Prefix Sum)
@@ -293,7 +300,7 @@ class FluxRenderer {
     // Limpar o buffer de fluxo na área processada para reutilização
     for (int y = minY; y <= maxY; y++) {
       final rowOffset = y * width;
-      for (int x = minX; x <= maxX; x++) {
+      for (int x = resolveMinX; x <= resolveMaxX; x++) {
         _fluxBuffer[rowOffset + x] = 0;
       }
     }

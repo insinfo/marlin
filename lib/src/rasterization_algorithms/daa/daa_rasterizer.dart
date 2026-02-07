@@ -108,9 +108,7 @@ class EdgeData {
   int evaluate(int x, int y) {
     // F(x,y) = A*x + B*y + C
     // Usando ponto fixo, precisamos ajustar a escala
-    return ((a * x) >> _fixedShift) +
-        ((b * y) >> _fixedShift) +
-        c;
+    return ((a * x) >> _fixedShift) + ((b * y) >> _fixedShift) + c;
   }
 }
 
@@ -156,6 +154,18 @@ class DAARasterizer {
     double y3,
     int color,
   ) {
+    // Normaliza winding para manter sinal consistente na função de aresta.
+    final area2 = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1);
+    if (area2 == 0.0) return;
+    if (area2 > 0.0) {
+      final tx = x2;
+      final ty = y2;
+      x2 = x3;
+      y2 = y3;
+      x3 = tx;
+      y3 = ty;
+    }
+
     // Converter para ponto fixo
     final fx1 = _toFixed(x1);
     final fy1 = _toFixed(y1);
@@ -257,17 +267,139 @@ class DAARasterizer {
     if (vertices.length < 6) return; // Mínimo 3 vértices (6 coordenadas)
 
     final n = vertices.length ~/ 2;
-    final x0 = vertices[0];
-    final y0 = vertices[1];
+    final edgeX1 = List<double>.filled(n, 0.0);
+    final edgeY1 = List<double>.filled(n, 0.0);
+    final edgeX2 = List<double>.filled(n, 0.0);
+    final edgeY2 = List<double>.filled(n, 0.0);
 
-    // Fan triangulation a partir do primeiro vértice
-    for (int i = 1; i < n - 1; i++) {
+    var minX = vertices[0];
+    var maxX = vertices[0];
+    var minY = vertices[1];
+    var maxY = vertices[1];
+
+    for (int i = 0; i < n; i++) {
+      final j = (i + 1) % n;
       final x1 = vertices[i * 2];
       final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[(i + 1) * 2];
-      final y2 = vertices[(i + 1) * 2 + 1];
+      final x2 = vertices[j * 2];
+      final y2 = vertices[j * 2 + 1];
 
-      drawTriangle(x0, y0, x1, y1, x2, y2, color);
+      edgeX1[i] = x1;
+      edgeY1[i] = y1;
+      edgeX2[i] = x2;
+      edgeY2[i] = y2;
+
+      if (x1 < minX) minX = x1;
+      if (x1 > maxX) maxX = x1;
+      if (y1 < minY) minY = y1;
+      if (y1 > maxY) maxY = y1;
     }
+
+    final minXi = minX.floor().clamp(0, width - 1);
+    final maxXi = maxX.ceil().clamp(0, width - 1);
+    final minYi = minY.floor().clamp(0, height - 1);
+    final maxYi = maxY.ceil().clamp(0, height - 1);
+
+    for (int y = minYi; y <= maxYi; y++) {
+      final py = y + 0.5;
+      final rowOffset = y * width;
+
+      for (int x = minXi; x <= maxXi; x++) {
+        final px = x + 0.5;
+        final alpha = _computePolygonAlpha(
+          edgeCount: n,
+          edgeX1: edgeX1,
+          edgeY1: edgeY1,
+          edgeX2: edgeX2,
+          edgeY2: edgeY2,
+          px: px,
+          py: py,
+        );
+
+        if (alpha == 255) {
+          framebuffer[rowOffset + x] = color;
+        } else if (alpha > 0) {
+          _blendPixel(rowOffset + x, color, alpha);
+        }
+      }
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  int _computePolygonAlpha({
+    required int edgeCount,
+    required List<double> edgeX1,
+    required List<double> edgeY1,
+    required List<double> edgeX2,
+    required List<double> edgeY2,
+    required double px,
+    required double py,
+  }) {
+    int winding = 0;
+    double minDistSq = double.infinity;
+
+    for (int i = 0; i < edgeCount; i++) {
+      final x1 = edgeX1[i];
+      final y1 = edgeY1[i];
+      final x2 = edgeX2[i];
+      final y2 = edgeY2[i];
+
+      if (y1 <= py) {
+        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) winding++;
+      } else {
+        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) winding--;
+      }
+
+      final distSq = _distanceToSegmentSq(x1, y1, x2, y2, px, py);
+      if (distSq < minDistSq) minDistSq = distSq;
+    }
+
+    final inside = winding != 0;
+    final minDist = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
+    final signedDist = inside ? -minDist : minDist;
+    return _coverageLUT.getAlpha((signedDist * _fixedOne).toInt());
+  }
+
+  @pragma('vm:prefer-inline')
+  double _distanceToSegmentSq(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    final vx = x2 - x1;
+    final vy = y2 - y1;
+    final wx = px - x1;
+    final wy = py - y1;
+    final vv = vx * vx + vy * vy;
+
+    if (vv <= 1e-12) return wx * wx + wy * wy;
+
+    var t = (wx * vx + wy * vy) / vv;
+    if (t < 0.0) {
+      t = 0.0;
+    } else if (t > 1.0) {
+      t = 1.0;
+    }
+
+    final cx = x1 + vx * t;
+    final cy = y1 + vy * t;
+    final dx = px - cx;
+    final dy = py - cy;
+    return dx * dx + dy * dy;
+  }
+
+  @pragma('vm:prefer-inline')
+  double _isLeft(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    double px,
+    double py,
+  ) {
+    return (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1);
   }
 }

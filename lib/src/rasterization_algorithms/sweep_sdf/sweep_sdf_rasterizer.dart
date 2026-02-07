@@ -40,7 +40,7 @@ double smoothstep(double x) {
 /// S(x) = (x+0.5)³ - 0.5(x+0.5)⁴
 double smoothstepIntegral(double x) {
   if (x <= -0.5) return 0.0;
-  if (x >= 0.5) return x + 0.5 - 1.0/12.0; // Integral acumulada
+  if (x >= 0.5) return x + 0.5 - 1.0 / 12.0; // Integral acumulada
   final t = x + 0.5;
   return math.pow(t, 3) - 0.5 * math.pow(t, 4);
 }
@@ -48,12 +48,12 @@ double smoothstepIntegral(double x) {
 /// g(d): cobertura de um subpixel de largura 1/3 centrado na distância d
 /// g(d) = S(d + 1/6) - S(d - 1/6)
 double coverageG(double d) {
-  return smoothstepIntegral(d + 1.0/6.0) - smoothstepIntegral(d - 1.0/6.0);
+  return smoothstepIntegral(d + 1.0 / 6.0) - smoothstepIntegral(d - 1.0 / 6.0);
 }
 
 /// g'(d): derivada de g(d) = s(d + 1/6) - s(d - 1/6)
 double coverageGPrime(double d) {
-  return smoothstep(d + 1.0/6.0) - smoothstep(d - 1.0/6.0);
+  return smoothstep(d + 1.0 / 6.0) - smoothstep(d - 1.0 / 6.0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ double coverageGPrime(double d) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class CoverageTables {
-  static const int tableSize = 256;
+  static const int tableSize = 1024;
 
   final Float64List gTable;
   final Float64List gPrimeTable;
@@ -81,11 +81,81 @@ class CoverageTables {
     }
   }
 
-  /// Obtém valores de g e g' para uma distância d
-  List<double> lookup(double d) {
-    final dClamped = d.clamp(-1.0, 1.0);
-    final index = (((dClamped + 1.0) / 2.0) * (tableSize - 1)).round().clamp(0, tableSize - 1);
-    return [gTable[index], gPrimeTable[index]];
+  @pragma('vm:prefer-inline')
+  double _lookupInterpolated(Float64List table, double d) {
+    if (d <= -1.0) return table[0];
+    if (d >= 1.0) return table[tableSize - 1];
+
+    final pos = ((d + 1.0) * 0.5) * (tableSize - 1);
+    int i = pos.floor();
+    if (i >= tableSize - 1) i = tableSize - 2;
+    final t = pos - i;
+    final a = table[i];
+    final b = table[i + 1];
+    return a + (b - a) * t;
+  }
+
+  @pragma('vm:prefer-inline')
+  double lookupG(double d) => _lookupInterpolated(gTable, d);
+
+  @pragma('vm:prefer-inline')
+  double lookupGPrime(double d) => _lookupInterpolated(gPrimeTable, d);
+}
+
+@pragma('vm:prefer-inline')
+double _clamp01(double v) {
+  if (v <= 0.0) return 0.0;
+  if (v >= 1.0) return 1.0;
+  return v;
+}
+
+@pragma('vm:prefer-inline')
+int _blendChannel(int existing, int color, double coverage) {
+  final intensity = (_clamp01(coverage) * 255.0).round().clamp(0, 255);
+  return ((color * intensity + existing * (255 - intensity)) ~/ 255)
+      .clamp(0, 255);
+}
+
+extension on SweepSDFRasterizer {
+  @pragma('vm:prefer-inline')
+  void _paintBorderPixel(
+    int px,
+    int py,
+    SweepActiveEdge edge,
+    double edgeXAtScanline,
+    bool invertCoverage,
+    int colorR,
+    int colorG,
+    int colorB,
+  ) {
+    final pixelCenterX = px + 0.5;
+    final dPixel = edge.nx * (pixelCenterX - edgeXAtScanline);
+
+    final g = _tables.lookupG(dPixel);
+    final gPrime = _tables.lookupGPrime(dPixel);
+
+    final idx = (py * width + px) * 3;
+
+    final dR = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[0];
+    final dG = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[1];
+    final dB = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[2];
+
+    double cR = g + gPrime * (dR - dPixel);
+    double cG = g + gPrime * (dG - dPixel);
+    double cB = g + gPrime * (dB - dPixel);
+
+    if (invertCoverage) {
+      cR = 1.0 - cR;
+      cG = 1.0 - cG;
+      cB = 1.0 - cB;
+    }
+
+    _subpixelBuffer[idx + 0] =
+        _blendChannel(_subpixelBuffer[idx + 0], colorR, cR);
+    _subpixelBuffer[idx + 1] =
+        _blendChannel(_subpixelBuffer[idx + 1], colorG, cG);
+    _subpixelBuffer[idx + 2] =
+        _blendChannel(_subpixelBuffer[idx + 2], colorB, cB);
   }
 }
 
@@ -126,7 +196,7 @@ class SweepSDFRasterizer {
   final CoverageTables _tables;
 
   /// Offsets subpixel (layout LCD RGB horizontal)
-  static const List<double> subpixelOffsetsX = [-1.0/3.0, 0.0, 1.0/3.0];
+  static const List<double> subpixelOffsetsX = [-1.0 / 3.0, 0.0, 1.0 / 3.0];
 
   SweepSDFRasterizer({required this.width, required this.height})
       : _tables = CoverageTables() {
@@ -226,17 +296,27 @@ class SweepSDFRasterizer {
       for (int i = 0; i + 1 < activeEdges.length; i += 2) {
         final leftEdge = activeEdges[i];
         final rightEdge = activeEdges[i + 1];
-
         final xLeft = leftEdge.x;
         final xRight = rightEdge.x;
 
         final xStart = xLeft.ceil().clamp(0, width);
         final xEnd = xRight.floor().clamp(0, width);
+        const eps = 1e-9;
+        final hasLeftFraction = (xStart - xLeft) > eps;
+        final hasRightFraction = (xRight - xEnd) > eps;
 
         // Pixel de borda esquerda
-        if (xStart > 0 && xStart - 1 < width) {
-          _processLeftBorderPixel(
-            xStart - 1, y, leftEdge, colorR, colorG, colorB);
+        if (hasLeftFraction && xStart > 0 && xStart - 1 < width) {
+          _paintBorderPixel(
+            xStart - 1,
+            y,
+            leftEdge,
+            xLeft,
+            true,
+            colorR,
+            colorG,
+            colorB,
+          );
         }
 
         // Pixels interiores (cobertura total)
@@ -250,9 +330,20 @@ class SweepSDFRasterizer {
         }
 
         // Pixel de borda direita
-        if (xEnd >= 0 && xEnd < width && xEnd != xStart - 1) {
-          _processRightBorderPixel(
-            xEnd, y, rightEdge, colorR, colorG, colorB);
+        if (hasRightFraction &&
+            xEnd >= 0 &&
+            xEnd < width &&
+            xEnd != xStart - 1) {
+          _paintBorderPixel(
+            xEnd,
+            y,
+            rightEdge,
+            xRight,
+            false,
+            colorR,
+            colorG,
+            colorB,
+          );
         }
       }
 
@@ -260,84 +351,6 @@ class SweepSDFRasterizer {
       for (final edge in activeEdges) {
         edge.x += edge.slopeInverse;
       }
-    }
-  }
-
-  /// Processa pixel de borda esquerda
-  void _processLeftBorderPixel(
-    int px, int py,
-    SweepActiveEdge edge,
-    int colorR, int colorG, int colorB,
-  ) {
-    final pixelCenterX = px + 0.5;
-
-    // Distância do centro do pixel à aresta (ao longo da normal)
-    final dPixel = edge.nx * (pixelCenterX - edge.x);
-
-    // Lookup de g e g'
-    final gValues = _tables.lookup(dPixel);
-    final g = gValues[0];
-    final gPrime = gValues[1];
-
-    // Calcular cobertura para cada subpixel
-    final idx = (py * width + px) * 3;
-
-    for (int s = 0; s < 3; s++) {
-      // Distância do subpixel à aresta
-      final dSub = dPixel + edge.nx * subpixelOffsetsX[s];
-
-      // Aproximação linear: g(dSub) ≈ g(dPixel) + g'(dPixel) * (dSub - dPixel)
-      var coverage = g + gPrime * (dSub - dPixel);
-
-      // Para borda esquerda, queremos a área à direita da aresta
-      coverage = (1.0 - coverage).clamp(0.0, 1.0);
-
-      final intensity = (coverage * 255).round().clamp(0, 255);
-      final existing = _subpixelBuffer[idx + s];
-
-      // Blend
-      final colors = [colorR, colorG, colorB];
-      _subpixelBuffer[idx + s] =
-          ((colors[s] * intensity + existing * (255 - intensity)) ~/ 255)
-              .clamp(0, 255);
-    }
-  }
-
-  /// Processa pixel de borda direita
-  void _processRightBorderPixel(
-    int px, int py,
-    SweepActiveEdge edge,
-    int colorR, int colorG, int colorB,
-  ) {
-    final pixelCenterX = px + 0.5;
-
-    // Distância do centro do pixel à aresta
-    final dPixel = edge.nx * (pixelCenterX - edge.x);
-
-    // Lookup de g e g'
-    final gValues = _tables.lookup(dPixel);
-    final g = gValues[0];
-    final gPrime = gValues[1];
-
-    // Calcular cobertura para cada subpixel
-    final idx = (py * width + px) * 3;
-
-    for (int s = 0; s < 3; s++) {
-      final dSub = dPixel + edge.nx * subpixelOffsetsX[s];
-
-      // Aproximação linear
-      var coverage = g + gPrime * (dSub - dPixel);
-
-      // Para borda direita, queremos a área à esquerda da aresta
-      coverage = coverage.clamp(0.0, 1.0);
-
-      final intensity = (coverage * 255).round().clamp(0, 255);
-      final existing = _subpixelBuffer[idx + s];
-
-      final colors = [colorR, colorG, colorB];
-      _subpixelBuffer[idx + s] =
-          ((colors[s] * intensity + existing * (255 - intensity)) ~/ 255)
-              .clamp(0, 255);
     }
   }
 

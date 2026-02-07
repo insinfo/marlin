@@ -117,14 +117,38 @@ class Blend2DRasterizer2 {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    double area2 = 0.0;
     for (int i = 0; i < n; i++) {
       final j = (i + 1) % n;
-      _rasterizeEdge(
-        vertices[i * 2],
-        vertices[i * 2 + 1],
-        vertices[j * 2],
-        vertices[j * 2 + 1],
-      );
+      area2 += vertices[i * 2] * vertices[j * 2 + 1] -
+          vertices[j * 2] * vertices[i * 2 + 1];
+    }
+
+    // Normaliza winding para evitar cancelamento entre polígonos sobrepostos
+    // no modo batch (os testes usam composição "over" com mesma cor).
+    final reverse = area2 > 0.0;
+
+    if (!reverse) {
+      for (int i = 0; i < n; i++) {
+        final j = (i + 1) % n;
+        _rasterizeEdge(
+          vertices[i * 2],
+          vertices[i * 2 + 1],
+          vertices[j * 2],
+          vertices[j * 2 + 1],
+        );
+      }
+    } else {
+      for (int i = 0; i < n; i++) {
+        final idx = n - 1 - i;
+        final jdx = (idx - 1 + n) % n;
+        _rasterizeEdge(
+          vertices[idx * 2],
+          vertices[idx * 2 + 1],
+          vertices[jdx * 2],
+          vertices[jdx * 2 + 1],
+        );
+      }
     }
   }
 
@@ -160,8 +184,7 @@ class Blend2DRasterizer2 {
     final bool canUseSimd = config.useSimd && (fillRule == 1);
 
     // Decide serial vs parallel
-    final bool shouldParallel =
-        config.useIsolates &&
+    final bool shouldParallel = config.useIsolates &&
         dirtyH >= config.minParallelDirtyHeight &&
         (maxTile - minTile + 1) >= 2;
 
@@ -173,6 +196,7 @@ class Blend2DRasterizer2 {
         _resolveTileSerial(
           tile: tile,
           color: color,
+          fillRule: fillRule,
           useSimd: canUseSimd,
         );
 
@@ -195,6 +219,7 @@ class Blend2DRasterizer2 {
         _resolveTileSerial(
           tile: tile,
           color: color,
+          fillRule: fillRule,
           useSimd: canUseSimd,
         );
 
@@ -329,8 +354,7 @@ class Blend2DRasterizer2 {
 
     if (ix0 == ix1) {
       final double xAvg = (x0 + x1) * 0.5 - ix0;
-      final int areaVal =
-          (distY * (xAvg * kCovOne)).toInt() >> kCovShift;
+      final int areaVal = (distY * (xAvg * kCovOne)).toInt() >> kCovShift;
 
       final int idx = rowOffset + ix0;
       tile.covers[idx] += distY;
@@ -345,7 +369,8 @@ class Blend2DRasterizer2 {
     double currX0 = x0;
     int currIX = ix0;
 
-    int currYFixed = ((y0) * kCovOne).toInt(); // y0 já é relativo à linha (0..1)
+    int currYFixed =
+        ((y0) * kCovOne).toInt(); // y0 já é relativo à linha (0..1)
 
     while (currIX != ix1) {
       final double t = (borderX - x0) / dx;
@@ -429,6 +454,7 @@ class Blend2DRasterizer2 {
   static void _resolveTileSerial({
     required _Tile tile,
     required int color,
+    required int fillRule,
     required bool useSimd,
   }) {
     final dto = _ResolveDTO(
@@ -438,7 +464,7 @@ class Blend2DRasterizer2 {
       areas: tile.areas,
       framebuffer: tile.fb,
       color: color,
-      fillRule: tile.ownerFillRule,
+      fillRule: fillRule,
       useSimd: useSimd,
     );
 
@@ -593,8 +619,8 @@ class Blend2DRasterizer2 {
         final Int32x4 vArea = areaView[rowSimdIdx];
 
         // limpa 4 por vez
-        coverView[rowSimdIdx] =  Int32x4(0, 0, 0, 0);
-        areaView[rowSimdIdx] =  Int32x4(0, 0, 0, 0);
+        coverView[rowSimdIdx] = Int32x4(0, 0, 0, 0);
+        areaView[rowSimdIdx] = Int32x4(0, 0, 0, 0);
 
         final int c0 = vCov.x;
         final int c1 = vCov.y;
@@ -617,7 +643,10 @@ class Blend2DRasterizer2 {
         var vAlphaF = vCoverageF.abs() * vScaleF; // (abs * 255 / 256)
         vAlphaF = vAlphaF.min(v255F).max(vZeroF);
 
-        if (vAlphaF.x < 1.0 && vAlphaF.y < 1.0 && vAlphaF.z < 1.0 && vAlphaF.w < 1.0) {
+        if (vAlphaF.x < 1.0 &&
+            vAlphaF.y < 1.0 &&
+            vAlphaF.z < 1.0 &&
+            vAlphaF.w < 1.0) {
           rowSimdIdx++;
           continue;
         }
@@ -629,8 +658,10 @@ class Blend2DRasterizer2 {
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
           final int invAlpha = 255 - finalAlpha;
-          final int outR = (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG = (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
+          final int outR =
+              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
+          final int outG =
+              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
           final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
@@ -641,8 +672,10 @@ class Blend2DRasterizer2 {
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
           final int invAlpha = 255 - finalAlpha;
-          final int outR = (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG = (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
+          final int outR =
+              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
+          final int outG =
+              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
           final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
@@ -653,8 +686,10 @@ class Blend2DRasterizer2 {
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
           final int invAlpha = 255 - finalAlpha;
-          final int outR = (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG = (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
+          final int outR =
+              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
+          final int outG =
+              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
           final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
@@ -665,8 +700,10 @@ class Blend2DRasterizer2 {
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
           final int invAlpha = 255 - finalAlpha;
-          final int outR = (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG = (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
+          final int outR =
+              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
+          final int outG =
+              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
           final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
@@ -742,11 +779,6 @@ class _Tile {
   })  : covers = Int32List(width * height),
         areas = Int32List(width * height),
         fb = Uint32List(width * height);
-
-  // Hack simples: fillRule vem do rasterizer, mas o resolve estático só recebe dto.
-  // Durante resolve serial chamamos com dto.fillRule preenchido.
-  // No worker, o fillRule vai dentro do job.
-  int get ownerFillRule => 1;
 }
 
 class _ResolveDTO {
@@ -938,10 +970,12 @@ class _Worker {
       'fillRule': job.fillRule,
       'useSimd': job.useSimd,
       'covers': TransferableTypedData.fromList([
-        job.covers.buffer.asUint8List(job.covers.offsetInBytes, job.covers.lengthInBytes)
+        job.covers.buffer
+            .asUint8List(job.covers.offsetInBytes, job.covers.lengthInBytes)
       ]),
       'areas': TransferableTypedData.fromList([
-        job.areas.buffer.asUint8List(job.areas.offsetInBytes, job.areas.lengthInBytes)
+        job.areas.buffer
+            .asUint8List(job.areas.offsetInBytes, job.areas.lengthInBytes)
       ]),
       'fb': TransferableTypedData.fromList([
         job.fb.buffer.asUint8List(job.fb.offsetInBytes, job.fb.lengthInBytes)
@@ -991,12 +1025,12 @@ void _workerMain(SendPort readyPort) {
 
       // ✅ Materialize com await conforme solicitado para garantir integridade
       final ByteBuffer coversBuffer = await (tC.materialize() as dynamic);
-      final ByteBuffer areasBuffer  = await (tA.materialize() as dynamic);
-      final ByteBuffer fbBuffer     = await (tF.materialize() as dynamic);
+      final ByteBuffer areasBuffer = await (tA.materialize() as dynamic);
+      final ByteBuffer fbBuffer = await (tF.materialize() as dynamic);
 
       final ByteData coversBd = ByteData.view(coversBuffer);
-      final ByteData areasBd  = ByteData.view(areasBuffer);
-      final ByteData fbBd     = ByteData.view(fbBuffer);
+      final ByteData areasBd = ByteData.view(areasBuffer);
+      final ByteData fbBd = ByteData.view(fbBuffer);
 
       final Int32List covers = coversBd.buffer.asInt32List(
         coversBd.offsetInBytes,
