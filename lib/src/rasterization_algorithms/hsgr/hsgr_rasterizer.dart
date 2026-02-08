@@ -13,6 +13,7 @@
 
 import 'dart:math' as math;
 import 'dart:typed_data';
+import '../common/polygon_contract.dart';
 
 @pragma('vm:prefer-inline')
 double _cross2(double ax, double ay, double bx, double by) => ax * by - ay * bx;
@@ -232,7 +233,7 @@ class _HilbertPathCache {
 // RASTERIZADOR HSGR
 // ─────────────────────────────────────────────────────────────────────────────
 
-class HSGRRasterizer {
+class HSGRRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -255,27 +256,143 @@ class HSGRRasterizer {
 
   Uint32List get buffer => _buffer;
 
-  void drawPolygon(List<double> vertices, int color) {
+  @override
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
+    final pointCount = vertices.length ~/ 2;
+    final contours = _resolveContours(pointCount, contourVertexCounts);
+    if (contours.isEmpty) return;
 
-    if (vertices.length == 6) {
+    // Fast-path: triângulo único continua no kernel original.
+    if (contours.length == 1 && contours.first.count == 3) {
       drawTriangle(
-        vertices[0], vertices[1],
-        vertices[2], vertices[3],
-        vertices[4], vertices[5],
+        vertices[0],
+        vertices[1],
+        vertices[2],
+        vertices[3],
+        vertices[4],
+        vertices[5],
         color,
       );
       return;
     }
+    if (contours.length == 1 && windingRule != 0) {
+      final only = contours.first;
+      final local = <double>[];
+      for (int i = 0; i < only.count; i++) {
+        final p = only.start + i;
+        local.add(vertices[p * 2]);
+        local.add(vertices[p * 2 + 1]);
+      }
+      final tris = _triangulateEarClipping(local);
+      if (tris.isNotEmpty) {
+        for (final t in tris) {
+          drawTriangle(
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+            t[4],
+            t[5],
+            color,
+          );
+        }
+        return;
+      }
+    }
 
-    final tris = _triangulateEarClipping(vertices);
-    for (final t in tris) {
-      drawTriangle(
-        t[0], t[1],
-        t[2], t[3],
-        t[4], t[5],
-        color,
-      );
+    double minX = double.infinity;
+    double minY = double.infinity;
+    double maxX = double.negativeInfinity;
+    double maxY = double.negativeInfinity;
+    for (int i = 0; i < vertices.length; i += 2) {
+      final x = vertices[i];
+      final y = vertices[i + 1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+
+    final int x0 = minX.floor().clamp(0, width - 1);
+    final int y0 = minY.floor().clamp(0, height - 1);
+    final int x1 = maxX.ceil().clamp(0, width - 1);
+    final int y1 = maxY.ceil().clamp(0, height - 1);
+    if (x0 > x1 || y0 > y1) return;
+
+    final edges = <_PolyEdge>[];
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int i = 0; i < contour.count; i++) {
+        final int p0 = contour.start + i;
+        final int p1 = contour.start + ((i + 1) % contour.count);
+        final double ex1 = vertices[p0 * 2];
+        final double ey1 = vertices[p0 * 2 + 1];
+        final double ex2 = vertices[p1 * 2];
+        final double ey2 = vertices[p1 * 2 + 1];
+        edges.add(_PolyEdge(
+          ex1,
+          ey1,
+          ex2,
+          ey2,
+          ey1 < ey2 ? 1 : -1,
+        ));
+      }
+    }
+    if (edges.isEmpty) return;
+    final rowBuckets = _buildRowBuckets(edges, y0, y1);
+
+    final tSize = 1 << tileOrder.clamp(1, 10);
+    final tilesX = ((x1 - x0 + 1) + tSize - 1) ~/ tSize;
+    final tilesY = ((y1 - y0 + 1) + tSize - 1) ~/ tSize;
+    final order = _ceilLog2(math.max(tilesX, tilesY));
+    final path = _HilbertPathCache.getPath(order);
+
+    for (int i = 0; i < path.length; i++) {
+      final packed = path[i];
+      final tx = packed & 0xFFFF;
+      final ty = (packed >> 16) & 0x3FFF;
+      if (tx >= tilesX || ty >= tilesY) continue;
+
+      final tileX0 = x0 + tx * tSize;
+      final tileY0 = y0 + ty * tSize;
+      final tileX1 = math.min(tileX0 + tSize - 1, x1);
+      final tileY1 = math.min(tileY0 + tSize - 1, y1);
+
+      for (int y = tileY0; y <= tileY1; y++) {
+        final rowEdges = rowBuckets[y - y0];
+        if (rowEdges.isEmpty) continue;
+        final row = y * width;
+        final py = y + 0.5;
+        for (int x = tileX0; x <= tileX1; x++) {
+          final idx = row + x;
+          final px = x + 0.5;
+
+          final inside = _isInsideIndexed(px, py, edges, rowEdges, windingRule);
+          double minDistSq = double.infinity;
+          for (int k = 0; k < rowEdges.length; k++) {
+            final e = edges[rowEdges[k]];
+            final distSq =
+                _pointSegmentDistanceSq(px, py, e.x1, e.y1, e.x2, e.y2);
+            if (distSq < minDistSq) minDistSq = distSq;
+          }
+
+          final dist = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
+          final signed = inside ? -dist : dist;
+          final alpha = (0.5 - signed).clamp(0.0, 1.0);
+          if (alpha <= 0.0) continue;
+          if (alpha >= 1.0) {
+            _buffer[idx] = color;
+          } else {
+            _blendPixelByIndex(idx, color, (alpha * 255).round());
+          }
+        }
+      }
     }
   }
 
@@ -444,4 +561,124 @@ class HSGRRasterizer {
 
     _buffer[idx] = 0xFF000000 | r | g;
   }
+}
+
+class _PolyEdge {
+  final double x1;
+  final double y1;
+  final double x2;
+  final double y2;
+  final int winding;
+
+  const _PolyEdge(this.x1, this.y1, this.x2, this.y2, this.winding);
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final rawCount in counts) {
+    if (rawCount <= 0) continue;
+    if (consumed + rawCount > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, rawCount));
+    consumed += rawCount;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
+}
+
+@pragma('vm:prefer-inline')
+double _pointSegmentDistanceSq(
+  double px,
+  double py,
+  double x1,
+  double y1,
+  double x2,
+  double y2,
+) {
+  final vx = x2 - x1;
+  final vy = y2 - y1;
+  final vv = vx * vx + vy * vy;
+  double t;
+  if (vv <= 1e-12) {
+    t = 0.0;
+  } else {
+    t = ((px - x1) * vx + (py - y1) * vy) / vv;
+    if (t < 0.0) {
+      t = 0.0;
+    } else if (t > 1.0) {
+      t = 1.0;
+    }
+  }
+  final cx = x1 + vx * t;
+  final cy = y1 + vy * t;
+  final dx = px - cx;
+  final dy = py - cy;
+  return dx * dx + dy * dy;
+}
+
+bool _isInsideIndexed(
+  double px,
+  double py,
+  List<_PolyEdge> edges,
+  List<int> edgeIndices,
+  int windingRule,
+) {
+  int winding = 0;
+  int crossings = 0;
+  for (int i = 0; i < edgeIndices.length; i++) {
+    final e = edges[edgeIndices[i]];
+    final bool upward = e.y1 <= py && e.y2 > py;
+    final bool downward = e.y1 > py && e.y2 <= py;
+    if (!(upward || downward)) continue;
+    final cross = (e.x2 - e.x1) * (py - e.y1) - (px - e.x1) * (e.y2 - e.y1);
+    if (cross > 0 && upward) {
+      winding += e.winding;
+      crossings++;
+    } else if (cross < 0 && downward) {
+      winding += e.winding;
+      crossings++;
+    }
+  }
+  if (windingRule == 0) return (crossings & 1) != 0;
+  return winding != 0;
+}
+
+List<List<int>> _buildRowBuckets(List<_PolyEdge> edges, int y0, int y1) {
+  final rows = y1 - y0 + 1;
+  final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+  for (int i = 0; i < edges.length; i++) {
+    final e = edges[i];
+    final minY = math.min(e.y1, e.y2);
+    final maxY = math.max(e.y1, e.y2);
+    final r0 = (minY.floor() - 1).clamp(y0, y1);
+    final r1 = (maxY.ceil() + 1).clamp(y0, y1);
+    for (int y = r0; y <= r1; y++) {
+      buckets[y - y0].add(i);
+    }
+  }
+  return buckets;
+}
+
+int _ceilLog2(int v) {
+  if (v <= 1) return 0;
+  int p = 0;
+  int x = 1;
+  while (x < v) {
+    x <<= 1;
+    p++;
+  }
+  return p;
 }

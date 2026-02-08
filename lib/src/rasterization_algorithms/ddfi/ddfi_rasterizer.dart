@@ -311,7 +311,12 @@ class FluxRenderer {
 
   /// Desenha um polígono (arestas apenas, sem triangulação)
   /// para evitar artefatos em polígonos côncavos.
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return; // Mínimo 3 vértices
 
     final n = vertices.length ~/ 2;

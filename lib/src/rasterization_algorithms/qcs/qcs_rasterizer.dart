@@ -119,12 +119,19 @@ class QCSRasterizer {
 
   /// Buffer de assinaturas por scanline (auxiliar de integração)
   late final Uint8List _signatureScanline;
+  late final Int32List _wTopR, _wTopG, _wTopB, _wBotR, _wBotG, _wBotB;
 
   QCSRasterizer({required this.width, required this.height})
       : _lut = SubpixelLUT() {
     _subpixelBuffer = Uint8List(width * height * 3);
     _pixelBuffer = Uint32List(width * height);
     _signatureScanline = Uint8List(width + 1);
+    _wTopR = Int32List(width + 1);
+    _wTopG = Int32List(width + 1);
+    _wTopB = Int32List(width + 1);
+    _wBotR = Int32List(width + 1);
+    _wBotG = Int32List(width + 1);
+    _wBotB = Int32List(width + 1);
   }
 
   void clear([int backgroundColor = 0xFFFFFFFF]) {
@@ -139,24 +146,37 @@ class QCSRasterizer {
     }
   }
 
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
 
     // 1. Pré-processamento de Arestas
     final edges = <_QcsEdge>[];
     double minY = double.infinity, maxY = double.negativeInfinity;
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x0 = vertices[i * 2], y0 = vertices[i * 2 + 1];
-      final x1 = vertices[j * 2], y1 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x0 = vertices[i * 2], y0 = vertices[i * 2 + 1];
+        final x1 = vertices[j * 2], y1 = vertices[j * 2 + 1];
 
-      if (y0 < minY) minY = y0; if (y0 > maxY) maxY = y0;
-      if (y1 < minY) minY = y1; if (y1 > maxY) maxY = y1;
-      if (y0 == y1) continue;
-      
-      edges.add(_QcsEdge(x0, y0, x1, y1));
+        if (y0 < minY) minY = y0;
+        if (y0 > maxY) maxY = y0;
+        if (y1 < minY) minY = y1;
+        if (y1 > maxY) maxY = y1;
+        if (y0 == y1) continue;
+
+        final windingDelta = (y1 > y0) ? 1 : -1;
+        edges.add(_QcsEdge(x0, y0, x1, y1, windingDelta));
+      }
     }
 
     final pxMinY = minY.floor().clamp(0, height - 1);
@@ -169,22 +189,34 @@ class QCSRasterizer {
     // 2. Loop de Scanlines
     for (int py = pxMinY; py <= pxMaxY; py++) {
       _signatureScanline.fillRange(0, _signatureScanline.length, 0);
+      if (windingRule != 0) {
+        _wTopR.fillRange(0, _wTopR.length, 0);
+        _wTopG.fillRange(0, _wTopG.length, 0);
+        _wTopB.fillRange(0, _wTopB.length, 0);
+        _wBotR.fillRange(0, _wBotR.length, 0);
+        _wBotG.fillRange(0, _wBotG.length, 0);
+        _wBotB.fillRange(0, _wBotB.length, 0);
+      }
 
       // Y dos centros das duas sub-scanlines QCS
       final yTop = py + 0.25;
       final yBot = py + 0.75;
 
-      // 3. Fase de Toggle (Marcar Bordas de Transição de Bit)
+      // 3. Fase de Toggle / Winding por subamostra
       for (final edge in edges) {
         // Interseção na sub-scanline Superior
         if ((edge.y0 <= yTop && edge.y1 > yTop) || (edge.y1 <= yTop && edge.y0 > yTop)) {
           final x = edge.x0 + (yTop - edge.y0) * (edge.x1 - edge.x0) / (edge.y1 - edge.y0);
-          // Toggle bits 0, 1, 2 baseados nos offsets de subpixel
-          // Convention: toggle na posição do subpixel
           for (int s = 0; s < 3; s++) {
             final ix = (x - _sampleOffsetsX[s]).floor();
             if (ix >= -1 && ix < width) {
-              _signatureScanline[ix + 1] ^= (1 << s);
+              if (windingRule == 0) {
+                _signatureScanline[ix + 1] ^= (1 << s);
+              } else {
+                if (s == 0) _wTopR[ix + 1] += edge.windingDelta;
+                if (s == 1) _wTopG[ix + 1] += edge.windingDelta;
+                if (s == 2) _wTopB[ix + 1] += edge.windingDelta;
+              }
             }
           }
         }
@@ -194,7 +226,13 @@ class QCSRasterizer {
           for (int s = 3; s < 6; s++) {
             final ix = (x - _sampleOffsetsX[s]).floor();
             if (ix >= -1 && ix < width) {
-              _signatureScanline[ix + 1] ^= (1 << s);
+              if (windingRule == 0) {
+                _signatureScanline[ix + 1] ^= (1 << s);
+              } else {
+                if (s == 3) _wBotR[ix + 1] += edge.windingDelta;
+                if (s == 4) _wBotG[ix + 1] += edge.windingDelta;
+                if (s == 5) _wBotB[ix + 1] += edge.windingDelta;
+              }
             }
           }
         }
@@ -202,11 +240,28 @@ class QCSRasterizer {
 
       // 4. Integração de Bits (Prefix XOR horizontal) + Blit
       int runningSignature = 0;
+      int runTopR = 0, runTopG = 0, runTopB = 0, runBotR = 0, runBotG = 0, runBotB = 0;
       final rowOffset = py * width * 3;
 
       for (int px = 0; px < width; px++) {
-        // Atualiza assinatura acumulada para este pixel
-        runningSignature ^= _signatureScanline[px];
+        if (windingRule == 0) {
+          runningSignature ^= _signatureScanline[px];
+        } else {
+          runTopR += _wTopR[px];
+          runTopG += _wTopG[px];
+          runTopB += _wTopB[px];
+          runBotR += _wBotR[px];
+          runBotG += _wBotG[px];
+          runBotB += _wBotB[px];
+
+          runningSignature = 0;
+          if (runTopR != 0) runningSignature |= (1 << 0);
+          if (runTopG != 0) runningSignature |= (1 << 1);
+          if (runTopB != 0) runningSignature |= (1 << 2);
+          if (runBotR != 0) runningSignature |= (1 << 3);
+          if (runBotG != 0) runningSignature |= (1 << 4);
+          if (runBotB != 0) runningSignature |= (1 << 5);
+        }
 
         if (runningSignature == 0) continue;
 
@@ -255,5 +310,32 @@ class QCSRasterizer {
 
 class _QcsEdge {
   final double x0, y0, x1, y1;
-  _QcsEdge(this.x0, this.y0, this.x1, this.y1);
+  final int windingDelta;
+  _QcsEdge(this.x0, this.y0, this.x1, this.y1, this.windingDelta);
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

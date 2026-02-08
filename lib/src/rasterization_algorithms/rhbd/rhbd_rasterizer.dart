@@ -21,6 +21,7 @@ library rhbd;
 
 import 'dart:typed_data';
 import 'dart:math' as math;
+import '../common/polygon_contract.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTES
@@ -136,7 +137,7 @@ class Tile {
 // RASTERIZADOR RHBD
 // ─────────────────────────────────────────────────────────────────────────────
 
-class RHBDRasterizer {
+class RHBDRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -170,41 +171,53 @@ class RHBDRasterizer {
   }
 
   /// Desenha um polígono usando o algoritmo híbrido
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
     double minX = double.infinity;
     double minY = double.infinity;
     double maxX = double.negativeInfinity;
     double maxY = double.negativeInfinity;
-    final edgeX1 = List<double>.filled(n, 0.0);
-    final edgeY1 = List<double>.filled(n, 0.0);
-    final edgeX2 = List<double>.filled(n, 0.0);
-    final edgeY2 = List<double>.filled(n, 0.0);
+    final edgeX1 = <double>[];
+    final edgeY1 = <double>[];
+    final edgeX2 = <double>[];
+    final edgeY2 = <double>[];
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x1 = vertices[i * 2];
-      final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[j * 2];
-      final y2 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x1 = vertices[i * 2];
+        final y1 = vertices[i * 2 + 1];
+        final x2 = vertices[j * 2];
+        final y2 = vertices[j * 2 + 1];
 
-      edgeX1[i] = x1;
-      edgeY1[i] = y1;
-      edgeX2[i] = x2;
-      edgeY2[i] = y2;
+        edgeX1.add(x1);
+        edgeY1.add(y1);
+        edgeX2.add(x2);
+        edgeY2.add(y2);
 
-      if (x1 < minX) minX = x1;
-      if (x1 > maxX) maxX = x1;
-      if (y1 < minY) minY = y1;
-      if (y1 > maxY) maxY = y1;
+        if (x1 < minX) minX = x1;
+        if (x1 > maxX) maxX = x1;
+        if (y1 < minY) minY = y1;
+        if (y1 > maxY) maxY = y1;
+      }
     }
-
     final minXi = minX.floor().clamp(0, width - 1);
     final maxXi = maxX.ceil().clamp(0, width - 1);
-    final minYi = minY.floor().clamp(0, height - 1);
-    final maxYi = maxY.ceil().clamp(0, height - 1);
+    final minYi = minY.floor().clamp(0, height - 1).toInt();
+    final maxYi = maxY.ceil().clamp(0, height - 1).toInt();
+    final edgeCount = edgeX1.length;
+    if (edgeCount == 0) return;
+    final rowBuckets = _buildRowBuckets(minYi, maxYi, edgeCount, edgeY1, edgeY2);
 
     final minTileX = (minXi ~/ kTileSize).clamp(0, tilesX - 1);
     final maxTileX = (maxXi ~/ kTileSize).clamp(0, tilesX - 1);
@@ -226,17 +239,20 @@ class RHBDRasterizer {
 
         for (int y = yStart; y <= yEnd; y++) {
           final cy = y + 0.5;
+          final rowEdgeIndices = rowBuckets[y - minYi];
+          if (rowEdgeIndices.isEmpty) continue;
 
           for (int x = xStart; x <= xEnd; x++) {
             final cx = x + 0.5;
             final alpha = _computePixelAlpha(
-              n,
               edgeX1,
               edgeY1,
               edgeX2,
               edgeY2,
+              rowEdgeIndices,
               cx,
               cy,
+              windingRule,
             );
 
             if (alpha > 0) {
@@ -250,29 +266,38 @@ class RHBDRasterizer {
 
   @pragma('vm:prefer-inline')
   int _computePixelAlpha(
-    int edgeCount,
     List<double> edgeX1,
     List<double> edgeY1,
     List<double> edgeX2,
     List<double> edgeY2,
+    List<int> edgeIndices,
     double px,
     double py,
+    int windingRule,
   ) {
     int winding = 0;
+    int crossings = 0;
     double minDistSq = double.infinity;
 
-    for (int i = 0; i < edgeCount; i++) {
+    for (int k = 0; k < edgeIndices.length; k++) {
+      final i = edgeIndices[k];
       final x1 = edgeX1[i];
       final y1 = edgeY1[i];
       final x2 = edgeX2[i];
       final y2 = edgeY2[i];
+      final isLeft = _isLeft(x1, y1, x2, y2, px, py);
+
+      if ((y1 > py) != (y2 > py) &&
+          (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1)) {
+        crossings++;
+      }
 
       if (y1 <= py) {
-        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) {
+        if (y2 > py && isLeft > 0) {
           winding++;
         }
       } else {
-        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) {
+        if (y2 <= py && isLeft < 0) {
           winding--;
         }
       }
@@ -281,7 +306,7 @@ class RHBDRasterizer {
       if (distSq < minDistSq) minDistSq = distSq;
     }
 
-    final inside = winding != 0;
+    final inside = windingRule == 0 ? ((crossings & 1) != 0) : (winding != 0);
     final minDist = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
     final signedDist = inside ? -minDist : minDist;
 
@@ -365,4 +390,51 @@ class RHBDRasterizer {
   }
 
   Uint32List get buffer => _framebuffer;
+
+  List<List<int>> _buildRowBuckets(
+    int minYi,
+    int maxYi,
+    int edgeCount,
+    List<double> edgeY1,
+    List<double> edgeY2,
+  ) {
+    final rows = maxYi - minYi + 1;
+    final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+    for (int i = 0; i < edgeCount; i++) {
+      final minY = math.min(edgeY1[i], edgeY2[i]);
+      final maxY = math.max(edgeY1[i], edgeY2[i]);
+      final r0 = (minY.floor() - 1).clamp(minYi, maxYi);
+      final r1 = (maxY.ceil() + 1).clamp(minYi, maxYi);
+      for (int y = r0; y <= r1; y++) {
+        buckets[y - minYi].add(i);
+      }
+    }
+    return buckets;
+  }
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

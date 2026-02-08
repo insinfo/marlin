@@ -26,6 +26,7 @@ library amcad;
 
 import 'dart:typed_data';
 import 'dart:math' as math;
+import '../common/polygon_contract.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTES
@@ -155,7 +156,7 @@ class _SdfResult {
 // RASTERIZADOR AMCAD
 // ─────────────────────────────────────────────────────────────────────────────
 
-class AMCADRasterizer {
+class AMCADRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -181,10 +182,19 @@ class AMCADRasterizer {
   }
 
   /// Desenha um polígono usando SDF analítico
-  void drawPolygon(List<double> vertices, int color) {
+  @override
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    final edges = _buildEdges(vertices, contours);
+    if (edges.isEmpty) return;
 
     // Bounding box
     double minX = double.infinity, maxX = double.negativeInfinity;
@@ -204,16 +214,43 @@ class AMCADRasterizer {
     final tileMaxX = (maxX / kMicroCellSize).ceil().clamp(0, tilesX - 1);
     final tileMinY = (minY / kMicroCellSize).floor().clamp(0, tilesY - 1);
     final tileMaxY = (maxY / kMicroCellSize).ceil().clamp(0, tilesY - 1);
+    final minYi = minY.floor().clamp(0, height - 1);
+    final maxYi = maxY.ceil().clamp(0, height - 1);
+    final rowBuckets = _buildRowBuckets(minYi, maxYi, edges);
+    final allEdgeIndices = List<int>.generate(edges.length, (i) => i);
 
     for (int ty = tileMinY; ty <= tileMaxY; ty++) {
       for (int tx = tileMinX; tx <= tileMaxX; tx++) {
-        _processTile(tx, ty, vertices, color);
+        _processTile(
+          tx,
+          ty,
+          vertices,
+          color,
+          windingRule,
+          contours,
+          edges,
+          rowBuckets,
+          allEdgeIndices,
+          minYi,
+          maxYi,
+        );
       }
     }
   }
 
   /// Processa um tile
-  void _processTile(int tx, int ty, List<double> vertices, int color) {
+  void _processTile(int tx, int ty, List<double> vertices, int color,
+      [int windingRule = 1,
+      List<_ContourSpan>? contours,
+      List<_EdgeData>? edges,
+      List<List<int>>? rowBuckets,
+      List<int>? allEdgeIndices,
+      int minYi = 0,
+      int maxYi = 0]) {
+    contours ??= _resolveContours(vertices.length ~/ 2, null);
+    edges ??= _buildEdges(vertices, contours);
+    rowBuckets ??= _buildRowBuckets(minYi, maxYi, edges);
+    allEdgeIndices ??= List<int>.generate(edges.length, (i) => i);
     final tileX = tx * kMicroCellSize;
     final tileY = ty * kMicroCellSize;
 
@@ -221,7 +258,18 @@ class AMCADRasterizer {
     final centerX = tileX + kMicroCellSize / 2.0;
     final centerY = tileY + kMicroCellSize / 2.0;
 
-    final c = _signedDistanceAndGrad(centerX, centerY, vertices);
+    final c = _signedDistanceAndGrad(
+      centerX,
+      centerY,
+      vertices,
+      windingRule,
+      contours,
+      edges,
+      rowBuckets,
+      allEdgeIndices,
+      minYi,
+      maxYi,
+    );
 
     final halfDiag = kMicroCellSize * 0.7071067811865476;
     final safe = halfDiag + kAAWidth;
@@ -246,7 +294,18 @@ class AMCADRasterizer {
         final pixelCenterX = globalX + 0.5;
         final pixelCenterY = globalY + 0.5;
 
-        final s = _signedDistanceAndGrad(pixelCenterX, pixelCenterY, vertices);
+        final s = _signedDistanceAndGrad(
+          pixelCenterX,
+          pixelCenterY,
+          vertices,
+          windingRule,
+          contours,
+          edges,
+          rowBuckets,
+          allEdgeIndices,
+          minYi,
+          maxYi,
+        );
 
         final coverage = _coverageLUT.getCoverage(s.phi, s.angle, s.gradMag);
 
@@ -257,36 +316,62 @@ class AMCADRasterizer {
     }
   }
 
-  _SdfResult _signedDistanceAndGrad(double x, double y, List<double> vertices) {
-    final n = vertices.length ~/ 2;
-
+  _SdfResult _signedDistanceAndGrad(
+    double x,
+    double y,
+    List<double> vertices,
+    int windingRule,
+    List<_ContourSpan> contours,
+    List<_EdgeData> edges,
+    List<List<int>> rowBuckets,
+    List<int> allEdgeIndices,
+    int minYi,
+    int maxYi,
+  ) {
     double minDist2 = double.infinity;
     double bestCx = 0.0, bestCy = 0.0;
     double bestEx = 1.0, bestEy = 0.0;
 
-    bool inside = false;
+    int evenOddCrossings = 0;
+    int nonZeroWinding = 0;
 
-    int j = n - 1;
-    double xj = vertices[j * 2];
-    double yj = vertices[j * 2 + 1];
+    final yi = y.floor().clamp(minYi, maxYi);
+    final row = rowBuckets[yi - minYi];
+    final candidates = row.isEmpty ? allEdgeIndices : row;
 
-    for (int i = 0; i < n; i++) {
-      final xi = vertices[i * 2];
-      final yi = vertices[i * 2 + 1];
+    for (int k = 0; k < candidates.length; k++) {
+      final e = edges[candidates[k]];
+      final xi = e.x1;
+      final yi1 = e.y1;
+      final xj = e.x2;
+      final yj = e.y2;
 
       final intersects =
-          ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-      if (intersects) inside = !inside;
+          ((yi1 > y) != (yj > y)) && (x < (xj - xi) * (y - yi1) / (yj - yi1) + xi);
+      if (intersects) {
+        evenOddCrossings++;
+      }
+
+      if (((yi1 <= y) && (yj > y)) || ((yi1 > y) && (yj <= y))) {
+        final isLeft = (xj - xi) * (y - yi1) - (yj - yi1) * (x - xi);
+        if (e.winding > 0) {
+          if (isLeft > 0.0) nonZeroWinding++;
+        } else if (isLeft < 0.0) {
+          nonZeroWinding--;
+        }
+      }
 
       final ex = xi - xj;
-      final ey = yi - yj;
+      final ey = yi1 - yj;
       final len2 = ex * ex + ey * ey;
 
       if (len2 > 1e-12) {
         var t = ((x - xj) * ex + (y - yj) * ey) / len2;
-        if (t < 0.0)
+        if (t < 0.0) {
           t = 0.0;
-        else if (t > 1.0) t = 1.0;
+        } else if (t > 1.0) {
+          t = 1.0;
+        }
 
         final cx = xj + t * ex;
         final cy = yj + t * ey;
@@ -303,11 +388,11 @@ class AMCADRasterizer {
           bestEy = ey;
         }
       }
-
-      j = i;
-      xj = xi;
-      yj = yi;
     }
+
+    bool inside = (windingRule == 0)
+        ? ((evenOddCrossings & 1) != 0)
+        : (nonZeroWinding != 0);
 
     final unsignedDist = math.sqrt(minDist2);
     final onEdge = unsignedDist <= kEdgeEps;
@@ -388,4 +473,72 @@ class AMCADRasterizer {
   }
 
   Uint32List get buffer => _framebuffer;
+
+  List<_EdgeData> _buildEdges(List<double> vertices, List<_ContourSpan> contours) {
+    final edges = <_EdgeData>[];
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final int j = contour.start + local;
+        final int i = contour.start + ((local + 1) % contour.count);
+        final x1 = vertices[i * 2];
+        final y1 = vertices[i * 2 + 1];
+        final x2 = vertices[j * 2];
+        final y2 = vertices[j * 2 + 1];
+        edges.add(_EdgeData(x1, y1, x2, y2, y1 < y2 ? 1 : -1));
+      }
+    }
+    return edges;
+  }
+
+  List<List<int>> _buildRowBuckets(int minYi, int maxYi, List<_EdgeData> edges) {
+    final rows = maxYi - minYi + 1;
+    final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+    for (int i = 0; i < edges.length; i++) {
+      final e = edges[i];
+      final minY = math.min(e.y1, e.y2);
+      final maxY = math.max(e.y1, e.y2);
+      final r0 = (minY.floor() - 1).clamp(minYi, maxYi);
+      final r1 = (maxY.ceil() + 1).clamp(minYi, maxYi);
+      for (int y = r0; y <= r1; y++) {
+        buckets[y - minYi].add(i);
+      }
+    }
+    return buckets;
+  }
+}
+
+class _EdgeData {
+  final double x1;
+  final double y1;
+  final double x2;
+  final double y2;
+  final int winding;
+  const _EdgeData(this.x1, this.y1, this.x2, this.y2, this.winding);
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

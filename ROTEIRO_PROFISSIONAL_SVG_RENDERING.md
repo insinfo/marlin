@@ -39,6 +39,26 @@ entre outros
 - [x] `MarlinCache`: correcao de limpeza da faixa de tiles tocados em `resetTileLine` (remove limpeza incorreta que podia deixar residuos visuais).
 - [x] Stroker central do benchmark migrado de "quad por segmento" para "anel por contorno" com join miter/bevel (reduz emendas visuais e custo de geometria de stroke).
 - [x] `Blend2D v2` com isolates agora usa o mesmo resolve mascarado por bitset de celulas ativas (paridade com caminho serial).
+- [x] `MarlinRenderer.endRendering` portado para fluxo de tile-line/subpixel mais fiel ao `Renderer.java` (AEL incremental + insertion sort local + acumulacao diferencial de cobertura).
+- [x] `MarlinCache.copyAARow` ajustado para contrato diferencial (`prefix-sum` + clamp + `touchedTile` por cobertura), alinhando com a referencia Java.
+- [x] `Marlin` deixou de remapear alpha duas vezes no blit (remove distorcao de cobertura e reduz artefatos de cortes).
+- [x] Benchmark SVG: `Blend2D v1` desativado por padrao (`enableBlend2Dv1 = false`) devido custo extremo em cenas SVG reais (especialmente `B2D_v1_SIMD` no Tiger).
+- [x] Contrato unificado introduzido: `drawPolygon(vertices, color, {windingRule, contourVertexCounts})` em backends do benchmark.
+- [x] `ACDR` corrigido para processar `contourVertexCounts` + `windingRule` (even-odd/non-zero) em SVG real.
+- [x] `AMCAD` corrigido para SDF com multiplos contornos sem arestas fantasmas entre subpaths.
+- [x] `Marlin` recebeu desempate estavel de crossings iguais com chave secundaria (`edgePtr`) para robustez em contornos coincidentes.
+- [x] `ACDR` no benchmark SVG otimizado por blend restrito ao bounding box do poligono (queda de ~7355ms para ~1841ms no Tiger).
+- [x] `QCS` corrigido com implementacao real de `contourVertexCounts + windingRule` (even-odd/non-zero) no loop de assinatura por subamostra.
+- [x] `SCP_AED` corrigido com implementacao real de contornos em scanline/SDF/curvature (sem conectar subpaths distintos).
+- [x] Benchmark SVG validado apos correcoes: sem regressao funcional no `froggy-simple` para `QCS` e `SCP_AED`.
+- [x] `DBSR` corrigido com implementacao real de `contourVertexCounts + windingRule` (even-odd/non-zero), removendo conexao artificial entre subpaths.
+- [x] `HSGR` corrigido para preencher poligonos multi-contorno com `windingRule` real (fallback robusto por distancia/inside test para SVG complexo).
+- [x] Benchmark SVG atualizado para propagar `windingRule` + `contourVertexCounts` tambem para `DBSR` e `HSGR`.
+- [x] Otimizacao `HSGR` aplicada no caminho multi-contorno: processamento tile-aware em ordem Hilbert + bucketizacao de arestas por linha (reduz custo em SVG com muitos subpaths).
+- [x] Hardening `DBSR` aplicado: bucketizacao de arestas por linha para reduzir custo por pixel mantendo `evenodd/non-zero`.
+- [x] `RHBD` otimizado com bucketizacao de arestas por linha no caminho por tile (reduz custo por pixel em SVG real).
+- [x] `AMCAD` otimizado com bucketizacao de arestas por linha na avaliacao SDF/inside test (queda forte de custo em cenas com muitos contornos).
+- [x] Novo rasterizador `LNAF_SE` integrado ao projeto e benchmarks (scanline + span-ends + LUT de normal quantizada).
 
 Medicoes observadas (benchmark `benchmark/svg_render_benchmark.dart`):
 - DAA em `Ghostscript_Tiger`: ~8594ms -> ~95ms.
@@ -54,6 +74,10 @@ Observacao:
 - Estado atual Blend2D: packing/bitmask ja ativo no resolve serial; proximo passo e estender o mesmo esquema para o caminho com isolates (serializacao de bitmask + resolve paralelo com mascaras).
 - Estado atual strokes: suporte atual e de benchmark (stroke-to-fill simplificado por segmento, join/cap basicos). Proximo passo e mover esse pipeline para IR de path/stroker central para qualidade de join/cap igual entre backends.
 - Estado atual strokes: benchmark ja usa stroker de anel por contorno (miter/bevel). Proximo passo e suportar caps/joins completos por estilo SVG (`linecap`, `linejoin`, `miterlimit`) no IR central.
+- Estado atual HSGR: corretude em SVG multi-subpath melhorou, mas o fallback robusto ficou caro no `froggy-simple`; proximo passo e reintroduzir percurso Hilbert/tile com AET por contorno para recuperar performance.
+- Estado atual HSGR: caminho multi-contorno agora usa tiles/Hilbert + buckets por linha; custo do `froggy-simple` caiu significativamente, mantendo suporte a furos/subpaths.
+- Estado atual RHBD/AMCAD: ambos migrados para selecao de arestas por scanline (row buckets), reduzindo o custo O(pixels*edges) para O(pixels*edges_locais) em SVG real.
+- Estado atual LNAF_SE: backend novo focado em throughput (interior de spans solido + AA apenas nas pontas), com suporte a `evenodd/non-zero` e contornos multiplos.
 
 Proximo foco imediato:
 - Corrigir `banding` horizontal do Blend2D (`_addSegment`/conservacao de cobertura em clipping horizontal) e validar contra referencia.

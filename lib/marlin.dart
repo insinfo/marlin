@@ -14,6 +14,7 @@
 /// - **RHBD** - Rasterização Híbrida em Blocos para Dart
 /// - **AMCAD** - Analytic Micro-Cell Adaptive Distance-field
 /// - **HSGR** - Hilbert-Space Guided Rasterization
+/// - **LNAF_SE** - Lattice-Normal Alpha Field com Span-Ends
 /// - **SWEEP_SDF** - Scanline with Analytical SDF for Subpixel
 /// - **SCDT** - Spectral Coverage Decomposition with Ternary Encoding
 /// - **SCP_AED** - Stochastic Coverage Propagation with Adaptive Error Diffusion
@@ -40,6 +41,7 @@ export 'src/rasterization_algorithms/hsgr/hsgr_rasterizer.dart';
 export 'src/rasterization_algorithms/sweep_sdf/sweep_sdf_rasterizer.dart';
 export 'src/rasterization_algorithms/scdt/scdt_rasterizer.dart';
 export 'src/rasterization_algorithms/scp_aed/scp_aed_rasterizer.dart';
+export 'src/rasterization_algorithms/lnaf_se/lnaf_se_rasterizer.dart';
 export 'src/rasterization_algorithms/blend2d/blend2d_rasterizer.dart';
 export 'src/rasterization_algorithms/skia_scanline/skia_scanline_rasterizer.dart'
     hide
@@ -55,6 +57,7 @@ export 'src/rasterization_algorithms/edge_flag_aa/edge_flag_aa_rasterizer.dart'
 export 'src/rasterization_algorithms/blaze_fast/blaze_fast_rasterizer.dart';
 export 'src/rasterization_algorithms/ultra_quality/ssaa_rasterizer.dart';
 export 'src/rasterization_algorithms/wavelet_haar/wavelet_haar_rasterizer.dart';
+export 'src/rasterization_algorithms/common/polygon_contract.dart';
 
 
 // PNG Output

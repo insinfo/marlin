@@ -32,6 +32,7 @@ library epl_aa;
 import 'dart:typed_data';
 import 'dart:math' as math;
 import 'epl_aa_tables.dart';
+import '../common/polygon_contract.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOOK-UP TABLE DE COBERTURA
@@ -104,6 +105,7 @@ class EplProcessedEdge {
   final double x1, y1, x2, y2;
   final double vx, vy;
   final double vv;
+  final double minX, maxX, minY, maxY;
 
   /// Normal unitária
   final double nx, ny;
@@ -129,6 +131,10 @@ class EplProcessedEdge {
     required this.vx,
     required this.vy,
     required this.vv,
+    required this.minX,
+    required this.maxX,
+    required this.minY,
+    required this.maxY,
     required this.nx,
     required this.ny,
     required this.planeC,
@@ -145,6 +151,10 @@ class EplProcessedEdge {
     final len = math.sqrt(dx * dx + dy * dy);
     final invLen = len > 0 ? 1.0 / len : 0.0;
     final vv = dx * dx + dy * dy;
+    final minX = math.min(x1, x2);
+    final maxX = math.max(x1, x2);
+    final minY = math.min(y1, y2);
+    final maxY = math.max(y1, y2);
 
     // Normal apontando para a direita do vetor (sentido horário)
     final nx = dy * invLen;
@@ -163,6 +173,10 @@ class EplProcessedEdge {
       vx: dx,
       vy: dy,
       vv: vv,
+      minX: minX,
+      maxX: maxX,
+      minY: minY,
+      maxY: maxY,
       nx: nx,
       ny: ny,
       planeC: planeC,
@@ -192,7 +206,7 @@ class EplProcessedEdge {
 // RASTERIZADOR EPL_AA
 // ─────────────────────────────────────────────────────────────────────────────
 
-class EPLRasterizer {
+class EPLRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -204,6 +218,7 @@ class EPLRasterizer {
 
   /// Tamanho do tile para processamento
   static const int tileSize = 32;
+  static const double _candidateExpand = 1.5;
   static const double _farDistSq = 0.55 * 0.55;
   static const double _pathologicalSecondDistSq = 0.6 * 0.6;
 
@@ -217,23 +232,36 @@ class EPLRasterizer {
   }
 
   /// Desenha um polígono usando o método de semi-plano com LUT
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
 
     // Converter para arestas processadas
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
     final edges = <EplProcessedEdge>[];
     edges.length = 0;
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      edges.add(EplProcessedEdge.fromPoints(
-        vertices[i * 2],
-        vertices[i * 2 + 1],
-        vertices[j * 2],
-        vertices[j * 2 + 1],
-        _coverageLUT,
-      ));
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        edges.add(EplProcessedEdge.fromPoints(
+          vertices[i * 2],
+          vertices[i * 2 + 1],
+          vertices[j * 2],
+          vertices[j * 2 + 1],
+          _coverageLUT,
+        ));
+      }
+    }
+    if (edges.isEmpty) {
+      return;
     }
 
     // Bounding box
@@ -254,18 +282,96 @@ class EPLRasterizer {
     final pxMinY = minY.floor().clamp(0, height - 1);
     final pxMaxY = maxY.ceil().clamp(0, height - 1);
 
-    // Rasterizar por pixel
-    for (int py = pxMinY; py <= pxMaxY; py++) {
-      final centerY = py + 0.5;
+    final rowBuckets = _buildRowBuckets(edges, pxMinY, pxMaxY);
+    final minTileX = pxMinX ~/ tileSize;
+    final maxTileX = pxMaxX ~/ tileSize;
+    final minTileY = pxMinY ~/ tileSize;
+    final maxTileY = pxMaxY ~/ tileSize;
+    final tilesX = maxTileX - minTileX + 1;
+    final tileBuckets = _buildTileBuckets(
+      edges,
+      pxMinX,
+      pxMaxX,
+      pxMinY,
+      pxMaxY,
+      minTileX,
+      maxTileX,
+      minTileY,
+      maxTileY,
+    );
 
-      for (int px = pxMinX; px <= pxMaxX; px++) {
-        final centerX = px + 0.5;
+    final edgeStamp = Int32List(edges.length);
+    final rowTileCandidates = <int>[];
+    int stamp = 1;
 
-        // Verificar se está dentro do polígono
-        final coverage = _computePixelCoverage(edges, centerX, centerY);
+    for (int ty = minTileY; ty <= maxTileY; ty++) {
+      final tileY0 = math.max(ty * tileSize, pxMinY);
+      final tileY1 = math.min((ty + 1) * tileSize - 1, pxMaxY);
+      final tileRowBase = (ty - minTileY) * tilesX;
 
-        if (coverage > 0) {
-          _blendPixel(px, py, color, coverage);
+      for (int tx = minTileX; tx <= maxTileX; tx++) {
+        final tileX0 = math.max(tx * tileSize, pxMinX);
+        final tileX1 = math.min((tx + 1) * tileSize - 1, pxMaxX);
+        final tileCandidates = tileBuckets[tileRowBase + (tx - minTileX)];
+        final hasTileCandidates = tileCandidates.isNotEmpty;
+
+        if (hasTileCandidates) {
+          stamp++;
+          if (stamp >= 0x7FFFFFFF) {
+            edgeStamp.fillRange(0, edgeStamp.length, 0);
+            stamp = 1;
+          }
+          for (int i = 0; i < tileCandidates.length; i++) {
+            edgeStamp[tileCandidates[i]] = stamp;
+          }
+        }
+
+        for (int py = tileY0; py <= tileY1; py++) {
+          final rowEdges = rowBuckets[py - pxMinY];
+          if (rowEdges.isEmpty) continue;
+
+          final centerY = py + 0.5;
+          final row = py * width;
+
+          rowTileCandidates.clear();
+          if (hasTileCandidates) {
+            for (int i = 0; i < rowEdges.length; i++) {
+              final edgeIdx = rowEdges[i];
+              if (edgeStamp[edgeIdx] == stamp) {
+                rowTileCandidates.add(edgeIdx);
+              }
+            }
+          }
+
+          if (rowTileCandidates.isEmpty) {
+            final inside = _isPointInsideIndexed(
+              edges,
+              rowEdges,
+              tileX0 + 0.5,
+              centerY,
+              windingRule,
+            );
+            if (inside) {
+              _buffer.fillRange(row + tileX0, row + tileX1 + 1, color);
+            }
+            continue;
+          }
+
+          for (int px = tileX0; px <= tileX1; px++) {
+            final centerX = px + 0.5;
+            final coverage = _computePixelCoverage(
+              edges,
+              rowTileCandidates,
+              rowEdges,
+              centerX,
+              centerY,
+              windingRule,
+            );
+
+            if (coverage > 0) {
+              _blendPixelByIndex(row + px, color, coverage);
+            }
+          }
         }
       }
     }
@@ -273,30 +379,19 @@ class EPLRasterizer {
 
   /// Computa a cobertura de um pixel usando a aresta dominante
   int _computePixelCoverage(
-      List<EplProcessedEdge> edges, double centerX, double centerY) {
-    int winding = 0;
+    List<EplProcessedEdge> edges,
+    List<int> distanceCandidates,
+    List<int> rowEdgeIndices,
+    double centerX,
+    double centerY,
+    int windingRule,
+  ) {
     EplProcessedEdge? dominantEdge;
     double minDistSq = double.infinity;
     double secondMinDistSq = double.infinity;
 
-    for (final edge in edges) {
-      final x1 = edge.x1;
-      final y1 = edge.y1;
-      final x2 = edge.x2;
-      final y2 = edge.y2;
-
-      if (y1 <= centerY) {
-        if (y2 > centerY &&
-            ((x2 - x1) * (centerY - y1) - (centerX - x1) * (y2 - y1)) > 0) {
-          winding++;
-        }
-      } else {
-        if (y2 <= centerY &&
-            ((x2 - x1) * (centerY - y1) - (centerX - x1) * (y2 - y1)) < 0) {
-          winding--;
-        }
-      }
-
+    for (int i = 0; i < distanceCandidates.length; i++) {
+      final edge = edges[distanceCandidates[i]];
       final distSq = _distanceToSegmentSq(edge, centerX, centerY);
 
       if (distSq < minDistSq) {
@@ -309,7 +404,13 @@ class EPLRasterizer {
     }
 
     if (dominantEdge == null) return 0;
-    final centerInside = winding != 0;
+    final centerInside = _isPointInsideIndexed(
+      edges,
+      rowEdgeIndices,
+      centerX,
+      centerY,
+      windingRule,
+    );
 
     // Pixel longe da borda: classificação binária robusta.
     if (minDistSq > _farDistSq) {
@@ -322,7 +423,13 @@ class EPLRasterizer {
 
     if (isPathological) {
       // Fallback para supersampling 4×4
-      return _supersample4x4(edges, centerX - 0.5, centerY - 0.5);
+      return _supersample4x4(
+        edges,
+        rowEdgeIndices,
+        centerX - 0.5,
+        centerY - 0.5,
+        windingRule,
+      );
     }
 
     // Caso normal: usar LUT
@@ -341,7 +448,12 @@ class EPLRasterizer {
 
   /// Fallback: supersampling 4×4 para pixels problemáticos
   int _supersample4x4(
-      List<EplProcessedEdge> edges, double pixelX, double pixelY) {
+    List<EplProcessedEdge> edges,
+    List<int> rowEdgeIndices,
+    double pixelX,
+    double pixelY,
+    int windingRule,
+  ) {
     int count = 0;
 
     for (int sy = 0; sy < 4; sy++) {
@@ -350,7 +462,9 @@ class EPLRasterizer {
       for (int sx = 0; sx < 4; sx++) {
         final x = pixelX + (sx + 0.5) / 4;
 
-        if (_isPointInsideWinding(edges, x, y)) count++;
+        if (_isPointInsideIndexed(edges, rowEdgeIndices, x, y, windingRule)) {
+          count++;
+        }
       }
     }
 
@@ -358,11 +472,33 @@ class EPLRasterizer {
   }
 
   @pragma('vm:prefer-inline')
-  bool _isPointInsideWinding(
-      List<EplProcessedEdge> edges, double px, double py) {
+  bool _isPointInsideIndexed(
+    List<EplProcessedEdge> edges,
+    List<int> edgeIndices,
+    double px,
+    double py,
+    int windingRule,
+  ) {
+    if (windingRule == 0) {
+      bool inside = false;
+      for (int i = 0; i < edgeIndices.length; i++) {
+        final edge = edges[edgeIndices[i]];
+        final x1 = edge.x1;
+        final y1 = edge.y1;
+        final x2 = edge.x2;
+        final y2 = edge.y2;
+        if ((y1 > py) != (y2 > py) &&
+            (px < (x2 - x1) * (py - y1) / (y2 - y1) + x1)) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    }
+
     int winding = 0;
 
-    for (final edge in edges) {
+    for (int i = 0; i < edgeIndices.length; i++) {
+      final edge = edges[edgeIndices[i]];
       final x1 = edge.x1;
       final y1 = edge.y1;
       final x2 = edge.x2;
@@ -420,9 +556,66 @@ class EPLRasterizer {
     return dx * dx + dy * dy;
   }
 
+  List<List<int>> _buildRowBuckets(
+    List<EplProcessedEdge> edges,
+    int minY,
+    int maxY,
+  ) {
+    final rows = maxY - minY + 1;
+    final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+    for (int i = 0; i < edges.length; i++) {
+      final e = edges[i];
+      final y0 = (e.minY.floor() - 1).clamp(minY, maxY);
+      final y1 = (e.maxY.ceil() + 1).clamp(minY, maxY);
+      for (int y = y0; y <= y1; y++) {
+        buckets[y - minY].add(i);
+      }
+    }
+    return buckets;
+  }
+
+  List<List<int>> _buildTileBuckets(
+    List<EplProcessedEdge> edges,
+    int minX,
+    int maxX,
+    int minY,
+    int maxY,
+    int minTileX,
+    int maxTileX,
+    int minTileY,
+    int maxTileY,
+  ) {
+    final tilesX = maxTileX - minTileX + 1;
+    final tilesY = maxTileY - minTileY + 1;
+    final buckets = List<List<int>>.generate(tilesX * tilesY, (_) => <int>[]);
+
+    for (int i = 0; i < edges.length; i++) {
+      final e = edges[i];
+      final ex0 =
+          (e.minX - _candidateExpand).floor().clamp(minX, maxX).toInt();
+      final ex1 = (e.maxX + _candidateExpand).ceil().clamp(minX, maxX).toInt();
+      final ey0 =
+          (e.minY - _candidateExpand).floor().clamp(minY, maxY).toInt();
+      final ey1 = (e.maxY + _candidateExpand).ceil().clamp(minY, maxY).toInt();
+      if (ex0 > ex1 || ey0 > ey1) continue;
+
+      final tx0 = (ex0 ~/ tileSize).clamp(minTileX, maxTileX).toInt();
+      final tx1 = (ex1 ~/ tileSize).clamp(minTileX, maxTileX).toInt();
+      final ty0 = (ey0 ~/ tileSize).clamp(minTileY, maxTileY).toInt();
+      final ty1 = (ey1 ~/ tileSize).clamp(minTileY, maxTileY).toInt();
+
+      for (int ty = ty0; ty <= ty1; ty++) {
+        final rowBase = (ty - minTileY) * tilesX;
+        for (int tx = tx0; tx <= tx1; tx++) {
+          buckets[rowBase + (tx - minTileX)].add(i);
+        }
+      }
+    }
+    return buckets;
+  }
+
   /// Aplica blending de um pixel
-  void _blendPixel(int x, int y, int foreground, int alpha) {
-    final idx = y * width + x;
+  void _blendPixelByIndex(int idx, int foreground, int alpha) {
     final bg = _buffer[idx];
 
     if (alpha >= 255) {
@@ -447,4 +640,30 @@ class EPLRasterizer {
   }
 
   Uint32List get buffer => _buffer;
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

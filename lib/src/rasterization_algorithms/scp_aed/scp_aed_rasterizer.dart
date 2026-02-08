@@ -31,7 +31,7 @@ class SCPAEDRasterizer {
 
   // Scratch
   final List<_Edge> _edges = <_Edge>[];
-  final List<double> _xs = <double>[];
+  final List<_Crossing> _crossings = <_Crossing>[];
 
   // ------------------------------------------------------------
   // Parâmetros (ajuste fino)
@@ -55,6 +55,8 @@ class SCPAEDRasterizer {
 
   // Margem do bbox: precisa cobrir SDF + vizinhança de difusão/erro.
   static const int _bboxMargin = 8;
+  static const int _tileSize = 32;
+  static const int _sdfTilePruneEdgeThreshold = 24;
 
   SCPAEDRasterizer({required this.width, required this.height}) {
     final n = width * height;
@@ -75,8 +77,14 @@ class SCPAEDRasterizer {
     _error.fillRange(0, _error.length, 0.0);
   }
 
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
+    final contours = _resolveContours(vertices.length ~/ 2, contourVertexCounts);
 
     final b = _computeBounds(vertices, margin: _bboxMargin);
     if (b.isEmpty) return;
@@ -84,21 +92,35 @@ class SCPAEDRasterizer {
     // Reseta só o bbox (fundamental quando desenha vários polígonos no mesmo frame)
     _resetBboxState(b);
 
-    // 1) Scanline => máscara inside/outside (φ = +/-_phiFar)
-    _fillInteriorScanline(vertices, b);
+    // 1) Pré-processa arestas e buckets espaciais
+    _buildEdges(vertices, b, contours);
+    if (_edges.isEmpty) return;
+    final rowBuckets = _buildRowBuckets(b);
 
-    // 2) Curvatura simples (só pra modular erro/ruído em cantos)
-    _computeCurvature(vertices, b);
+    // 2) Scanline => máscara inside/outside (φ = +/-_phiFar)
+    _fillInteriorScanline(b, windingRule, rowBuckets);
 
-    // 3) Inicializa SDF assinado na banda (perto das arestas)
-    _initSignedDistanceNarrowBand(vertices, b, radius: _sdfRadius);
+    // 3) Curvatura simples (só pra modular erro/ruído em cantos)
+    _computeCurvature(vertices, b, contours);
 
-    // 4) Difusão estocástica leve só na banda
+    // 4) Inicializa SDF assinado na banda (perto das arestas)
+    if (_edges.length >= _sdfTilePruneEdgeThreshold) {
+      final tileBuckets = _buildTileBuckets(b, _sdfRadius);
+      _initSignedDistanceNarrowBandWithTilePruning(
+        b,
+        tileBuckets,
+        radius: _sdfRadius,
+      );
+    } else {
+      _initSignedDistanceNarrowBandDirect(b, radius: _sdfRadius);
+    }
+
+    // 5) Difusão estocástica leve só na banda
     for (int i = 0; i < _diffuseIters; i++) {
       _diffuse(b);
     }
 
-    // 5) Render: cobertura rápida + error diffusion na banda
+    // 6) Render: cobertura rápida + error diffusion na banda
     _render(color, b);
   }
 
@@ -144,55 +166,132 @@ class SCPAEDRasterizer {
   // Scanline (máscara inside/outside)
   // --------------------------------------------------------------------------
 
-  void _fillInteriorScanline(List<double> vertices, _Bounds b) {
-    final n = vertices.length ~/ 2;
+  void _buildEdges(List<double> vertices, _Bounds b, List<_ContourSpan> contours) {
     _edges.clear();
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      double x0 = vertices[i * 2];
-      double y0 = vertices[i * 2 + 1];
-      double x1 = vertices[j * 2];
-      double y1 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        double x0 = vertices[i * 2];
+        double y0 = vertices[i * 2 + 1];
+        double x1 = vertices[j * 2];
+        double y1 = vertices[j * 2 + 1];
 
-      if (y0 == y1) continue;
-      if (y0 > y1) {
-        final tx = x0; x0 = x1; x1 = tx;
-        final ty = y0; y0 = y1; y1 = ty;
+        if (y0 == y1) continue;
+        int winding = 1;
+        if (y0 > y1) {
+          final tx = x0; x0 = x1; x1 = tx;
+          final ty = y0; y0 = y1; y1 = ty;
+          winding = -1;
+        }
+
+        // culling vertical no bbox
+        if (y1 < b.y0 || y0 > b.y1 + 1) continue;
+
+        _edges.add(_Edge(x0, y0, x1, y1, winding));
       }
-
-      // culling vertical no bbox
-      if (y1 < b.y0 || y0 > b.y1 + 1) continue;
-
-      _edges.add(_Edge(x0, y0, x1, y1));
     }
+  }
+
+  List<List<int>> _buildRowBuckets(_Bounds b) {
+    final rows = b.y1 - b.y0 + 1;
+    final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+    for (int i = 0; i < _edges.length; i++) {
+      final e = _edges[i];
+      final yStart = (e.y0.floor() - 1).clamp(b.y0, b.y1);
+      final yEnd = (e.y1.ceil() + 1).clamp(b.y0, b.y1);
+      for (int y = yStart; y <= yEnd; y++) {
+        buckets[y - b.y0].add(i);
+      }
+    }
+    return buckets;
+  }
+
+  List<List<int>> _buildTileBuckets(_Bounds b, double radius) {
+    final minTileX = b.x0 ~/ _tileSize;
+    final maxTileX = b.x1 ~/ _tileSize;
+    final minTileY = b.y0 ~/ _tileSize;
+    final maxTileY = b.y1 ~/ _tileSize;
+    final tilesX = maxTileX - minTileX + 1;
+    final tilesY = maxTileY - minTileY + 1;
+    final buckets = List<List<int>>.generate(tilesX * tilesY, (_) => <int>[]);
+
+    for (int i = 0; i < _edges.length; i++) {
+      final e = _edges[i];
+      final ex0 = (math.min(e.x0, e.x1) - radius).floor().clamp(b.x0, b.x1);
+      final ex1 = (math.max(e.x0, e.x1) + radius).ceil().clamp(b.x0, b.x1);
+      final ey0 = (e.y0 - radius).floor().clamp(b.y0, b.y1);
+      final ey1 = (e.y1 + radius).ceil().clamp(b.y0, b.y1);
+      if (ex0 > ex1 || ey0 > ey1) continue;
+
+      final tx0 = (ex0 ~/ _tileSize).clamp(minTileX, maxTileX).toInt();
+      final tx1 = (ex1 ~/ _tileSize).clamp(minTileX, maxTileX).toInt();
+      final ty0 = (ey0 ~/ _tileSize).clamp(minTileY, maxTileY).toInt();
+      final ty1 = (ey1 ~/ _tileSize).clamp(minTileY, maxTileY).toInt();
+
+      for (int ty = ty0; ty <= ty1; ty++) {
+        final rowBase = (ty - minTileY) * tilesX;
+        for (int tx = tx0; tx <= tx1; tx++) {
+          buckets[rowBase + (tx - minTileX)].add(i);
+        }
+      }
+    }
+    return buckets;
+  }
+
+  void _fillInteriorScanline(
+    _Bounds b,
+    int windingRule,
+    List<List<int>> rowBuckets,
+  ) {
+    _crossings.clear();
 
     for (int y = b.y0; y <= b.y1; y++) {
-      final scanY = y + 0.5;
-      _xs.clear();
+      final rowEdgeIndices = rowBuckets[y - b.y0];
+      if (rowEdgeIndices.isEmpty) continue;
 
-      for (final e in _edges) {
+      final scanY = y + 0.5;
+      _crossings.clear();
+
+      for (int i = 0; i < rowEdgeIndices.length; i++) {
+        final e = _edges[rowEdgeIndices[i]];
         if (scanY >= e.y0 && scanY < e.y1) {
           final t = (scanY - e.y0) / (e.y1 - e.y0);
-          _xs.add(e.x0 + t * (e.x1 - e.x0));
+          _crossings.add(_Crossing(e.x0 + t * (e.x1 - e.x0), e.winding));
         }
       }
 
-      if (_xs.isEmpty) continue;
-      _xs.sort();
+      if (_crossings.isEmpty) continue;
+      _crossings.sort((a, b2) => a.x.compareTo(b2.x));
 
       final row = y * width;
+      int winding = 0;
+      double? startX;
+      for (int i = 0; i < _crossings.length; i++) {
+        final c = _crossings[i];
+        final bool wasInside =
+            (windingRule == 0) ? ((winding & 1) != 0) : (winding != 0);
+        winding += c.winding;
+        final bool isInside =
+            (windingRule == 0) ? ((winding & 1) != 0) : (winding != 0);
 
-      for (int k = 0; k + 1 < _xs.length; k += 2) {
-        int xStart = _xs[k].ceil();
-        int xEnd = _xs[k + 1].floor();
-
-        if (xStart < b.x0) xStart = b.x0;
-        if (xEnd > b.x1) xEnd = b.x1;
-        if (xStart > xEnd) continue;
-
-        for (int x = xStart; x <= xEnd; x++) {
-          _phi[row + x] = _phiFar; // inside
+        if (!wasInside && isInside) {
+          startX = c.x;
+          continue;
+        }
+        if (wasInside && !isInside && startX != null) {
+          int xStart = startX.ceil();
+          int xEnd = c.x.floor();
+          if (xStart < b.x0) xStart = b.x0;
+          if (xEnd > b.x1) xEnd = b.x1;
+          if (xStart <= xEnd) {
+            for (int x = xStart; x <= xEnd; x++) {
+              _phi[row + x] = _phiFar; // inside
+            }
+          }
+          startX = null;
         }
       }
     }
@@ -202,46 +301,47 @@ class SCPAEDRasterizer {
   // Curvatura simples (só em cantos) + espalhamento local
   // --------------------------------------------------------------------------
 
-  void _computeCurvature(List<double> vertices, _Bounds b) {
-    final n = vertices.length ~/ 2;
-
+  void _computeCurvature(List<double> vertices, _Bounds b, List<_ContourSpan> contours) {
     // “pinta” um pequeno disco ao redor do vértice com o ângulo de virada (0..pi)
     const int r = 2;
-    for (int i = 0; i < n; i++) {
-      final p0 = i;
-      final p1 = (i + 1) % n;
-      final p2 = (i + 2) % n;
+    for (final contour in contours) {
+      if (contour.count < 3) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final p0 = contour.start + local;
+        final p1 = contour.start + ((local + 1) % contour.count);
+        final p2 = contour.start + ((local + 2) % contour.count);
 
-      final dx1 = vertices[p1 * 2] - vertices[p0 * 2];
-      final dy1 = vertices[p1 * 2 + 1] - vertices[p0 * 2 + 1];
-      final dx2 = vertices[p2 * 2] - vertices[p1 * 2];
-      final dy2 = vertices[p2 * 2 + 1] - vertices[p1 * 2 + 1];
+        final dx1 = vertices[p1 * 2] - vertices[p0 * 2];
+        final dy1 = vertices[p1 * 2 + 1] - vertices[p0 * 2 + 1];
+        final dx2 = vertices[p2 * 2] - vertices[p1 * 2];
+        final dy2 = vertices[p2 * 2 + 1] - vertices[p1 * 2 + 1];
 
-      final a1 = math.atan2(dy1, dx1);
-      final a2 = math.atan2(dy2, dx2);
-      double diff = (a2 - a1).abs();
-      if (diff > math.pi) diff = 2 * math.pi - diff;
+        final a1 = math.atan2(dy1, dx1);
+        final a2 = math.atan2(dy2, dx2);
+        double diff = (a2 - a1).abs();
+        if (diff > math.pi) diff = 2 * math.pi - diff;
 
-      final vx = vertices[p1 * 2].round();
-      final vy = vertices[p1 * 2 + 1].round();
+        final vx = vertices[p1 * 2].round();
+        final vy = vertices[p1 * 2 + 1].round();
 
-      for (int oy = -r; oy <= r; oy++) {
-        final yy = vy + oy;
-        if (yy < b.y0 || yy > b.y1) continue;
-        final row = yy * width;
+        for (int oy = -r; oy <= r; oy++) {
+          final yy = vy + oy;
+          if (yy < b.y0 || yy > b.y1) continue;
+          final row = yy * width;
 
-        for (int ox = -r; ox <= r; ox++) {
-          final xx = vx + ox;
-          if (xx < b.x0 || xx > b.x1) continue;
+          for (int ox = -r; ox <= r; ox++) {
+            final xx = vx + ox;
+            if (xx < b.x0 || xx > b.x1) continue;
 
-          final d2 = (ox * ox + oy * oy);
-          if (d2 > r * r) continue;
+            final d2 = (ox * ox + oy * oy);
+            if (d2 > r * r) continue;
 
-          // falloff simples
-          final w = 1.0 - (math.sqrt(d2) / r);
-          final idx = row + xx;
-          final v = diff * w;
-          if (v > _curvature[idx]) _curvature[idx] = v;
+            // falloff simples
+            final w = 1.0 - (math.sqrt(d2) / r);
+            final idx = row + xx;
+            final v = diff * w;
+            if (v > _curvature[idx]) _curvature[idx] = v;
+          }
         }
       }
     }
@@ -251,27 +351,91 @@ class SCPAEDRasterizer {
   // Narrow-band SDF: distância ponto->segmento (somente perto da borda)
   // --------------------------------------------------------------------------
 
-  void _initSignedDistanceNarrowBand(List<double> vertices, _Bounds b, {required double radius}) {
-    final n = vertices.length ~/ 2;
+  void _initSignedDistanceNarrowBandWithTilePruning(
+    _Bounds b,
+    List<List<int>> tileBuckets, {
+    required double radius,
+  }) {
+    final minTileX = b.x0 ~/ _tileSize;
+    final maxTileX = b.x1 ~/ _tileSize;
+    final minTileY = b.y0 ~/ _tileSize;
+    final maxTileY = b.y1 ~/ _tileSize;
+    final tilesX = maxTileX - minTileX + 1;
     final r = radius;
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
+    for (int ty = minTileY; ty <= maxTileY; ty++) {
+      final tileY0 = math.max(ty * _tileSize, b.y0);
+      final tileY1 = math.min((ty + 1) * _tileSize - 1, b.y1);
 
-      final ax = vertices[i * 2];
-      final ay = vertices[i * 2 + 1];
-      final bx = vertices[j * 2];
-      final by = vertices[j * 2 + 1];
+      for (int tx = minTileX; tx <= maxTileX; tx++) {
+        final tileX0 = math.max(tx * _tileSize, b.x0);
+        final tileX1 = math.min((tx + 1) * _tileSize - 1, b.x1);
+        final candidates =
+            tileBuckets[(ty - minTileY) * tilesX + (tx - minTileX)];
+        if (candidates.isEmpty) continue;
 
-      final minX = math.min(ax, bx) - r;
-      final maxX = math.max(ax, bx) + r;
-      final minY = math.min(ay, by) - r;
-      final maxY = math.max(ay, by) + r;
+        for (int ci = 0; ci < candidates.length; ci++) {
+          final e = _edges[candidates[ci]];
+          final ax = e.x0;
+          final ay = e.y0;
+          final bx = e.x1;
+          final by = e.y1;
 
-      int x0 = minX.floor().clamp(b.x0, b.x1);
-      int x1 = maxX.ceil().clamp(b.x0, b.x1);
-      int y0 = minY.floor().clamp(b.y0, b.y1);
-      int y1 = maxY.ceil().clamp(b.y0, b.y1);
+          int x0 =
+              (math.min(ax, bx) - r).floor().clamp(tileX0, tileX1).toInt();
+          int x1 =
+              (math.max(ax, bx) + r).ceil().clamp(tileX0, tileX1).toInt();
+          int y0 = (math.min(ay, by) - r)
+              .floor()
+              .clamp(tileY0, tileY1)
+              .toInt();
+          int y1 = (math.max(ay, by) + r)
+              .ceil()
+              .clamp(tileY0, tileY1)
+              .toInt();
+          if (x0 > x1 || y0 > y1) continue;
+
+          for (int y = y0; y <= y1; y++) {
+            final py = y + 0.5;
+            final row = y * width;
+
+            for (int x = x0; x <= x1; x++) {
+              final idx = row + x;
+              final sign = (_phi[idx] >= 0.0) ? 1.0 : -1.0;
+
+              final px = x + 0.5;
+              final d2 = _dist2PointToSegment(px, py, ax, ay, bx, by);
+              final curAbs = _phi[idx].abs();
+              if (d2 >= curAbs * curAbs) continue;
+
+              var d = math.sqrt(d2);
+              if (d > _phiFar) d = _phiFar;
+
+              _phi[idx] = sign * d;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void _initSignedDistanceNarrowBandDirect(
+    _Bounds b, {
+    required double radius,
+  }) {
+    final r = radius;
+    for (int ei = 0; ei < _edges.length; ei++) {
+      final e = _edges[ei];
+      final ax = e.x0;
+      final ay = e.y0;
+      final bx = e.x1;
+      final by = e.y1;
+
+      int x0 = (math.min(ax, bx) - r).floor().clamp(b.x0, b.x1).toInt();
+      int x1 = (math.max(ax, bx) + r).ceil().clamp(b.x0, b.x1).toInt();
+      int y0 = (math.min(ay, by) - r).floor().clamp(b.y0, b.y1).toInt();
+      int y1 = (math.max(ay, by) + r).ceil().clamp(b.y0, b.y1).toInt();
+      if (x0 > x1 || y0 > y1) continue;
 
       for (int y = y0; y <= y1; y++) {
         final py = y + 0.5;
@@ -279,14 +443,10 @@ class SCPAEDRasterizer {
 
         for (int x = x0; x <= x1; x++) {
           final idx = row + x;
-
-          // sinal vem da máscara do scanline (inside/outside)
           final sign = (_phi[idx] >= 0.0) ? 1.0 : -1.0;
 
           final px = x + 0.5;
           final d2 = _dist2PointToSegment(px, py, ax, ay, bx, by);
-
-          // evita sqrt se não for melhorar
           final curAbs = _phi[idx].abs();
           if (d2 >= curAbs * curAbs) continue;
 
@@ -495,5 +655,38 @@ class _Bounds {
 
 class _Edge {
   final double x0, y0, x1, y1;
-  _Edge(this.x0, this.y0, this.x1, this.y1);
+  final int winding;
+  _Edge(this.x0, this.y0, this.x1, this.y1, this.winding);
+}
+
+class _Crossing {
+  final double x;
+  final int winding;
+  const _Crossing(this.x, this.winding);
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }
