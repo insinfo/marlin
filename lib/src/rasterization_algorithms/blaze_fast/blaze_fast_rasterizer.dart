@@ -24,7 +24,12 @@ class ScanlineRasterizer {
   }
 
   /// Preenche polígono (even-odd), sem AA
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;

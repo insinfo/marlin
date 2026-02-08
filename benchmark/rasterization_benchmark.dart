@@ -243,7 +243,13 @@ Future<void> main() async {
   // ─── ACDR ───────────────────────────────────────────────────────────────
   print('Testing ACDR (Accumulated Coverage Derivative)...');
   try {
-    final acdr = ACDRRasterizer(width: width, height: height);
+    final acdr = ACDRRasterizer(
+        width: width,
+        height: height,
+        enableSubpixelY: false,
+        enableSinglePixelSpanFix: false,
+        enableVerticalSupersample: false);
+
     results.add(await runBenchmark(
       'ACDR',
       (vertices, color) {
@@ -485,6 +491,23 @@ Future<void> main() async {
     await saveImage('HSGR', hsgr.buffer, width, height);
   } catch (e) {
     print('  HSGR failed: $e');
+  }
+
+  // ─── LNAF_SE ────────────────────────────────────────────────────────────
+  print('Testing LNAF_SE (Lattice-Normal Alpha Field)...');
+  try {
+    final lnaf = LNAFSERasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'LNAF_SE',
+      (vertices, color) => lnaf.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => lnaf.clear(0xFFFFFFFF),
+    ));
+    await saveImage('LNAF_SE', lnaf.buffer, width, height);
+  } catch (e) {
+    print('  LNAF_SE failed: $e');
   }
 
   // ─── SWEEP_SDF ──────────────────────────────────────────────────────────

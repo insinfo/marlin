@@ -23,6 +23,7 @@ library dbsr;
 
 import 'dart:typed_data';
 import 'dart:math' as math;
+import '../common/polygon_contract.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTES DE SUBPIXEL
@@ -151,7 +152,7 @@ class Edge {
 /// Rasterizador Distance-Based Subpixel Rasterization
 ///
 /// Otimizado para displays LCD com layout RGB horizontal.
-class DBSRRasterizer {
+class DBSRRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -327,10 +328,17 @@ class DBSRRasterizer {
   }
 
   /// Desenha um polígono (concavo/convexo) com AA subpixel
-  void drawPolygon(List<double> vertices, int color) {
+  @override
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return; // Mínimo 3 vértices
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
 
     // Bounding box
     var minX = vertices[0];
@@ -351,25 +359,44 @@ class DBSRRasterizer {
     final minYi = minY.floor().clamp(0, height - 1);
     final maxYi = maxY.ceil().clamp(0, height - 1);
 
-    // Pré-calcular arestas sem alocação de objetos
-    final edgeCount = n;
+    // Pré-calcular arestas sem conectar contornos distintos.
+    int edgeCount = 0;
+    for (final c in contours) {
+      if (c.count >= 2) edgeCount += c.count;
+    }
+    if (edgeCount == 0) return;
+
     final edgeX1 = List<double>.filled(edgeCount, 0.0);
     final edgeY1 = List<double>.filled(edgeCount, 0.0);
     final edgeX2 = List<double>.filled(edgeCount, 0.0);
     final edgeY2 = List<double>.filled(edgeCount, 0.0);
+    final edgeWinding = List<int>.filled(edgeCount, 0);
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x1 = vertices[i * 2];
-      final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[j * 2];
-      final y2 = vertices[j * 2 + 1];
-
-      edgeX1[i] = x1;
-      edgeY1[i] = y1;
-      edgeX2[i] = x2;
-      edgeY2[i] = y2;
+    int edgeIndex = 0;
+    for (final contour in contours) {
+      for (int i = 0; i < contour.count; i++) {
+        final int p0 = contour.start + i;
+        final int p1 = contour.start + ((i + 1) % contour.count);
+        final x1 = vertices[p0 * 2];
+        final y1 = vertices[p0 * 2 + 1];
+        final x2 = vertices[p1 * 2];
+        final y2 = vertices[p1 * 2 + 1];
+        edgeX1[edgeIndex] = x1;
+        edgeY1[edgeIndex] = y1;
+        edgeX2[edgeIndex] = x2;
+        edgeY2[edgeIndex] = y2;
+        edgeWinding[edgeIndex] = y1 < y2 ? 1 : -1;
+        edgeIndex++;
+      }
     }
+
+    final rowBuckets = _buildRowBuckets(
+      minYi,
+      maxYi,
+      edgeCount,
+      edgeY1,
+      edgeY2,
+    );
 
     // Extrair canais de cor
     final colorR = (color >> 16) & 0xFF;
@@ -378,6 +405,8 @@ class DBSRRasterizer {
 
     for (int y = minYi; y <= maxYi; y++) {
       final centerY = y + 0.5;
+      final rowEdgeIndices = rowBuckets[y - minYi];
+      if (rowEdgeIndices.isEmpty) continue;
 
       for (int x = minXi; x <= maxXi; x++) {
         final baseIdx = (y * width + x) * 3;
@@ -387,11 +416,13 @@ class DBSRRasterizer {
         final weightR = _computeSubpixelWeightPolygon(
           centerR,
           centerY,
-          edgeCount,
+          windingRule,
           edgeX1,
           edgeY1,
           edgeX2,
           edgeY2,
+          edgeWinding,
+          rowEdgeIndices,
         );
 
         // Subpixel G (centro)
@@ -399,11 +430,13 @@ class DBSRRasterizer {
         final weightG = _computeSubpixelWeightPolygon(
           centerG,
           centerY,
-          edgeCount,
+          windingRule,
           edgeX1,
           edgeY1,
           edgeX2,
           edgeY2,
+          edgeWinding,
+          rowEdgeIndices,
         );
 
         // Subpixel B (direita)
@@ -411,11 +444,13 @@ class DBSRRasterizer {
         final weightB = _computeSubpixelWeightPolygon(
           centerB,
           centerY,
-          edgeCount,
+          windingRule,
           edgeX1,
           edgeY1,
           edgeX2,
           edgeY2,
+          edgeWinding,
+          rowEdgeIndices,
         );
 
         if (weightR > 0) {
@@ -485,29 +520,35 @@ class DBSRRasterizer {
   int _computeSubpixelWeightPolygon(
     double px,
     double py,
-    int edgeCount,
+    int windingRule,
     List<double> edgeX1,
     List<double> edgeY1,
     List<double> edgeX2,
     List<double> edgeY2,
+    List<int> edgeWinding,
+    List<int> edgeIndices,
   ) {
     int winding = 0;
+    int parityCrossings = 0;
     double minDistSq = double.infinity;
 
-    for (int i = 0; i < edgeCount; i++) {
+    for (int k = 0; k < edgeIndices.length; k++) {
+      final i = edgeIndices[k];
       final x1 = edgeX1[i];
       final y1 = edgeY1[i];
       final x2 = edgeX2[i];
       final y2 = edgeY2[i];
 
-      // Winding (Non-Zero Rule)
-      if (y1 <= py) {
-        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) {
-          winding++;
-        }
-      } else {
-        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) {
-          winding--;
+      final bool upward = y1 <= py && y2 > py;
+      final bool downward = y1 > py && y2 <= py;
+      if (upward || downward) {
+        final cross = _isLeft(x1, y1, x2, y2, px, py);
+        if (cross > 0 && upward) {
+          winding += edgeWinding[i];
+          parityCrossings++;
+        } else if (cross < 0 && downward) {
+          winding += edgeWinding[i];
+          parityCrossings++;
         }
       }
 
@@ -537,7 +578,7 @@ class DBSRRasterizer {
       if (distSq < minDistSq) minDistSq = distSq;
     }
 
-    final inside = winding != 0;
+    final inside = windingRule == 0 ? ((parityCrossings & 1) != 0) : winding != 0;
     final minAbs = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
     final signedDist = inside ? -minAbs : minAbs;
     return _distanceLUT.getWeight((signedDist * _fixedOne).toInt());
@@ -573,4 +614,51 @@ class DBSRRasterizer {
 
   /// Retorna o buffer de subpixels (para debug)
   Uint8List get subpixels => _subpixelBuffer;
+
+  List<List<int>> _buildRowBuckets(
+    int minYi,
+    int maxYi,
+    int edgeCount,
+    List<double> edgeY1,
+    List<double> edgeY2,
+  ) {
+    final rows = maxYi - minYi + 1;
+    final buckets = List<List<int>>.generate(rows, (_) => <int>[]);
+    for (int i = 0; i < edgeCount; i++) {
+      final minY = math.min(edgeY1[i], edgeY2[i]);
+      final maxY = math.max(edgeY1[i], edgeY2[i]);
+      final r0 = (minY.floor() - 1).clamp(minYi, maxYi);
+      final r1 = (maxY.ceil() + 1).clamp(minYi, maxYi);
+      for (int y = r0; y <= r1; y++) {
+        buckets[y - minYi].add(i);
+      }
+    }
+    return buckets;
+  }
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final rawCount in counts) {
+    if (rawCount <= 0) continue;
+    if (consumed + rawCount > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, rawCount));
+    consumed += rawCount;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

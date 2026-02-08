@@ -45,7 +45,12 @@ class WaveletHaarRasterizer {
     _buffer.fillRange(0, _buffer.length, color);
   }
 
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6) return;
 
     _tree.reset();

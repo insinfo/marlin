@@ -31,6 +31,7 @@ const svgFiles = <String>[
 
 const renderWidth = 512;
 const renderHeight = 512;
+const enableBlend2Dv1 = false;
 
 class PreparedPolygon {
   final List<double> vertices;
@@ -141,133 +142,77 @@ void _appendStrokePolygons({
   required int strokeColor,
   required double strokeWidthPx,
 }) {
+  if (strokeWidthPx <= 0.0) return;
+  const double eps = 1e-6;
+  final double halfWidth = strokeWidthPx * 0.5;
+  final double joinOverlap = halfWidth * 0.8;
+
   final int pointCount = vertices.length ~/ 2;
   final contours = _resolveContours(pointCount, contourVertexCounts);
 
   for (final contour in contours) {
-    final ring = _buildStrokeRing(
-      vertices: vertices,
-      startPoint: contour.start,
-      count: contour.count,
-      halfWidth: strokeWidthPx * 0.5,
-      miterLimit: 4.0,
-    );
-    if (ring.isEmpty) continue;
-    prepared.add(PreparedPolygon(
-      ring,
-      strokeColor,
-      1,
-      contourVertexCounts: <int>[ring.length ~/ 2],
-    ));
-  }
-}
+    if (contour.count < 2) continue;
 
-List<double> _buildStrokeRing({
-  required List<double> vertices,
-  required int startPoint,
-  required int count,
-  required double halfWidth,
-  required double miterLimit,
-}) {
-  if (count < 3 || halfWidth <= 0) return const <double>[];
-  const eps = 1e-9;
+    final int first = contour.start;
+    final int last = contour.start + contour.count - 1;
+    final double fx = vertices[first * 2];
+    final double fy = vertices[first * 2 + 1];
+    final double lx = vertices[last * 2];
+    final double ly = vertices[last * 2 + 1];
+    final bool closed = ((fx - lx) * (fx - lx) + (fy - ly) * (fy - ly)) <= eps;
 
-  final left = List<double>.filled(count * 2, 0.0);
-  final right = List<double>.filled(count * 2, 0.0);
+    final int segCount = closed ? contour.count : (contour.count - 1);
+    for (int i = 0; i < segCount; i++) {
+      final int p0 = contour.start + i;
+      final int p1 = contour.start + ((i + 1) % contour.count);
 
-  for (int i = 0; i < count; i++) {
-    final prev = startPoint + ((i - 1 + count) % count);
-    final curr = startPoint + i;
-    final next = startPoint + ((i + 1) % count);
+      final double x0 = vertices[p0 * 2];
+      final double y0 = vertices[p0 * 2 + 1];
+      final double x1 = vertices[p1 * 2];
+      final double y1 = vertices[p1 * 2 + 1];
 
-    final px = vertices[prev * 2];
-    final py = vertices[prev * 2 + 1];
-    final cx = vertices[curr * 2];
-    final cy = vertices[curr * 2 + 1];
-    final nx = vertices[next * 2];
-    final ny = vertices[next * 2 + 1];
+      double dx = x1 - x0;
+      double dy = y1 - y0;
+      final double len2 = dx * dx + dy * dy;
+      if (len2 <= eps) continue;
+      final double invLen = 1.0 / math.sqrt(len2);
+      dx *= invLen;
+      dy *= invLen;
 
-    double inDx = cx - px;
-    double inDy = cy - py;
-    double outDx = nx - cx;
-    double outDy = ny - cy;
+      double sx = x0;
+      double sy = y0;
+      double ex = x1;
+      double ey = y1;
 
-    double inLen2 = inDx * inDx + inDy * inDy;
-    double outLen2 = outDx * outDx + outDy * outDy;
-
-    if (inLen2 <= eps && outLen2 <= eps) {
-      left[i * 2] = cx;
-      left[i * 2 + 1] = cy;
-      right[i * 2] = cx;
-      right[i * 2 + 1] = cy;
-      continue;
-    }
-    if (inLen2 <= eps) {
-      inDx = outDx;
-      inDy = outDy;
-      inLen2 = outLen2;
-    }
-    if (outLen2 <= eps) {
-      outDx = inDx;
-      outDy = inDy;
-      outLen2 = inLen2;
-    }
-
-    final invInLen = 1.0 / math.sqrt(inLen2);
-    final invOutLen = 1.0 / math.sqrt(outLen2);
-    inDx *= invInLen;
-    inDy *= invInLen;
-    outDx *= invOutLen;
-    outDy *= invOutLen;
-
-    final inNx = -inDy;
-    final inNy = inDx;
-    final outNx = -outDy;
-    final outNy = outDx;
-
-    double bisX = inNx + outNx;
-    double bisY = inNy + outNy;
-    final bisLen2 = bisX * bisX + bisY * bisY;
-
-    double offX;
-    double offY;
-
-    if (bisLen2 <= eps) {
-      offX = outNx * halfWidth;
-      offY = outNy * halfWidth;
-    } else {
-      final invBis = 1.0 / math.sqrt(bisLen2);
-      bisX *= invBis;
-      bisY *= invBis;
-      final denom = (bisX * outNx + bisY * outNy).abs();
-      double miterLen = halfWidth;
-      if (denom > eps) {
-        miterLen = halfWidth / denom;
+      if (closed || i > 0) {
+        sx -= dx * joinOverlap;
+        sy -= dy * joinOverlap;
       }
-      final maxMiter = halfWidth * miterLimit;
-      if (miterLen > maxMiter) {
-        miterLen = maxMiter;
+      if (closed || i < segCount - 1) {
+        ex += dx * joinOverlap;
+        ey += dy * joinOverlap;
       }
-      offX = bisX * miterLen;
-      offY = bisY * miterLen;
+
+      final double nx = -dy * halfWidth;
+      final double ny = dx * halfWidth;
+
+      prepared.add(PreparedPolygon(
+        <double>[
+          sx + nx,
+          sy + ny,
+          ex + nx,
+          ey + ny,
+          ex - nx,
+          ey - ny,
+          sx - nx,
+          sy - ny,
+        ],
+        strokeColor,
+        1,
+        contourVertexCounts: const <int>[4],
+      ));
     }
-
-    left[i * 2] = cx + offX;
-    left[i * 2 + 1] = cy + offY;
-    right[i * 2] = cx - offX;
-    right[i * 2 + 1] = cy - offY;
   }
-
-  final ring = <double>[];
-  for (int i = 0; i < count; i++) {
-    ring.add(left[i * 2]);
-    ring.add(left[i * 2 + 1]);
-  }
-  for (int i = count - 1; i >= 0; i--) {
-    ring.add(right[i * 2]);
-    ring.add(right[i * 2 + 1]);
-  }
-  return ring;
 }
 
 List<double> _scaleVertices(
@@ -318,6 +263,7 @@ List<Vec2> _toNormalizedVec2(List<double> verticesPx) {
   return out;
 }
 
+// ignore: unused_element
 void _blendCoverageInto(Uint32List dst, Float64List coverage, int color) {
   final srcA = (color >> 24) & 0xFF;
   final srcR = (color >> 16) & 0xFF;
@@ -348,6 +294,65 @@ void _blendCoverageInto(Uint32List dst, Float64List coverage, int color) {
     final outB = (srcB * alpha + bgB * invA) >> 8;
 
     dst[i] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+  }
+}
+
+void _blendCoverageIntoBounds(
+  Uint32List dst,
+  Float64List coverage,
+  int color,
+  List<double> vertices,
+) {
+  if (vertices.length < 6) return;
+  double minX = double.infinity;
+  double minY = double.infinity;
+  double maxX = double.negativeInfinity;
+  double maxY = double.negativeInfinity;
+  for (int i = 0; i < vertices.length; i += 2) {
+    final x = vertices[i];
+    final y = vertices[i + 1];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+
+  final int x0 = minX.floor().clamp(0, renderWidth - 1);
+  final int y0 = minY.floor().clamp(0, renderHeight - 1);
+  final int x1 = maxX.ceil().clamp(0, renderWidth - 1);
+  final int y1 = maxY.ceil().clamp(0, renderHeight - 1);
+
+  final srcA = (color >> 24) & 0xFF;
+  final srcR = (color >> 16) & 0xFF;
+  final srcG = (color >> 8) & 0xFF;
+  final srcB = color & 0xFF;
+
+  for (int y = y0; y <= y1; y++) {
+    final row = y * renderWidth;
+    for (int x = x0; x <= x1; x++) {
+      final i = row + x;
+      final c = coverage[i];
+      if (c <= 0.0) continue;
+
+      final cov = c.clamp(0.0, 1.0);
+      int alpha = (cov * srcA).round();
+      if (alpha <= 0) continue;
+      if (alpha >= 255) {
+        dst[i] = 0xFF000000 | (srcR << 16) | (srcG << 8) | srcB;
+        continue;
+      }
+
+      final bg = dst[i];
+      final bgR = (bg >> 16) & 0xFF;
+      final bgG = (bg >> 8) & 0xFF;
+      final bgB = bg & 0xFF;
+      final invA = 255 - alpha;
+
+      final outR = (srcR * alpha + bgR * invA) >> 8;
+      final outG = (srcG * alpha + bgG * invA) >> 8;
+      final outB = (srcB * alpha + bgB * invA) >> 8;
+      dst[i] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+    }
   }
 }
 
@@ -402,15 +407,24 @@ Future<void> _renderBlend2DV2BatchByColorRuns(
 List<RasterizerAdapter> _buildAdapters() {
   return <RasterizerAdapter>[
     FunctionAdapter('ACDR', (polygons) async {
-      final rasterizer =
-          ACDRRasterizer(width: renderWidth, height: renderHeight);
+      final rasterizer = ACDRRasterizer(
+          width: renderWidth,
+          height: renderHeight,
+          enableSubpixelY: false,
+          enableSinglePixelSpanFix: false,
+          enableVerticalSupersample: false);
       final out = Uint32List(renderWidth * renderHeight)
         ..fillRange(0, renderWidth * renderHeight, 0xFFFFFFFF);
 
       for (final poly in polygons) {
         rasterizer.clear();
-        rasterizer.rasterize(_toNormalizedVec2(poly.vertices));
-        _blendCoverageInto(out, rasterizer.coverageBuffer, poly.color);
+        rasterizer.rasterize(
+          _toNormalizedVec2(poly.vertices),
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+        _blendCoverageIntoBounds(
+            out, rasterizer.coverageBuffer, poly.color, poly.vertices);
       }
 
       return _uint32ToRGBA(out);
@@ -433,7 +447,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -448,7 +467,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -494,7 +518,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.pixels);
@@ -504,7 +533,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -524,7 +558,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -534,7 +573,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -544,7 +588,27 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('LNAF_SE', (polygons) async {
+      final r = LNAFSERasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -574,43 +638,50 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
     }),
-    FunctionAdapter('B2D_v1_Scalar', (polygons) async {
-      final r = Blend2DRasterizer(
-        renderWidth,
-        renderHeight,
-        config: const RasterizerConfig(useSimd: false, useIsolates: false),
-      );
-      r.clear(0xFFFFFFFF);
+    if (enableBlend2Dv1)
+      FunctionAdapter('B2D_v1_Scalar', (polygons) async {
+        final r = Blend2DRasterizer(
+          renderWidth,
+          renderHeight,
+          config: const RasterizerConfig(useSimd: false, useIsolates: false),
+        );
+        r.clear(0xFFFFFFFF);
 
-      for (final poly in polygons) {
-        await r.drawPolygon(poly.vertices, poly.color,
-            windingRule: poly.windingRule,
-            contourVertexCounts: poly.contourVertexCounts);
-      }
+        for (final poly in polygons) {
+          await r.drawPolygon(poly.vertices, poly.color,
+              windingRule: poly.windingRule,
+              contourVertexCounts: poly.contourVertexCounts);
+        }
 
-      return _uint32ToRGBA(r.buffer);
-    }),
-    FunctionAdapter('B2D_v1_SIMD', (polygons) async {
-      final r = Blend2DRasterizer(
-        renderWidth,
-        renderHeight,
-        config: const RasterizerConfig(useSimd: true, useIsolates: false),
-      );
-      r.clear(0xFFFFFFFF);
+        return _uint32ToRGBA(r.buffer);
+      }),
+    if (enableBlend2Dv1)
+      FunctionAdapter('B2D_v1_SIMD', (polygons) async {
+        final r = Blend2DRasterizer(
+          renderWidth,
+          renderHeight,
+          config: const RasterizerConfig(useSimd: true, useIsolates: false),
+        );
+        r.clear(0xFFFFFFFF);
 
-      for (final poly in polygons) {
-        await r.drawPolygon(poly.vertices, poly.color,
-            windingRule: poly.windingRule,
-            contourVertexCounts: poly.contourVertexCounts);
-      }
+        for (final poly in polygons) {
+          await r.drawPolygon(poly.vertices, poly.color,
+              windingRule: poly.windingRule,
+              contourVertexCounts: poly.contourVertexCounts);
+        }
 
-      return _uint32ToRGBA(r.buffer);
-    }),
+        return _uint32ToRGBA(r.buffer);
+      }),
     /*
     FunctionAdapter('B2D_v1_Scalar_Iso', (polygons) async {
       final r = Blend2DRasterizer(

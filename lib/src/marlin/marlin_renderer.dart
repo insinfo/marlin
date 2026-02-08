@@ -55,6 +55,7 @@ class MarlinRenderer implements PathConsumer2D {
   // ignore: unused_field
   static const int _subpixelMaskY = MarlinConst.subpixelMaskY;
   static const double _power2To32 = MarlinConst.power2To32;
+  static const int _mask32 = 0xFFFFFFFF;
 
   // ignore: unused_field
   static const double _quadDecBnd = 8.0 * (1.0 / 8.0);
@@ -73,7 +74,7 @@ class MarlinRenderer implements PathConsumer2D {
   // ignore: unused_field
   int _bboxMinX = 0, _bboxMinY = 0, _bboxMaxX = 0, _bboxMaxY = 0;
 
-  int _edgeMinY = 0, _edgeMaxY = 0;
+  double _edgeMinY = 0.0, _edgeMaxY = 0.0;
   double _edgeMinX = 0.0, _edgeMaxX = 0.0;
 
   // ignore: unused_field
@@ -88,8 +89,6 @@ class MarlinRenderer implements PathConsumer2D {
 
   Int32List _edgeBuckets;
   Int32List _edgeBucketCounts;
-  int _bucketsMinY = 0;
-  int _bucketsMaxY = 0;
 
   // Scanline arrays
   Int32List _crossings;
@@ -98,9 +97,10 @@ class MarlinRenderer implements PathConsumer2D {
   // Int32List _auxCrossings;
   // Int32List _auxEdgePtrs;
 
-  final Int32List _alphaLine;
+  Int32List _alphaLine;
   // ignore: unused_field
   int _edgeCount = 0;
+  int _bboxSpMinX = 0, _bboxSpMaxX = 0, _bboxSpMinY = 0, _bboxSpMaxY = 0;
 
   // Init
   factory MarlinRenderer(int width, int height) {
@@ -156,8 +156,8 @@ class MarlinRenderer implements PathConsumer2D {
       _edgeBucketCounts = _rdrCtx.getIntArray(edgeBucketsLength) as Int32List;
     }
 
-    _edgeMinY = 2147483647; // Float.POSITIVE_INFINITY as int (logic)
-    _edgeMaxY = -2147483648;
+    _edgeMinY = double.infinity;
+    _edgeMaxY = double.negativeInfinity;
     _edgeMinX = double.infinity;
     _edgeMaxX = double.negativeInfinity;
 
@@ -165,8 +165,8 @@ class MarlinRenderer implements PathConsumer2D {
     _edgesPos = _sizeofEdge; // Start at non-zero to verify linked lists
     _subpathOpen = false;
 
-    // Init cache logic
-    _cache.init(_boundsMinX, _boundsMinY, _boundsMaxX, _boundsMaxY);
+    _edgeBuckets.fillRange(0, edgeBucketsLength, 0);
+    _edgeBucketCounts.fillRange(0, edgeBucketsLength, 0);
   }
 
   void dispose() {
@@ -261,8 +261,8 @@ class MarlinRenderer implements PathConsumer2D {
 
     if (firstCrossing >= lastCrossing) return;
 
-    if (y1 < _edgeMinY) _edgeMinY = y1.floor();
-    if (y2 > _edgeMaxY) _edgeMaxY = y2.ceil(); // tracking int bounds?
+    if (y1 < _edgeMinY) _edgeMinY = y1;
+    if (y2 > _edgeMaxY) _edgeMaxY = y2;
 
     final double slope = (x2 - x1) / (y2 - y1);
 
@@ -283,12 +283,12 @@ class MarlinRenderer implements PathConsumer2D {
     // 2^32 * x + 0x7fffffff
     final int x1FixedBiased = (_power2To32 * x1Intercept).toInt() + 2147483647;
 
-    _edges[ptr + _offCurX] = x1FixedBiased >> 32;
-    _edges[ptr + _offError] = (x1FixedBiased & 0xFFFFFFFF) >> 1;
+    _edges[ptr + _offCurX] = _i32(x1FixedBiased >> 32);
+    _edges[ptr + _offError] = ((x1FixedBiased & _mask32) >> 1);
 
     final int slopeFixed = (_power2To32 * slope).toInt();
-    _edges[ptr + _offBumpX] = slopeFixed >> 32;
-    _edges[ptr + _offBumpErr] = (slopeFixed & 0xFFFFFFFF) >> 1;
+    _edges[ptr + _offBumpX] = _i32(slopeFixed >> 32);
+    _edges[ptr + _offBumpErr] = ((slopeFixed & _mask32) >> 1);
 
     final int bucketIdx = firstCrossing - _boundsMinY;
 
@@ -401,219 +401,250 @@ class MarlinRenderer implements PathConsumer2D {
   }
 
   void endRendering([int color = 0]) {
-    _bucketsMinY = FloatMath.maxInt(_edgeMinY, _boundsMinY);
-    _bucketsMaxY = FloatMath.minInt(_edgeMaxY, _boundsMaxY);
+    if (_edgeMinY.isInfinite) return;
 
-    int y = _bucketsMinY;
+    final int spminX =
+        FloatMath.maxInt(FloatMath.ceilInt(_edgeMinX - 0.5), _boundsMinX);
+    final int spmaxX =
+        FloatMath.minInt(FloatMath.ceilInt(_edgeMaxX - 0.5), _boundsMaxX - 1);
+    final int spminY = FloatMath.maxInt(FloatMath.ceilInt(_edgeMinY), _boundsMinY);
+
+    int maxY = FloatMath.ceilInt(_edgeMaxY);
+    final int spmaxY;
+    if (maxY <= _boundsMaxY - 1) {
+      spmaxY = maxY;
+    } else {
+      spmaxY = _boundsMaxY - 1;
+      maxY = _boundsMaxY;
+    }
+
+    if (spminX > spmaxX || spminY > spmaxY) return;
+
+    final int pminX = spminX >> _subpixelLgPositionsX;
+    final int pmaxX = (spmaxX + MarlinConst.subpixelMaskX) >> _subpixelLgPositionsX;
+    final int pminY = spminY >> _subpixelLgPositionsY;
+    final int pmaxY = (spmaxY + MarlinConst.subpixelMaskY) >> _subpixelLgPositionsY;
+
+    _cache.init(pminX, pminY, pmaxX, pmaxY);
+
+    _bboxSpMinX = pminX << _subpixelLgPositionsX;
+    _bboxSpMaxX = pmaxX << _subpixelLgPositionsX;
+    _bboxSpMinY = spminY;
+    _bboxSpMaxY = math.min(spmaxY + 1, pmaxY << _subpixelLgPositionsY);
+
+    final int alphaWidth = (pmaxX - pminX) + 2;
+    if (_alphaLine.length < alphaWidth) {
+      _alphaLine = _rdrCtx.getIntArray(alphaWidth) as Int32List;
+    }
+
+    for (int tileY = pminY; tileY < pmaxY; tileY += MarlinConst.tileSize) {
+      final int spTileMinY =
+          math.max(_bboxSpMinY, tileY << _subpixelLgPositionsY);
+      if (spTileMinY >= _bboxSpMaxY) continue;
+
+      final int spTileMaxY = math.min(
+          _bboxSpMaxY,
+          (tileY << _subpixelLgPositionsY) +
+              (MarlinConst.tileSize << _subpixelLgPositionsY));
+
+      _cache.resetTileLine(tileY);
+      _endRenderingRange(spTileMinY, spTileMaxY);
+      _blit(color);
+    }
+  }
+
+  void _endRenderingRange(int ymin, int ymax) {
+    final bool windingEvenOdd = (_windingRule == MarlinConst.windEvenOdd);
+    final int bboxx0 = _bboxSpMinX;
+    final int bboxx1 = _bboxSpMaxX;
+    const int errStepMax = 0x7fffffff;
+    const int minValue = -2147483648;
+    const int maxValue = 2147483647;
+
+    int pixMinX = maxValue;
+    int pixMaxX = minValue;
+    int lastY = -1;
+
+    int y = ymin;
     int bucket = y - _boundsMinY;
-    int numCrossings = 0;
-    final int edgeBucketsLen = _edgeBuckets.length;
+    int numCrossings = _edgeCount;
 
-    // Clear cache state for new render
-    _cache.resetTileLine(y);
+    for (; y < ymax; y++, bucket++) {
+      final int bucketCount = _edgeBucketCounts[bucket];
+      int prevNumCrossings = numCrossings;
 
-    // Iteration on scanlines
-    for (; y < _bucketsMaxY; y++, bucket++) {
-      if (bucket >= edgeBucketsLen) break;
-
-      int bucketCount = _edgeBucketCounts[bucket];
-
-      // Remove finished edges and add new ones
       if (bucketCount != 0) {
-        // Remove finished edges first?
-        // "bucketCount & 0x1" means YMax reached for some edges.
         if ((bucketCount & 0x1) != 0) {
+          final int yLim = (y << 1) | 0x1;
           int newCount = 0;
           for (int i = 0; i < numCrossings; i++) {
-            int ptr = _edgePtrs[i];
-            // Check if edge ends at this Y.
-            // yMax is _edges[ptr + _offYMaxOr] >> 1
-            if ((_edges[ptr + _offYMaxOr] >> 1) > y) {
-              _edgePtrs[newCount++] = ptr;
+            final int ecur = _edgePtrs[i];
+            if (_edges[ecur + _offYMaxOr] > yLim) {
+              _edgePtrs[newCount++] = ecur;
             }
           }
-          numCrossings = newCount;
+          prevNumCrossings = numCrossings = newCount;
         }
 
-        // Add new edges
-        if (bucketCount > 1) {
-          int ptr = _edgeBuckets[bucket];
-          while (ptr != 0) {
-            if (_edgePtrs.length <= numCrossings) {
-              _edgePtrs = _widenIntArray(
-                  _edgePtrs, numCrossings, _edgePtrs.length << 1);
-            }
-            _edgePtrs[numCrossings++] = ptr;
-            ptr = _edges[ptr + _offNext];
+        final int ptrLen = bucketCount >> 1;
+        if (ptrLen != 0) {
+          final int ptrEnd = numCrossings + ptrLen;
+          if (_edgePtrs.length < ptrEnd) {
+            _edgePtrs = _widenIntArray(_edgePtrs, numCrossings, ptrEnd);
+          }
+          int ecur = _edgeBuckets[bucket];
+          while (numCrossings < ptrEnd) {
+            _edgePtrs[numCrossings++] = ecur;
+            ecur = _edges[ecur + _offNext];
+          }
+          if (_crossings.length < numCrossings) {
+            _crossings = _widenIntArray(_crossings, 0, numCrossings + 1);
           }
         }
-
-        // Reset bucket count for reuse (Java does this in dispose or clear?)
-        // We should zero it in dispose or here. Java recurses so it cleans up.
-        // We are not recursing, we assume clear/init zeros it.
-        _edgeBucketCounts[bucket] = 0; // Clear for next path
       }
 
-      // Process active edges
-      // 1. Compute Crossings
-      if (_crossings.length < numCrossings) {
-        _crossings = _widenIntArray(
-            _crossings, 0, numCrossings + 1024); // simplistic resize
-      }
+      if (numCrossings != 0) {
+        final bool useBinarySearch = numCrossings >= 20;
+        for (int i = 0; i < numCrossings; i++) {
+          final int ecur = _edgePtrs[i];
+          int curx = _edges[ecur + _offCurX];
+          final int cross =
+              _i32(curx << 1) | (_edges[ecur + _offYMaxOr] & 0x1);
 
-      for (int i = 0; i < numCrossings; i++) {
-        int ptr = _edgePtrs[i];
-        int curx = _edges[ptr + _offCurX];
+          curx = _i32(curx + _edges[ecur + _offBumpX]);
+          final int err =
+              _i32(_edges[ecur + _offError] + _edges[ecur + _offBumpErr]);
+          _edges[ecur + _offCurX] = _i32(curx - (err >> 31));
+          _edges[ecur + _offError] = err & errStepMax;
 
-        // Add to crossings: (curx << 1) | orientation
-        int orientation = _edges[ptr + _offYMaxOr] & 1;
-        _crossings[i] = (curx << 1) | orientation;
-
-        // Update edge for next scanline
-        int error = _edges[ptr + _offError];
-        error += _edges[ptr + _offBumpErr];
-        curx += _edges[ptr + _offBumpX];
-
-        // Apply error carry
-        // int carry = (error >> 31) & 1; using logic directly
-
-        // if error (32-bit signed) has bit 31 set, it is negative.
-        // (error >> 31) will be -1.
-        // (error >> 31) & 1 will be 1.
-        int carry = (error >> 31) & 1;
-        curx += carry;
-
-        _edges[ptr + _offCurX] = curx;
-        _edges[ptr + _offError] = error & 2147483647; // Clear sign/carry bit
-      }
-
-      // 2. Sort Crossings
-      _quickSort(_crossings, 0, numCrossings - 1);
-
-      // 3. Render Scanline
-      int minX = _width; // track min/max for efficient clear
-      int maxX = 0;
-
-      int curCoverage = 0;
-      int prevX = 0; // subpixel x
-
-      // Clear alphaLine for current row
-      _alphaLine.fillRange(0, _width, 0);
-
-      for (int i = 0; i < numCrossings; i++) {
-        int cross = _crossings[i];
-        int x = cross >> 1; // x subpixel. (cross >> 1) is subpix coordinate?
-        // crossings are (curx << 1). curx is 32.32 fixed point integral part?
-        // Wait. _edges[offCurX] is high 32 bits of 32.32 fixed.
-        // So curx IS integer pixel?
-        // No. "curx = next VPC = fixed_floor(x1_fixed + 0x7fffffff)".
-        // x1_fixed is subpixel * 2^32.
-        // So curx is SUBPIXEL coordinate.
-        // _crossings stores subpixel x.
-        // We want PIXEL x for alphaLine.
-        // SUBPIXEL_POSITIONS_X = 8 (log2=3).
-        // So pixel x = (subpixel x) >> 3.
-        // But we might want subpixel coverage accumulation.
-
-        // Java ScanLineIterator: "pix_x = next_x >> _SUBPIXEL_LG_POSITIONS_X".
-        // It uses alphaLine (int[]) to store coverage.
-
-        // Simplified winding rule processing (NonZero)
-        int orientation = (cross & 1) == 1 ? 1 : -1;
-
-        if (x > prevX) {
-          // Determine pixels spanned
-
-          // Winding rule:
-          // If NonZero (1), we use curCoverage (and abs() later).
-          // If EvenOdd (0), we use (curCoverage & 1).
-          int winding = curCoverage;
-          if (_windingRule == MarlinConst.windEvenOdd) {
-            winding &= 1;
-          }
-
-          // Optimized fill
-          int p0 = prevX >> _subpixelLgPositionsX;
-          int p1 = x >> _subpixelLgPositionsX;
-
-          if (p0 == p1) {
-            if (p0 >= 0 && p0 < _alphaLine.length) {
-              int delta = x - prevX;
-              _alphaLine[p0] += delta * winding;
-              if (p0 < minX) minX = p0;
-              if (p0 > maxX) maxX = p0;
-            }
-          } else {
-            if (p0 >= 0 && p0 < _alphaLine.length) {
-              int nextP = (p0 + 1) << _subpixelLgPositionsX;
-              int delta = nextP - prevX;
-              _alphaLine[p0] += delta * winding;
-              if (p0 < minX) minX = p0;
-              if (p0 > maxX) maxX = p0;
-            }
-
-            int pStart = math.max(p0 + 1, 0);
-            int pEnd = math.min(p1, _alphaLine.length);
-            int fullCover = _subpixelPositionsX * winding;
-
-            if (pEnd > pStart) {
-              for (int p = pStart; p < pEnd; p++) {
-                _alphaLine[p] += fullCover;
+          if (i > 0 &&
+              _crossingLess(cross, ecur, _crossings[i - 1], _edgePtrs[i - 1])) {
+            int insertAt = i;
+            if (useBinarySearch && i >= prevNumCrossings) {
+              int low = 0;
+              int high = i - 1;
+              while (low <= high) {
+                final int mid = (low + high) >> 1;
+                if (_crossingLess(_crossings[mid], _edgePtrs[mid], cross, ecur)) {
+                  low = mid + 1;
+                } else {
+                  high = mid - 1;
+                }
               }
-              if (pStart < minX) minX = pStart;
-              int lastP = pEnd - 1;
-              if (lastP > maxX) maxX = lastP;
+              insertAt = low;
+            } else {
+              int j = i - 1;
+              while (j >= 0 &&
+                  _crossingLess(cross, ecur, _crossings[j], _edgePtrs[j])) {
+                j--;
+              }
+              insertAt = j + 1;
             }
 
-            if (p1 >= 0 && p1 < _alphaLine.length) {
-              int prevP1 = p1 << _subpixelLgPositionsX;
-              int delta = x - prevP1;
-              _alphaLine[p1] += delta * winding;
-              if (p1 < minX) minX = p1;
-              if (p1 > maxX) maxX = p1;
+            for (int j = i - 1; j >= insertAt; j--) {
+              _crossings[j + 1] = _crossings[j];
+              _edgePtrs[j + 1] = _edgePtrs[j];
             }
+            _crossings[insertAt] = cross;
+            _edgePtrs[insertAt] = ecur;
+          } else {
+            _crossings[i] = cross;
           }
         }
-        curCoverage += orientation;
-        prevX = x; // update prevX
-      }
 
-      // Copy to Cache
-      if (maxX >= minX) {
-        // Convert accumulated subpixel counts to alpha 0..255?
-        // MarlinCache expects 0..64 (maxAlpha).
-        // _alphaLine stores sums of active subpixels.
-        // Max possible value is 8 * winding_count.
-        // We need to apply winding rule here.
+        int lowx = _crossings[0] >> 1;
+        int highx = _crossings[numCrossings - 1] >> 1;
+        int x0 = (lowx > bboxx0) ? lowx : bboxx0;
+        int x1 = (highx < bboxx1) ? highx : bboxx1;
+        int tmp = x0 >> _subpixelLgPositionsX;
+        if (tmp < pixMinX) pixMinX = tmp;
+        tmp = x1 >> _subpixelLgPositionsX;
+        if (tmp > pixMaxX) pixMaxX = tmp;
 
-        // Normalize and ABS
-        for (int i = minX; i <= maxX; i++) {
-          int val = _alphaLine[i];
-          if (val != 0) {
-            val = val.abs(); // NonZero rule
-            // if EvenOdd: val = val & (maxAlpha); ?
-            // simple clamp
-            if (val > MarlinConst.maxAAAlpha)
-              val = MarlinConst.maxAAAlpha; // MarlinConst.maxAAAlpha
-            _alphaLine[i] = val; // Store back for copyAARow
+        int curxo = _crossings[0];
+        int prev = curxo >> 1;
+        int curx = prev;
+        int crorientation = ((curxo & 0x1) << 1) - 1;
+
+        void addSpan(int span0, int span1) {
+          int sx0 = (span0 > bboxx0) ? span0 : bboxx0;
+          int sx1 = (span1 < bboxx1) ? span1 : bboxx1;
+          if (sx0 >= sx1) return;
+
+          sx0 -= bboxx0;
+          sx1 -= bboxx0;
+
+          final int pixX = sx0 >> _subpixelLgPositionsX;
+          final int pixXMaxM1 = (sx1 - 1) >> _subpixelLgPositionsX;
+          if (pixX == pixXMaxM1) {
+            final int delta = sx1 - sx0;
+            _alphaLine[pixX] += delta;
+            _alphaLine[pixX + 1] -= delta;
+          } else {
+            int frac = (sx0 & MarlinConst.subpixelMaskX);
+            _alphaLine[pixX] += (_subpixelPositionsX - frac);
+            _alphaLine[pixX + 1] += frac;
+
+            final int pixXMax = sx1 >> _subpixelLgPositionsX;
+            frac = (sx1 & MarlinConst.subpixelMaskX);
+            _alphaLine[pixXMax] -= (_subpixelPositionsX - frac);
+            _alphaLine[pixXMax + 1] -= frac;
           }
         }
-        _cache.copyAARow(_alphaLine, y, minX, maxX + 1);
-      }
 
-      // Blit cache to buffer if a tile strip is complete
-      if ((y + 1) % MarlinConst.tileSize == 0 || y == _bucketsMaxY - 1) {
-        _blit(color);
-        if (y < _bucketsMaxY - 1) {
-          _cache.resetTileLine(y + 1);
+        if (windingEvenOdd) {
+          int sum = crorientation;
+          for (int i = 1; i < numCrossings; i++) {
+            curxo = _crossings[i];
+            curx = curxo >> 1;
+            crorientation = ((curxo & 0x1) << 1) - 1;
+            if ((sum & 0x1) != 0) {
+              addSpan(prev, curx);
+            }
+            sum += crorientation;
+            prev = curx;
+          }
+        } else {
+          int sum = 0;
+          for (int i = 1;; i++) {
+            sum += crorientation;
+            if (sum != 0) {
+              if (prev > curx) prev = curx;
+            } else {
+              addSpan(prev, curx);
+              prev = maxValue;
+            }
+            if (i == numCrossings) break;
+            curxo = _crossings[i];
+            curx = curxo >> 1;
+            crorientation = ((curxo & 0x1) << 1) - 1;
+          }
         }
       }
+
+      if ((y & MarlinConst.subpixelMaskY) == MarlinConst.subpixelMaskY) {
+        lastY = y >> _subpixelLgPositionsY;
+        if (pixMaxX >= pixMinX) {
+          _cache.copyAARow(_alphaLine, lastY, pixMinX, pixMaxX + 2);
+        } else {
+          _cache.clearAARow(lastY);
+        }
+        pixMinX = maxValue;
+        pixMaxX = minValue;
+      }
+
+      _edgeBuckets[bucket] = 0;
+      _edgeBucketCounts[bucket] = 0;
     }
 
-    // Clear edge buckets for next path
-    for (int i = 0; i < edgeBucketsLen; i++) {
-      _edgeBuckets[i] = 0;
+    final int finalY = (y - 1) >> _subpixelLgPositionsY;
+    if (pixMaxX >= pixMinX) {
+      _cache.copyAARow(_alphaLine, finalY, pixMinX, pixMaxX + 2);
+    } else if (finalY != lastY) {
+      _cache.clearAARow(finalY);
     }
+
+    _edgeCount = numCrossings;
   }
 
   void _blit(int color) {
@@ -622,134 +653,54 @@ class MarlinRenderer implements PathConsumer2D {
     final int tMin = _cache.tileMin;
     final int tMax = _cache.tileMax;
     final int tileW = MarlinConst.tileSize;
+    final int yStart = _cache.bboxY0;
+    final int yLimit = math.min(_cache.bboxY1, yStart + MarlinConst.tileSize);
 
-    // TileSize is 32 subpixels. Subpixel log2Y is 3. 32 >> 3 = 4 pixels.
-    // We process 4 pixel rows.
-    final int rowsPerBlock =
-        MarlinConst.tileSize >> MarlinConst.subpixelLgPositionsY;
-    final int subpixelsPerPixel = MarlinConst.subpixelPositionsY;
-
-    // Accumulation buffer for the pixel rows in this block (width * 4)
-    // Optimisation: reuse a static buffer? For now allow allocation or use small one.
-    // To avoid allocs, we iterate tiles.
+    final int sr = (color >> 16) & 0xFF;
+    final int sg = (color >> 8) & 0xFF;
+    final int sb = color & 0xFF;
 
     for (int t = tMin; t < tMax; t++) {
       if (_cache.touchedTile[t] == 0) continue;
+      final int tx = _cache.bboxX0 + (t << MarlinConst.tileSizeLg);
 
-      final int tx = t * tileW;
-
-      // We need to accumulate alpha for the pixels in this tile column.
-      // But RLE is row-based.
-      // We'll accumulate in a local buffer for the tile width (32 pixels).
-      // Width is small (32). Height is 4.
-      // Int32List tileAccum = Int32List(32 * 4); // 128 ints. Cheap.
-      final Int32List tileAccum = Int32List(
-          256); // Oversize to 256 to be safe against boundary conditions
-
-      final int yStart = _cache.bboxY0;
-      final int yLimit = math.min(_cache.bboxY1, yStart + MarlinConst.tileSize);
-
-      // 1. Accumulate subpixels
       for (int y = yStart; y < yLimit; y++) {
-        final int rowAAChunkIndex =
-            _cache.rowAAChunkIndex[y % MarlinConst.tileSize];
-        if (rowAAChunkIndex == 0) continue;
+        if (y < 0 || y >= _height) continue;
+        final int row = y - yStart;
+        final int rowIdx = _cache.rowAAChunkIndex[row];
+        if (rowIdx == 0) continue;
 
-        final Uint8List rowAAChunk = _cache.rowAAChunk;
-        int idx = rowAAChunkIndex;
-        // Correct initialization from cache metadata
-        int x = _cache.rowAAx0[y % MarlinConst.tileSize];
-
-        final int py = (y - yStart) >> MarlinConst.subpixelLgPositionsY;
-
-        // Validate py
-        if (py < 0 || py >= rowsPerBlock) continue;
-
-        final int accumOffset = py * tileW;
+        int idx = rowIdx;
+        int x = _cache.rowAAx0[row];
+        final int rowOffset = y * _width;
 
         while (true) {
-          final int val = rowAAChunk[idx++];
-          final int len = rowAAChunk[idx++];
+          final int val = _cache.rowAAChunk[idx++];
+          final int len = _cache.rowAAChunk[idx++];
           if (val == 0 && len == 0) break;
 
           if (val != 0) {
-            // Intersect [x, x+len] with [tx, tx+tileW]
-            int start = math.max(x, tx);
-            int end = math.min(x + len, tx + tileW);
-
-            if (end > start) {
-              int localStart = start - tx;
-              int count = end - start;
-              int dstIdx = accumOffset + localStart;
-
-              // Safe loop
-              if (dstIdx >= 0 && dstIdx + count <= tileAccum.length) {
-                for (int k = 0; k < count; k++) {
-                  tileAccum[dstIdx + k] += val;
-                }
-              }
+            final int runEnd = x + len;
+            final int start = math.max(x, tx);
+            final int end = math.min(runEnd, tx + tileW);
+            for (int px = start; px < end; px++) {
+              if (px < 0 || px >= _width) continue;
+              final int di = rowOffset + px;
+              final int dst = _pixelBuffer[di];
+              final int dr = (dst >> 16) & 0xFF;
+              final int dg = (dst >> 8) & 0xFF;
+              final int db = dst & 0xFF;
+              final int invA = 255 - val;
+              final int outR = ((sr * val) + (dr * invA)) >> 8;
+              final int outG = ((sg * val) + (dg * invA)) >> 8;
+              final int outB = ((sb * val) + (db * invA)) >> 8;
+              _pixelBuffer[di] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
             }
           }
           x += len;
         }
       }
-
-      // 2. Blit tileAccum to pixelBuffer
-      final int pYStart = yStart >> MarlinConst.subpixelLgPositionsY;
-      final int pYLimit =
-          (yLimit + subpixelsPerPixel - 1) >> MarlinConst.subpixelLgPositionsY;
-
-      for (int py = 0; py < (pYLimit - pYStart); py++) {
-        final int globalPy = pYStart + py;
-        if (globalPy >= _height) break;
-
-        final int rowOffset = globalPy * _width;
-        final int accumOffset = py * tileW;
-
-        for (int px = 0; px < tileW; px++) {
-          final int globalPx = tx + px;
-          if (globalPx >= _width) break;
-
-          int alphaSum = tileAccum[accumOffset + px];
-          if (alphaSum == 0) continue;
-
-          // Normalize alpha.
-          // Max sum is 64 * 8 = 512.
-          // Map 0..512 -> 0..255.
-          int alpha = MarlinCache.alphaMap[alphaSum.clamp(0, 64)];
-          if (alpha > 255) alpha = 255;
-
-          // Simple blend over buffer
-          // Assume white bg check moved to test? No we blend.
-          final int bg = _pixelBuffer[rowOffset + globalPx];
-
-          // SrcOver: srcAlpha + dstAlpha*(1-srcAlpha)
-          // Here color is solid (alpha 255 ideally) but shaped by alpha.
-          // So we treat 'alpha' as the coverage of 'color'.
-
-          int r = (color >> 16) & 0xFF;
-          int g = (color >> 8) & 0xFF;
-          int b = color & 0xFF;
-
-          int bgR = (bg >> 16) & 0xFF;
-          int bgG = (bg >> 8) & 0xFF;
-          int bgB = bg & 0xFF;
-
-          int invA = 255 - alpha;
-
-          int fr = (r * alpha + bgR * invA) ~/ 255;
-          int fg = (g * alpha + bgG * invA) ~/ 255;
-          int fb = (b * alpha + bgB * invA) ~/ 255;
-
-          _pixelBuffer[rowOffset + globalPx] =
-              0xFF000000 | (fr << 16) | (fg << 8) | fb;
-        }
-      }
-
-      _cache.touchedTile[t] = 0;
     }
-    _cache.tileMin = 2147483647;
-    _cache.tileMax = 0;
   }
 
   // Arrays
@@ -768,29 +719,11 @@ class MarlinRenderer implements PathConsumer2D {
     return newArray;
   }
 
-  // Sort
-  static void _quickSort(Int32List a, int left, int right) {
-    if (left >= right) return;
-    int pi = _partition(a, left, right);
-    _quickSort(a, left, pi - 1);
-    _quickSort(a, pi + 1, right);
-  }
+  static int _i32(int v) => v.toSigned(32);
 
-  static int _partition(Int32List a, int left, int right) {
-    int pivot = a[right];
-    int i = (left - 1);
-    for (int j = left; j < right; j++) {
-      if (a[j] <= pivot) {
-        i++;
-        int temp = a[i];
-        a[i] = a[j];
-        a[j] = temp;
-      }
-    }
-    int temp = a[i + 1];
-    a[i + 1] = a[right];
-    a[right] = temp;
-    return i + 1;
+  static bool _crossingLess(int c1, int e1, int c2, int e2) {
+    if (c1 != c2) return c1 < c2;
+    return e1 < e2;
   }
 
   // Convenience for backward compat

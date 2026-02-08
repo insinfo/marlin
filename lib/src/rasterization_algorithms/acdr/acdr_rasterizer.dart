@@ -27,6 +27,7 @@ library acdr;
 
 import 'dart:typed_data';
 import 'dart:math' as math;
+import '../common/polygon_contract.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIPOS FUNDAMENTAIS
@@ -107,7 +108,7 @@ class EdgeEvent implements Comparable<EdgeEvent> {
 /// final coverage = rasterizer.rasterize(polygon);
 /// // coverage é um Float64List de tamanho width*height, valores em [0, 1]
 /// ```
-class ACDRRasterizer {
+class ACDRRasterizer implements PolygonContract {
   final int width;
   final int height;
 
@@ -155,37 +156,45 @@ class ACDRRasterizer {
   /// pré-computados (slopes, reciprocais, bounding boxes).
   ///
   /// Arestas horizontais são descartadas (contribuição nula à cobertura).
-  List<AcdrProcessedEdge> _preprocessEdges(List<Vec2> vertices) {
+  List<AcdrProcessedEdge> _preprocessEdges(
+    List<Vec2> vertices, {
+    List<int>? contourVertexCounts,
+  }) {
     final edges = <AcdrProcessedEdge>[];
     final n = vertices.length;
+    final contours = _resolveContours(n, contourVertexCounts);
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x0 = vertices[i].x * width;
-      final y0 = vertices[i].y * height;
-      final x1 = vertices[j].x * width;
-      final y1 = vertices[j].y * height;
+    for (final contour in contours) {
+      if (contour.count < 2) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x0 = vertices[i].x * width;
+        final y0 = vertices[i].y * height;
+        final x1 = vertices[j].x * width;
+        final y1 = vertices[j].y * height;
 
-      final dy = y1 - y0;
-      if (dy.abs() < 1e-6) continue; // Aresta horizontal — sem contribuição
+        final dy = y1 - y0;
+        if (dy.abs() < 1e-6) continue; // Aresta horizontal — sem contribuição
 
-      final dx = x1 - x0;
-      final slopeDxDy = dx / dy; // Usado para calcular X na scanline
-      final slopeDyDx = dy / dx; // Usado para cobertura subpixel
-      final invSlopeDxDy = dy / dx; // Reciprocal pré-computado
+        final dx = x1 - x0;
+        final slopeDxDy = dx / dy; // Usado para calcular X na scanline
+        final slopeDyDx = dy / dx; // Usado para cobertura subpixel
+        final invSlopeDxDy = dy / dx; // Reciprocal pré-computado
 
-      edges.add(AcdrProcessedEdge(
-        x0: x0,
-        y0: y0,
-        x1: x1,
-        y1: y1,
-        yMin: dy > 0 ? y0 : y1,
-        yMax: dy > 0 ? y1 : y0,
-        slopeDxDy: slopeDxDy,
-        slopeDyDx: slopeDyDx,
-        invSlopeDxDy: invSlopeDxDy,
-        direction: dy > 0 ? 1 : -1,
-      ));
+        edges.add(AcdrProcessedEdge(
+          x0: x0,
+          y0: y0,
+          x1: x1,
+          y1: y1,
+          yMin: dy > 0 ? y0 : y1,
+          yMax: dy > 0 ? y1 : y0,
+          slopeDxDy: slopeDxDy,
+          slopeDyDx: slopeDyDx,
+          invSlopeDxDy: invSlopeDxDy,
+          direction: dy > 0 ? 1 : -1,
+        ));
+      }
     }
 
     return edges;
@@ -357,11 +366,16 @@ class ACDRRasterizer {
   ///
   /// @param vertices Lista de vértices do polígono (coordenadas normalizadas)
   /// @return Float64List com cobertura de cada pixel [0, 1]
-  Float64List rasterize(List<Vec2> vertices) {
+  Float64List rasterize(
+    List<Vec2> vertices, {
+    int windingRule = 0,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 3) return coverageBuffer;
 
     // Fase 1: Pré-processar arestas
-    final edges = _preprocessEdges(vertices);
+    final edges =
+        _preprocessEdges(vertices, contourVertexCounts: contourVertexCounts);
     if (edges.isEmpty) return coverageBuffer;
 
     final sampleOffsets = enableVerticalSupersample
@@ -380,13 +394,27 @@ class ACDRRasterizer {
         final events = _scanlineEvents[scanY];
         if (events.length < 2) continue;
 
-        // Processar pares de eventos (regra even-odd)
-        for (int p = 0; p + 1 < events.length; p += 2) {
-          final leftEvent = events[p];
-          final rightEvent = events[p + 1];
+        // Processar spans por regra de preenchimento:
+        // windingRule: 0 = even-odd, 1 = non-zero
+        int winding = 0;
+        double? xLeft;
+        int leftEdgeIndex = -1;
+        for (int p = 0; p < events.length; p++) {
+          final event = events[p];
+          final bool wasInside = (windingRule == 0) ? ((winding & 1) != 0) : (winding != 0);
+          winding += event.isEntering ? 1 : -1;
+          final bool isInside = (windingRule == 0) ? ((winding & 1) != 0) : (winding != 0);
 
-          final xLeft = leftEvent.x;
-          final xRight = rightEvent.x;
+          if (!wasInside && isInside) {
+            xLeft = event.x;
+            leftEdgeIndex = event.edgeIndex;
+            continue;
+          }
+          if (!(wasInside && !isInside) || xLeft == null || leftEdgeIndex < 0) {
+            continue;
+          }
+
+          final xRight = event.x;
 
           // Epsilon para evitar dupla contagem em interseções exatas
           final xLeftAdj = xLeft + 1e-6;
@@ -404,8 +432,8 @@ class ACDRRasterizer {
               pxLeft,
               xLeftAdj,
               xRightAdj,
-              edges[leftEvent.edgeIndex],
-              edges[rightEvent.edgeIndex],
+              edges[leftEdgeIndex],
+              edges[event.edgeIndex],
             );
             if (coverage > 0.0) {
               coverageBuffer[scanY * width + pxLeft] +=
@@ -419,7 +447,7 @@ class ACDRRasterizer {
             scanY,
             pxLeft,
             xLeftAdj,
-            edges[leftEvent.edgeIndex],
+            edges[leftEdgeIndex],
             sampleWeight,
           );
 
@@ -428,7 +456,7 @@ class ACDRRasterizer {
             scanY,
             pxRight,
             xRightAdj,
-            edges[rightEvent.edgeIndex],
+            edges[event.edgeIndex],
             sampleWeight,
           );
 
@@ -443,6 +471,8 @@ class ACDRRasterizer {
               coverageBuffer[rowOffset + px] += sampleWeight;
             }
           }
+          xLeft = null;
+          leftEdgeIndex = -1;
         }
       }
     }
@@ -551,6 +581,55 @@ class ACDRRasterizer {
   void clear() {
     coverageBuffer.fillRange(0, coverageBuffer.length, 0.0);
   }
+
+  @override
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int windingRule = 1,
+    List<int>? contourVertexCounts,
+  }) {
+    // Mantem compatibilidade com o contrato unificado:
+    // converte vertices em pixels para normalizado.
+    if (vertices.length < 6) return;
+    clear();
+    final pts = List<Vec2>.generate(
+      vertices.length ~/ 2,
+      (i) => Vec2(vertices[i * 2] / width, vertices[i * 2 + 1] / height),
+      growable: false,
+    );
+    rasterize(
+      pts,
+      windingRule: windingRule == 0 ? 0 : 1,
+      contourVertexCounts: contourVertexCounts,
+    );
+  }
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }
 
 @pragma('vm:prefer-inline')

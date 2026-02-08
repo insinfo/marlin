@@ -69,7 +69,7 @@ class MarlinCache {
 
   void resetTileLine(int pminY) {
     bboxY0 = pminY;
-    rowAAChunkPos = 2; // Start at 2 so 0 is invalid index
+    rowAAChunkPos = 2; // keep 0 as invalid index in rowAAChunkIndex
     rowAAChunkIndex.fillRange(0, rowAAChunkIndex.length, 0);
 
     if (tileMin != 2147483647) {
@@ -91,18 +91,19 @@ class MarlinCache {
   void copyAARow(Int32List alphaRow, int y, int px0, int px1) {
     if (px1 <= px0) return;
 
-    final int row = y - bboxY0;
-    rowAAx0[row] = px0; // Start X
+    final int pxBBox1 = px1 < bboxX1 ? px1 : bboxX1;
+    if (pxBBox1 <= px0) return;
 
-    // Position finding
-    // Ensure space logic same as before or improved
-    // We assume enough space or grow?
-    // We'll grow if needed. RLE worst case is 2 bytes per pixel (alternating).
-    // Plus terminator.
-    final int maxLen = (px1 - px0) * 2 + 2;
+    final int row = y - bboxY0;
+    rowAAx0[row] = px0;
+    rowAAx1[row] = pxBBox1;
+
+    final int from = px0 - bboxX0;
+    final int to = pxBBox1 - bboxX0;
+    final int clearTo = px1 - bboxX0;
+    final int maxLen = (to - from) * 2 + 2;
 
     if (rowAAChunk.length < rowAAChunkPos + maxLen) {
-      // resize logic
       int newSize = rowAAChunk.length * 2;
       if (newSize < rowAAChunkPos + maxLen)
         newSize = rowAAChunkPos + maxLen + 4096;
@@ -117,53 +118,55 @@ class MarlinCache {
     int pos = rowAAChunkPos;
     final Uint8List chunk = rowAAChunk;
 
-    int currentRunVal = alphaRow[px0];
-    // Clear alphaRow as we read (Marlin contract)
-    alphaRow[px0] = 0;
-
+    int x = from;
+    int sum = alphaRow[x];
+    if (sum < 0) sum = 0;
+    if (sum > MarlinConst.maxAAAlpha) sum = MarlinConst.maxAAAlpha;
+    int currentRunVal = alphaMap[sum];
+    alphaRow[x] = 0;
     int currentRunLen = 1;
 
-    for (int x = px0 + 1; x < px1; x++) {
-      int val = alphaRow[x];
-      alphaRow[x] = 0; // Clear
+    if (sum != 0) {
+      touchedTile[x >> MarlinConst.tileSizeLg] += sum;
+    }
+
+    for (x = from + 1; x < to; x++) {
+      sum += alphaRow[x];
+      alphaRow[x] = 0;
+      if (sum < 0) sum = 0;
+      if (sum > MarlinConst.maxAAAlpha) sum = MarlinConst.maxAAAlpha;
+      final int val = alphaMap[sum];
+
+      if (sum != 0) {
+        touchedTile[x >> MarlinConst.tileSizeLg] += sum;
+      }
 
       if (val == currentRunVal && currentRunLen < 255) {
         currentRunLen++;
       } else {
-        // Flush run
         chunk[pos++] = currentRunVal;
         chunk[pos++] = currentRunLen;
-
         currentRunVal = val;
         currentRunLen = 1;
       }
     }
-    // Flush last run
+
     chunk[pos++] = currentRunVal;
     chunk[pos++] = currentRunLen;
 
-    // Terminator
     chunk[pos++] = 0;
     chunk[pos++] = 0;
 
     rowAAChunkPos = pos;
 
-    // Update tile limits
-    int tx = (px0 - bboxX0) >> MarlinConst.tileSizeLg;
+    int tx = from >> MarlinConst.tileSizeLg;
     if (tx < tileMin) tileMin = tx;
-    tx = ((px1 - bboxX0 - 1) >> MarlinConst.tileSizeLg) + 1;
+    tx = ((to - 1) >> MarlinConst.tileSizeLg) + 1;
     if (tx > tileMax) tileMax = tx;
 
-    // Update touchedTile (approximate - explicit sum is better but expensive?
-    // Original code updated touchedTile per pixel.
-    // Here we can just mark tiles as touched?
-    // _blit checks `touchedTile[t] == 0`.
-    // We should mark them 1.
-    // Loop tiles spanned
-    int t0 = (px0 - bboxX0) >> MarlinConst.tileSizeLg;
-    int t1 = ((px1 - 1 - bboxX0) >> MarlinConst.tileSizeLg);
-    for (int t = t0; t <= t1; t++) {
-      touchedTile[t] += 1;
+    final int clearEnd = clearTo < alphaRow.length ? clearTo : alphaRow.length;
+    if (clearEnd > from) {
+      alphaRow.fillRange(from, clearEnd, 0);
     }
   }
 
