@@ -56,8 +56,6 @@ export 'src/rasterization_algorithms/blaze_fast/blaze_fast_rasterizer.dart';
 export 'src/rasterization_algorithms/ultra_quality/ssaa_rasterizer.dart';
 export 'src/rasterization_algorithms/wavelet_haar/wavelet_haar_rasterizer.dart';
 
-// SVG Support
-export 'src/svg/svg_parser.dart';
 
 // PNG Output
 export 'src/png/png_writer.dart';

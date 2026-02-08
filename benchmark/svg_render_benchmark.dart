@@ -2,200 +2,692 @@
 /// SVG RENDERING BENCHMARK
 /// =============================================================================
 ///
-/// Renderiza arquivos SVG complexos usando cada implementação de rasterização
-/// e gera arquivos PNG para visualização.
+/// Renderiza arquivos SVG reais com todos os rasterizadores disponíveis,
+/// gerando PNGs para inspeção visual.
 ///
 /// Uso:
 ///   dart run benchmark/svg_render_benchmark.dart
 ///
+
 library benchmark;
 
-
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:marlin/marlin.dart'; // Importar os rasterizadores via marlin
 
+import 'package:marlin/marlin.dart';
+import 'package:marlin/src/svg/svg_parser.dart';
 
+import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer2.dart'
+    as b2d2;
 
-/// Diretório de saída para os PNGs
 const outputDir = 'output/svg_renders';
 
-/// Arquivos SVG para renderizar
-const svgFiles = [
+const svgFiles = <String>[
   'assets/svg/Ghostscript_Tiger.svg',
   'assets/svg/froggy-simple.svg',
 ];
 
-/// Tamanho de renderização
 const renderWidth = 512;
 const renderHeight = 512;
 
-/// Interface para renderizadores
+class PreparedPolygon {
+  final List<double> vertices;
+  final int color;
+  final int windingRule; // 0: EvenOdd, 1: NonZero (matching MarlinConst)
+  final List<int>? contourVertexCounts; // Path subpaths; null = single contour
+
+  const PreparedPolygon(
+    this.vertices,
+    this.color,
+    this.windingRule, {
+    this.contourVertexCounts,
+  });
+}
+
 abstract class RasterizerAdapter {
   String get name;
-  Uint8List render(List<SvgPolygon> polygons, double svgWidth, double svgHeight);
+
+  Future<Uint8List> render(List<PreparedPolygon> polygons);
 }
 
-/// Adaptador para DAA
-class DAAAdapter implements RasterizerAdapter {
+class FunctionAdapter implements RasterizerAdapter {
   @override
-  String get name => 'DAA';
-  
+  final String name;
+
+  final Future<Uint8List> Function(List<PreparedPolygon> polygons) _render;
+
+  FunctionAdapter(this.name, this._render);
+
   @override
-  Uint8List render(List<SvgPolygon> polygons, double svgWidth, double svgHeight) {
-    final rasterizer = DAARasterizer(width: renderWidth, height: renderHeight);
-    rasterizer.clear(0xFFFFFFFF); // Fundo branco
-    final scaleX = renderWidth / svgWidth;
-    final scaleY = renderHeight / svgHeight;
-    
-    for (final poly in polygons) {
-      if (poly.vertices.length >= 6) {
-        final scaled = _scaleVertices(poly.vertices, scaleX, scaleY);
-        rasterizer.drawPolygon(scaled, poly.fillColor);
-      }
-    }
-    
-    return _uint32ToRGBA(rasterizer.framebuffer);
+  Future<Uint8List> render(List<PreparedPolygon> polygons) => _render(polygons);
+}
+
+List<PreparedPolygon> _preparePolygons(
+  List<SvgPolygon> polygons,
+  double svgWidth,
+  double svgHeight,
+) {
+  final safeW = svgWidth <= 0 ? 1.0 : svgWidth;
+  final safeH = svgHeight <= 0 ? 1.0 : svgHeight;
+  final scaleX = renderWidth / safeW;
+  final scaleY = renderHeight / safeH;
+
+  final prepared = <PreparedPolygon>[];
+  for (final poly in polygons) {
+    if (poly.vertices.length < 6) continue;
+    final color = poly.fillColor;
+    if (((color >> 24) & 0xFF) == 0) continue;
+
+    final scaled = _scaleVertices(poly.vertices, scaleX, scaleY);
+    // Map poly.evenOdd (bool) to int. EvenOdd=0, NonZero=1
+    final windingRule = poly.evenOdd ? 0 : 1;
+    prepared.add(PreparedPolygon(
+      scaled,
+      color,
+      windingRule,
+      contourVertexCounts: poly.contourVertexCounts,
+    ));
   }
+  return prepared;
 }
 
-/// Adaptador para DDFI
-class DDFIAdapter implements RasterizerAdapter {
-  @override
-  String get name => 'DDFI';
-  
-  @override
-  Uint8List render(List<SvgPolygon> polygons, double svgWidth, double svgHeight) {
-    final rasterizer = FluxRenderer(renderWidth, renderHeight);
-    rasterizer.clear(0xFFFFFFFF); // Fundo branco
-    final scaleX = renderWidth / svgWidth;
-    final scaleY = renderHeight / svgHeight;
-    
-    for (final poly in polygons) {
-      if (poly.vertices.length >= 6) {
-        final scaled = _scaleVertices(poly.vertices, scaleX, scaleY);
-        rasterizer.drawPolygon(scaled, poly.fillColor);
-      }
-    }
-    
-    return _uint32ToRGBA(rasterizer.buffer);
-  }
-}
-
-/// Adaptador para Marlin
-class MarlinAdapter implements RasterizerAdapter {
-  @override
-  String get name => 'Marlin';
-
-  @override
-  Uint8List render(List<SvgPolygon> polygons, double svgWidth, double svgHeight) {
-    final renderer = MarlinRenderer(renderWidth, renderHeight);
-    renderer.clear(0xFFFFFFFF);
-    renderer.init(0, 0, renderWidth, renderHeight, MarlinConst.windEvenOdd);
-
-    final scaleX = renderWidth / svgWidth;
-    final scaleY = renderHeight / svgHeight;
-
-    for (final poly in polygons) {
-      if (poly.vertices.length >= 6) {
-        final scaled = _scaleVertices(poly.vertices, scaleX, scaleY);
-        renderer.drawPolygon(scaled, poly.fillColor);
-      }
-    }
-    
-    // Uint32List view of Int32List buffer for helper
-    return _uint32ToRGBA(renderer.buffer.buffer.asUint32List());
-  }
-}
-
-/// Escala vértices
-List<double> _scaleVertices(List<double> vertices, double scaleX, double scaleY) {
-  final result = <double>[];
+List<double> _scaleVertices(
+  List<double> vertices,
+  double scaleX,
+  double scaleY,
+) {
+  final out = List<double>.filled(vertices.length, 0.0, growable: false);
   for (int i = 0; i < vertices.length; i += 2) {
-    result.add(vertices[i] * scaleX);
-    result.add(vertices[i + 1] * scaleY);
+    out[i] = vertices[i] * scaleX;
+    out[i + 1] = vertices[i + 1] * scaleY;
   }
-  return result;
+  return out;
 }
 
-/// Converte buffer Uint32 (ARGB) para RGBA bytes
 Uint8List _uint32ToRGBA(Uint32List argbData) {
   final rgba = Uint8List(argbData.length * 4);
   for (int i = 0; i < argbData.length; i++) {
     final pixel = argbData[i];
-    rgba[i * 4] = (pixel >> 16) & 0xFF;     // R
-    rgba[i * 4 + 1] = (pixel >> 8) & 0xFF;  // G
-    rgba[i * 4 + 2] = pixel & 0xFF;         // B
-    rgba[i * 4 + 3] = (pixel >> 24) & 0xFF; // A
+    rgba[i * 4] = (pixel >> 16) & 0xFF;
+    rgba[i * 4 + 1] = (pixel >> 8) & 0xFF;
+    rgba[i * 4 + 2] = pixel & 0xFF;
+    rgba[i * 4 + 3] = (pixel >> 24) & 0xFF;
   }
   return rgba;
+}
+
+String _slugify(String name) {
+  final sb = StringBuffer();
+  for (int i = 0; i < name.length; i++) {
+    final code = name.codeUnitAt(i);
+    final isAlphaNum = (code >= 48 && code <= 57) ||
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122);
+    sb.write(isAlphaNum ? String.fromCharCode(code) : '_');
+  }
+  return sb.toString().replaceAll(RegExp('_+'), '_').toLowerCase();
+}
+
+List<Vec2> _toNormalizedVec2(List<double> verticesPx) {
+  final out = <Vec2>[];
+  final invW = 1.0 / renderWidth;
+  final invH = 1.0 / renderHeight;
+
+  for (int i = 0; i < verticesPx.length; i += 2) {
+    out.add(Vec2(verticesPx[i] * invW, verticesPx[i + 1] * invH));
+  }
+  return out;
+}
+
+void _blendCoverageInto(Uint32List dst, Float64List coverage, int color) {
+  final srcA = (color >> 24) & 0xFF;
+  final srcR = (color >> 16) & 0xFF;
+  final srcG = (color >> 8) & 0xFF;
+  final srcB = color & 0xFF;
+
+  for (int i = 0; i < coverage.length; i++) {
+    final c = coverage[i];
+    if (c <= 0.0) continue;
+
+    final cov = c.clamp(0.0, 1.0);
+    int alpha = (cov * srcA).round();
+    if (alpha <= 0) continue;
+
+    if (alpha >= 255) {
+      dst[i] = 0xFF000000 | (srcR << 16) | (srcG << 8) | srcB;
+      continue;
+    }
+
+    final bg = dst[i];
+    final bgR = (bg >> 16) & 0xFF;
+    final bgG = (bg >> 8) & 0xFF;
+    final bgB = bg & 0xFF;
+    final invA = 255 - alpha;
+
+    final outR = (srcR * alpha + bgR * invA) >> 8;
+    final outG = (srcG * alpha + bgG * invA) >> 8;
+    final outB = (srcB * alpha + bgB * invA) >> 8;
+
+    dst[i] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
+  }
+}
+
+Future<void> _renderBlend2DV2BatchByColorRuns(
+  b2d2.Blend2DRasterizer2 rasterizer,
+  List<PreparedPolygon> polygons,
+) async {
+  int runColor = 0;
+  int runWinding = 0;
+  bool hasRun = false;
+
+  for (final poly in polygons) {
+    if (!hasRun) {
+      runColor = poly.color;
+      runWinding = poly.windingRule;
+      hasRun = true;
+      rasterizer.fillRule = runWinding;
+      rasterizer.addPolygon(
+        poly.vertices,
+        contourVertexCounts: poly.contourVertexCounts,
+      );
+      continue;
+    }
+
+    if (poly.color == runColor && poly.windingRule == runWinding) {
+      // Same batch state, accumulate
+      rasterizer.addPolygon(
+        poly.vertices,
+        contourVertexCounts: poly.contourVertexCounts,
+      );
+      continue;
+    }
+
+    // Flush previous batch
+    await rasterizer.flush(runColor);
+
+    // Start new batch
+    runColor = poly.color;
+    runWinding = poly.windingRule;
+    rasterizer.fillRule = runWinding;
+    rasterizer.addPolygon(
+      poly.vertices,
+      contourVertexCounts: poly.contourVertexCounts,
+    );
+  }
+
+  if (hasRun) {
+    await rasterizer.flush(runColor);
+  }
+}
+
+List<RasterizerAdapter> _buildAdapters() {
+  return <RasterizerAdapter>[
+    FunctionAdapter('ACDR', (polygons) async {
+      final rasterizer =
+          ACDRRasterizer(width: renderWidth, height: renderHeight);
+      final out = Uint32List(renderWidth * renderHeight)
+        ..fillRange(0, renderWidth * renderHeight, 0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        rasterizer.clear();
+        rasterizer.rasterize(_toNormalizedVec2(poly.vertices));
+        _blendCoverageInto(out, rasterizer.coverageBuffer, poly.color);
+      }
+
+      return _uint32ToRGBA(out);
+    }),
+    FunctionAdapter('Marlin', (polygons) async {
+      final renderer = MarlinRenderer(renderWidth, renderHeight);
+      renderer.clear(0xFFFFFFFF);
+      renderer.init(0, 0, renderWidth, renderHeight, MarlinConst.windEvenOdd);
+
+      for (final poly in polygons) {
+        renderer.drawPolygon(poly.vertices, poly.color,
+            windingRule: poly.windingRule,
+            contourVertexCounts: poly.contourVertexCounts);
+      }
+
+      return _uint32ToRGBA(renderer.buffer.buffer.asUint32List());
+    }),
+    FunctionAdapter('SCANLINE_EO', (polygons) async {
+      final r = ScanlineRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    /*
+    FunctionAdapter('SSAA', (polygons) async {
+      final r = SSAARasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        enableTileCulling: false,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    */
+    FunctionAdapter('WAVELET_HAAR', (polygons) async {
+      final r = WaveletHaarRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('DAA', (polygons) async {
+      final r = DAARasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.framebuffer);
+    }),
+    FunctionAdapter('DDFI', (polygons) async {
+      final r = FluxRenderer(renderWidth, renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('DBSR', (polygons) async {
+      final r = DBSRRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.pixels);
+    }),
+    FunctionAdapter('EPL_AA', (polygons) async {
+      final r = EPLRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('QCS', (polygons) async {
+      final r = QCSRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.pixels);
+    }),
+    FunctionAdapter('RHBD', (polygons) async {
+      final r = RHBDRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('AMCAD', (polygons) async {
+      final r = AMCADRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('HSGR', (polygons) async {
+      final r = HSGRRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('SWEEP_SDF', (polygons) async {
+      final r = SweepSDFRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.pixels);
+    }),
+    FunctionAdapter('SCDT', (polygons) async {
+      final r = SCDTRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.pixels);
+    }),
+    FunctionAdapter('SCP_AED', (polygons) async {
+      final r = SCPAEDRasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('B2D_v1_Scalar', (polygons) async {
+      final r = Blend2DRasterizer(
+        renderWidth,
+        renderHeight,
+        config: const RasterizerConfig(useSimd: false, useIsolates: false),
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        await r.drawPolygon(poly.vertices, poly.color,
+            windingRule: poly.windingRule,
+            contourVertexCounts: poly.contourVertexCounts);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('B2D_v1_SIMD', (polygons) async {
+      final r = Blend2DRasterizer(
+        renderWidth,
+        renderHeight,
+        config: const RasterizerConfig(useSimd: true, useIsolates: false),
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        await r.drawPolygon(poly.vertices, poly.color,
+            windingRule: poly.windingRule,
+            contourVertexCounts: poly.contourVertexCounts);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    /*
+    FunctionAdapter('B2D_v1_Scalar_Iso', (polygons) async {
+      final r = Blend2DRasterizer(
+        renderWidth,
+        renderHeight,
+        config: RasterizerConfig(
+          useSimd: false,
+          useIsolates: true,
+          tileHeight: renderHeight ~/ 4,
+        ),
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        await r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('B2D_v1_SIMD_Iso', (polygons) async {
+      final r = Blend2DRasterizer(
+        renderWidth,
+        renderHeight,
+        config: RasterizerConfig(
+          useSimd: true,
+          useIsolates: true,
+          tileHeight: renderHeight ~/ 4,
+        ),
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        await r.drawPolygon(poly.vertices, poly.color);
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    */
+    FunctionAdapter('B2D_v2_Imm_Scalar', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config:
+            const b2d2.RasterizerConfig2(useSimd: false, useIsolates: false),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        for (final poly in polygons) {
+          await r.drawPolygon(poly.vertices, poly.color,
+              flushNow: true,
+              windingRule: poly.windingRule,
+              contourVertexCounts: poly.contourVertexCounts);
+        }
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    /*
+    FunctionAdapter('B2D_v2_Imm_SIMD', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config: const b2d2.RasterizerConfig2(useSimd: true, useIsolates: false),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        for (final poly in polygons) {
+          await r.drawPolygon(poly.vertices, poly.color, flushNow: true);
+        }
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    */
+    FunctionAdapter('B2D_v2_Batch_Scalar', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config:
+            const b2d2.RasterizerConfig2(useSimd: false, useIsolates: false),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        await _renderBlend2DV2BatchByColorRuns(r, polygons);
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    FunctionAdapter('B2D_v2_Batch_SIMD', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config: const b2d2.RasterizerConfig2(useSimd: true, useIsolates: false),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        await _renderBlend2DV2BatchByColorRuns(r, polygons);
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    FunctionAdapter('B2D_v2_Batch_Scalar_Iso', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config: b2d2.RasterizerConfig2(
+          useSimd: false,
+          useIsolates: true,
+          tileHeight: renderHeight ~/ 4,
+          minParallelDirtyHeight: 1,
+        ),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        await _renderBlend2DV2BatchByColorRuns(r, polygons);
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    FunctionAdapter('B2D_v2_Batch_SIMD_Iso', (polygons) async {
+      final r = b2d2.Blend2DRasterizer2(
+        renderWidth,
+        renderHeight,
+        config: b2d2.RasterizerConfig2(
+          useSimd: true,
+          useIsolates: true,
+          tileHeight: renderHeight ~/ 4,
+          minParallelDirtyHeight: 1,
+        ),
+      );
+      try {
+        r.clear(0xFFFFFFFF);
+        await _renderBlend2DV2BatchByColorRuns(r, polygons);
+        return _uint32ToRGBA(r.buffer);
+      } finally {
+        await r.dispose();
+      }
+    }),
+    FunctionAdapter('SKIA_Scalar', (polygons) async {
+      final r = SkiaRasterizer(
+          width: renderWidth, height: renderHeight, useSimd: false);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('SKIA_SIMD', (polygons) async {
+      final r = SkiaRasterizer(
+          width: renderWidth, height: renderHeight, useSimd: true);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('EDGE_FLAG_AA', (polygons) async {
+      final r = EdgeFlagAARasterizer(width: renderWidth, height: renderHeight);
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+  ];
 }
 
 Future<void> main() async {
   print('╔══════════════════════════════════════════════════════════════════╗');
   print('║         SVG RENDERING BENCHMARK                                  ║');
-  print('║         Renderiza SVGs complexos com cada rasterizador           ║');
+  print('║         Renderiza SVGs reais com todos os rasterizadores         ║');
   print('╚══════════════════════════════════════════════════════════════════╝');
   print('');
 
-  // Criar diretório de saída
   await Directory(outputDir).create(recursive: true);
 
   final parser = SvgParser();
-  
-  // Lista de adaptadores funcionais
-  final adapters = <RasterizerAdapter>[
-    DAAAdapter(),
-    DDFIAdapter(),
-    MarlinAdapter(),
-  ];
+  final adapters = _buildAdapters();
+
+  print('Adapters: ${adapters.length}');
 
   for (final svgPath in svgFiles) {
     print('');
     print('═' * 70);
     print('Processing: $svgPath');
     print('═' * 70);
-    
-    // Carregar e parsear SVG
+
     final file = File(svgPath);
     if (!await file.exists()) {
       print('  File not found: $svgPath');
       continue;
     }
-    
+
     final svgContent = await file.readAsString();
     late SvgDocument doc;
-    
+
     try {
       doc = parser.parse(svgContent);
-      print('  SVG size: ${doc.width.toStringAsFixed(0)}x${doc.height.toStringAsFixed(0)}');
+      print(
+          '  SVG size: ${doc.width.toStringAsFixed(2)}x${doc.height.toStringAsFixed(2)}');
       print('  Polygons parsed: ${doc.polygons.length}');
     } catch (e) {
       print('  Failed to parse SVG: $e');
       continue;
     }
-    
-    if (doc.polygons.isEmpty) {
-      print('  No polygons found in SVG');
+
+    final prepared = _preparePolygons(doc.polygons, doc.width, doc.height);
+    if (prepared.isEmpty) {
+      print('  No drawable polygons found in SVG');
       continue;
     }
-    
-    // Nome base do arquivo
+
+    print('  Prepared polygons: ${prepared.length}');
+
     final baseName = svgPath.split('/').last.replaceAll('.svg', '');
-    
-    // Renderizar com cada adaptador
+
     for (final adapter in adapters) {
       print('');
       print('  Rendering with ${adapter.name}...');
-      
+
       try {
         final stopwatch = Stopwatch()..start();
-        final pixels = adapter.render(doc.polygons, doc.width, doc.height);
+        final pixels = await adapter.render(prepared);
         stopwatch.stop();
-        
-        final outputPath = '$outputDir/${baseName}_${adapter.name.toLowerCase()}.png';
+
+        final outputPath =
+            '$outputDir/${baseName}_${_slugify(adapter.name)}.png';
         await PngWriter.saveRgba(outputPath, pixels, renderWidth, renderHeight);
-        
+
         print('    ✓ Saved: $outputPath (${stopwatch.elapsedMilliseconds}ms)');
       } catch (e, st) {
         print('    ✗ Failed: $e');
@@ -203,7 +695,7 @@ Future<void> main() async {
       }
     }
   }
-  
+
   print('');
   print('═' * 70);
   print('Done! Check $outputDir for output files.');

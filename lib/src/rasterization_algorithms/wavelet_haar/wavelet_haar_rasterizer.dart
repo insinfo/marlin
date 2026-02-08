@@ -19,6 +19,8 @@ class WaveletHaarRasterizer {
 
   final Uint32List _buffer;
   final Float32List _grid;
+  final Int32List _xToGrid;
+  final Int32List _yToGrid;
 
   late final _WaveletTree _tree;
 
@@ -27,8 +29,16 @@ class WaveletHaarRasterizer {
         _maxDepth = _log2(_nextPow2(width > height ? width : height)) - 1,
         _buffer = Uint32List(width * height),
         _grid = Float32List(_nextPow2(width > height ? width : height) *
-            _nextPow2(width > height ? width : height)) {
+            _nextPow2(width > height ? width : height)),
+        _xToGrid = Int32List(width),
+        _yToGrid = Int32List(height) {
     _tree = _WaveletTree(_maxDepth, _gridRes);
+    for (int x = 0; x < width; x++) {
+      _xToGrid[x] = (x * _gridRes) ~/ width;
+    }
+    for (int y = 0; y < height; y++) {
+      _yToGrid[y] = (y * _gridRes) ~/ height;
+    }
   }
 
   void clear([int color = 0xFFFFFFFF]) {
@@ -45,6 +55,10 @@ class WaveletHaarRasterizer {
     final invH = 1.0 / height;
 
     double area2 = 0.0;
+    double minX = double.infinity;
+    double maxX = double.negativeInfinity;
+    double minY = double.infinity;
+    double maxY = double.negativeInfinity;
     for (int i = 0; i < n; i++) {
       final j = (i + 1) % n;
       final x0 = vertices[i * 2];
@@ -52,6 +66,10 @@ class WaveletHaarRasterizer {
       final x1 = vertices[j * 2];
       final y1 = vertices[j * 2 + 1];
       area2 += x0 * y1 - y0 * x1;
+      if (x0 < minX) minX = x0;
+      if (x0 > maxX) maxX = x0;
+      if (y0 < minY) minY = y0;
+      if (y0 > maxY) maxY = y0;
     }
     final ccw = area2 >= 0.0;
 
@@ -74,23 +92,11 @@ class WaveletHaarRasterizer {
 
     _grid.fillRange(0, _grid.length, 0);
     _tree.writeGrid(_grid);
-
-    for (int y = 0; y < height; y++) {
-      final gy = (y * _gridRes) ~/ height;
-      int row = y * width;
-      final gridRow = gy * _gridRes;
-      for (int x = 0; x < width; x++) {
-        final gx = (x * _gridRes) ~/ width;
-        final val = _grid[gridRow + gx].clamp(0.0, 1.0);
-        if (val <= 0) {
-          row++;
-          continue;
-        }
-        final alpha = (val * 255).round();
-        _blendPixelIndex(row, color, alpha);
-        row++;
-      }
-    }
+    final pxMinX = (minX.floor() - 1).clamp(0, width - 1);
+    final pxMaxX = (maxX.ceil() + 1).clamp(0, width - 1);
+    final pxMinY = (minY.floor() - 1).clamp(0, height - 1);
+    final pxMaxY = (maxY.ceil() + 1).clamp(0, height - 1);
+    _rasterizeGridToBuffer(color, pxMinX, pxMaxX, pxMinY, pxMaxY);
   }
 
   /// Rasteriza uma curva Bézier quadrática (p0, p1, p2)
@@ -119,23 +125,7 @@ class WaveletHaarRasterizer {
 
     _grid.fillRange(0, _grid.length, 0);
     _tree.writeGrid(_grid);
-
-    for (int y = 0; y < height; y++) {
-      final gy = (y * _gridRes) ~/ height;
-      int row = y * width;
-      final gridRow = gy * _gridRes;
-      for (int x = 0; x < width; x++) {
-        final gx = (x * _gridRes) ~/ width;
-        final val = _grid[gridRow + gx].clamp(0.0, 1.0);
-        if (val <= 0) {
-          row++;
-          continue;
-        }
-        final alpha = (val * 255).round();
-        _blendPixelIndex(row, color, alpha);
-        row++;
-      }
-    }
+    _rasterizeGridToBuffer(color, 0, width - 1, 0, height - 1);
   }
 
   /// Rasteriza uma lista de curvas Bézier quadráticas.
@@ -162,35 +152,45 @@ class WaveletHaarRasterizer {
 
     _grid.fillRange(0, _grid.length, 0);
     _tree.writeGrid(_grid);
+    _rasterizeGridToBuffer(color, 0, width - 1, 0, height - 1);
+  }
 
-    for (int y = 0; y < height; y++) {
-      final gy = (y * _gridRes) ~/ height;
-      int row = y * width;
-      final gridRow = gy * _gridRes;
-      for (int x = 0; x < width; x++) {
-        final gx = (x * _gridRes) ~/ width;
-        final val = _grid[gridRow + gx].clamp(0.0, 1.0);
-        if (val <= 0) {
+  void _rasterizeGridToBuffer(
+      int color, int minX, int maxX, int minY, int maxY) {
+    final fgR = (color >> 16) & 0xFF;
+    final fgG = (color >> 8) & 0xFF;
+    final fgB = color & 0xFF;
+
+    for (int y = minY; y <= maxY; y++) {
+      final gridRow = _yToGrid[y] * _gridRes;
+      int row = y * width + minX;
+      for (int x = minX; x <= maxX; x++) {
+        final val = _grid[gridRow + _xToGrid[x]];
+        if (val <= 0.0) {
+          row++;
+          continue;
+        }
+        if (val >= 1.0) {
+          _buffer[row] = color;
           row++;
           continue;
         }
         final alpha = (val * 255).round();
-        _blendPixelIndex(row, color, alpha);
+        _blendPixelIndexRgb(row, color, fgR, fgG, fgB, alpha);
         row++;
       }
     }
   }
 
-  void _blendPixelIndex(int idx, int foreground, int alpha) {
+  @pragma('vm:prefer-inline')
+  void _blendPixelIndexRgb(
+      int idx, int foreground, int fgR, int fgG, int fgB, int alpha) {
     if (alpha >= 255) {
       _buffer[idx] = foreground;
       return;
     }
 
     final bg = _buffer[idx];
-    final fgR = (foreground >> 16) & 0xFF;
-    final fgG = (foreground >> 8) & 0xFF;
-    final fgB = foreground & 0xFF;
     final bgR = (bg >> 16) & 0xFF;
     final bgG = (bg >> 8) & 0xFF;
     final bgB = bg & 0xFF;
@@ -712,19 +712,28 @@ class _WaveletTree {
 
   void _writeNode(
       int node, double val, int offX, int offY, int res, Float32List grid) {
-    final cvals = Float32List(4);
+    final base = node * 3;
+    final c0 = val +
+        _nodes.coeffs[base] +
+        _nodes.coeffs[base + 1] +
+        _nodes.coeffs[base + 2];
+    final c1 = val -
+        _nodes.coeffs[base] +
+        _nodes.coeffs[base + 1] -
+        _nodes.coeffs[base + 2];
+    final c2 = val +
+        _nodes.coeffs[base] -
+        _nodes.coeffs[base + 1] -
+        _nodes.coeffs[base + 2];
+    final c3 = val -
+        _nodes.coeffs[base] -
+        _nodes.coeffs[base + 1] +
+        _nodes.coeffs[base + 2];
 
-    for (int k = 0; k < 4; k++) {
-      double c = val;
-      for (int i = 0; i < 3; i++) {
-        final ii = (i + 1) & k;
-        final x = ii & 1;
-        final y = (ii >> 1) & 1;
-        final sign = 1 - 2 * (x ^ y);
-        c += sign * _nodes.coeffs[node * 3 + i];
-      }
-      cvals[k] = c.toDouble();
-    }
+    final cvals0 = c0;
+    final cvals1 = c1;
+    final cvals2 = c2;
+    final cvals3 = c3;
 
     final res2 = res >> 1;
 
@@ -736,7 +745,8 @@ class _WaveletTree {
       final childOffY = offY + y * res2;
 
       final child = _nodes.children[node * 4 + k];
-      final cval = cvals[k];
+      final cval =
+          k == 0 ? cvals0 : (k == 1 ? cvals1 : (k == 2 ? cvals2 : cvals3));
 
       if (child < 0) {
         if (_nodes.boundary[node * 4 + k] != 0) {
@@ -754,29 +764,40 @@ class _WaveletTree {
 
   void _writeLeaf(
       int leaf, double val, int offX, int offY, int res, Float32List grid) {
-    final cvals = Float32List(4);
+    final base = leaf * 3;
+    final c0 = val +
+        _leaves.coeffs[base] +
+        _leaves.coeffs[base + 1] +
+        _leaves.coeffs[base + 2];
+    final c1 = val -
+        _leaves.coeffs[base] +
+        _leaves.coeffs[base + 1] -
+        _leaves.coeffs[base + 2];
+    final c2 = val +
+        _leaves.coeffs[base] -
+        _leaves.coeffs[base + 1] -
+        _leaves.coeffs[base + 2];
+    final c3 = val -
+        _leaves.coeffs[base] -
+        _leaves.coeffs[base + 1] +
+        _leaves.coeffs[base + 2];
 
-    for (int k = 0; k < 4; k++) {
-      double c = val;
-      for (int i = 0; i < 3; i++) {
-        final ii = (i + 1) & k;
-        final x = ii & 1;
-        final y = (ii >> 1) & 1;
-        final sign = 1 - 2 * (x ^ y);
-        c += sign * _leaves.coeffs[leaf * 3 + i];
-      }
-      cvals[k] = c.toDouble();
-    }
+    final cvals0 = c0;
+    final cvals1 = c1;
+    final cvals2 = c2;
+    final cvals3 = c3;
 
     for (int k = 0; k < 4; k++) {
       final x = k & 1;
       final y = (k >> 1) & 1;
 
       final idx = (offY + y) * gridRes + (offX + x);
+      final cval =
+          k == 0 ? cvals0 : (k == 1 ? cvals1 : (k == 2 ? cvals2 : cvals3));
 
       if (_leaves.boundary[leaf * 4 + k] != 0) {
-        grid[idx] = cvals[k];
-      } else if (cvals[k] > 0.5) {
+        grid[idx] = cval;
+      } else if (cval > 0.5) {
         grid[idx] = 1.0;
       }
     }

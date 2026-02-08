@@ -18,24 +18,28 @@ const int kSubpixelMask = kSubpixelCount - 1;
 
 /// Representação de uma aresta para o algoritmo de scanline
 class SkEdge {
-  int fX = 0;  // X atual (ponto fixo)
+  int fX = 0; // X atual (ponto fixo)
   int fDx = 0; // Incremento de X por sub-scanline (ponto fixo)
   int fFirstY = 0; // Primeira sub-scanline
-  int fLastY = 0;  // Última sub-scanline
+  int fLastY = 0; // Última sub-scanline
   int fWinding = 0; // Direção (+1 ou -1)
-  SkEdge? fNext;  // Próxima na AET
+  SkEdge? fNext; // Próxima na AET
   SkEdge? fNextY; // Próxima no bucket do EdgeTable
 
   bool setLine(double x0, double y0, double x1, double y1) {
-    var fy0 = (y0 * kSubpixelCount * kFixedOne).toInt();
-    var fy1 = (y1 * kSubpixelCount * kFixedOne).toInt();
-    var fx0 = (x0 * kFixedOne).toInt();
-    var fx1 = (x1 * kFixedOne).toInt();
+    var fy0 = (y0 * kSubpixelCount * kFixedOne).round();
+    var fy1 = (y1 * kSubpixelCount * kFixedOne).round();
+    var fx0 = (x0 * kFixedOne).round();
+    var fx1 = (x1 * kFixedOne).round();
 
     int winding = 1;
     if (fy0 > fy1) {
-      final t = fy0; fy0 = fy1; fy1 = t;
-      final tx = fx0; fx0 = fx1; fx1 = tx;
+      final t = fy0;
+      fy0 = fy1;
+      fy1 = t;
+      final tx = fx0;
+      fx0 = fx1;
+      fx1 = tx;
       winding = -1;
     }
 
@@ -48,11 +52,11 @@ class SkEdge {
     int dxdy = 0;
     if (dy != 0) {
       // Usar double para precisão de slope
-      dxdy = ((dx.toDouble() / dy.toDouble()) * kFixedOne).toInt();
+      dxdy = ((dx.toDouble() / dy.toDouble()) * kFixedOne).round();
     }
 
     final clipY = (top << kFixedBits) + kFixedHalf - fy0;
-    final startX = fx0 + ((clipY.toDouble() * dxdy) / kFixedOne).toInt();
+    final startX = fx0 + ((clipY.toDouble() * dxdy) / kFixedOne).round();
 
     fX = startX;
     fDx = dxdy;
@@ -70,6 +74,26 @@ class EdgeList {
   void add(SkEdge edge) {
     edge.fNext = head;
     head = edge;
+  }
+
+  void addSorted(SkEdge edge) {
+    if (head == null ||
+        edge.fX < head!.fX ||
+        (edge.fX == head!.fX && edge.fDx < head!.fDx)) {
+      edge.fNext = head;
+      head = edge;
+      return;
+    }
+
+    var prev = head!;
+    var curr = prev.fNext;
+    while (curr != null &&
+        (curr.fX < edge.fX || (curr.fX == edge.fX && curr.fDx <= edge.fDx))) {
+      prev = curr;
+      curr = curr.fNext;
+    }
+    edge.fNext = curr;
+    prev.fNext = edge;
   }
 
   void sort() {
@@ -114,7 +138,8 @@ class SkiaRasterizer {
   final bool useSimd;
   FillRule fillRule = FillRule.nonZero;
 
-  SkiaRasterizer({required this.width, required this.height, this.useSimd = true}) {
+  SkiaRasterizer(
+      {required this.width, required this.height, this.useSimd = true}) {
     framebuffer = Uint32List(width * height);
     _scanlineAccumulator = Int32List(width);
     // View SIMD para incrementos rápidos
@@ -125,21 +150,36 @@ class SkiaRasterizer {
     framebuffer.fillRange(0, framebuffer.length, backgroundColor);
   }
 
-  void drawPolygon(List<double> vertices, int color) {
+  /// `windingRule`: 0 = EvenOdd, 1 = NonZero (compat com benchmark SVG).
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int? windingRule,
+    List<int>? contourVertexCounts,
+  }) {
+    if (windingRule != null) {
+      fillRule = windingRule == 0 ? FillRule.evenOdd : FillRule.nonZero;
+    }
     if (vertices.length < 6) return;
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
 
     int minYSub = 0x7FFFFFFF;
     int maxYSub = -0x80000000;
     final edges = <SkEdge>[];
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final edge = SkEdge();
-      if (edge.setLine(vertices[i * 2], vertices[i * 2 + 1], vertices[j * 2], vertices[j * 2 + 1])) {
-        edges.add(edge);
-        if (edge.fFirstY < minYSub) minYSub = edge.fFirstY;
-        if (edge.fLastY > maxYSub) maxYSub = edge.fLastY;
+    for (final contour in contours) {
+      if (contour.count < 3) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final edge = SkEdge();
+        if (edge.setLine(vertices[i * 2], vertices[i * 2 + 1], vertices[j * 2],
+            vertices[j * 2 + 1])) {
+          edges.add(edge);
+          if (edge.fFirstY < minYSub) minYSub = edge.fFirstY;
+          if (edge.fLastY > maxYSub) maxYSub = edge.fLastY;
+        }
       }
     }
 
@@ -168,11 +208,13 @@ class SkiaRasterizer {
         var e = edgeTable[subY];
         while (e != null) {
           final next = e.fNextY;
-          aet.add(e);
+          aet.addSorted(e);
           e = next;
         }
         _removeFinished(aet, subY);
-        aet.sort();
+        if (!_isAETSorted(aet.head)) {
+          aet.sort();
+        }
 
         // 2. Preenchimento de sub-scanline
         if (aet.head != null) {
@@ -194,6 +236,27 @@ class SkiaRasterizer {
         _blitAccumulatedScalar(y, color);
       }
     }
+  }
+
+  List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+    if (counts == null || counts.isEmpty) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+
+    int consumed = 0;
+    final out = <_ContourSpan>[];
+    for (final raw in counts) {
+      if (raw <= 0) continue;
+      if (consumed + raw > totalPoints) {
+        return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+      }
+      out.add(_ContourSpan(consumed, raw));
+      consumed += raw;
+    }
+    if (out.isEmpty || consumed != totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    return out;
   }
 
   void _fillSubScanlineScalar(EdgeList aet) {
@@ -328,7 +391,8 @@ class SkiaRasterizer {
     for (int i = 0; i < simdWidth; i++) {
       final counts = _accSIMD[i];
       // Pular blocos vazios rapidamente
-      if (counts.x == 0 && counts.y == 0 && counts.z == 0 && counts.w == 0) continue;
+      if (counts.x == 0 && counts.y == 0 && counts.z == 0 && counts.w == 0)
+        continue;
 
       final baseIdx = i << 2;
       for (int k = 0; k < 4; k++) {
@@ -375,6 +439,18 @@ class SkiaRasterizer {
     }
   }
 
+  bool _isAETSorted(SkEdge? head) {
+    var curr = head;
+    while (curr != null && curr.fNext != null) {
+      final next = curr.fNext!;
+      if (curr.fX > next.fX || (curr.fX == next.fX && curr.fDx > next.fDx)) {
+        return false;
+      }
+      curr = next;
+    }
+    return true;
+  }
+
   bool _isInside(int winding) {
     if (fillRule == FillRule.evenOdd) {
       return (winding & 1) != 0;
@@ -397,6 +473,15 @@ class AlphaBlitter implements Blitter {
   final int bufferWidth;
   final int color;
   AlphaBlitter(this.buffer, this.bufferWidth, this.color);
-  @override void blitH(int x, int y, int width) {}
-  @override void blitAntiH(int x, int y, List<int> alphas, int count) {}
+  @override
+  void blitH(int x, int y, int width) {}
+  @override
+  void blitAntiH(int x, int y, List<int> alphas, int count) {}
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+
+  const _ContourSpan(this.start, this.count);
 }

@@ -31,6 +31,7 @@ library epl_aa;
 
 import 'dart:typed_data';
 import 'dart:math' as math;
+import 'epl_aa_tables.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOOK-UP TABLE DE COBERTURA
@@ -42,114 +43,23 @@ import 'dart:math' as math;
 /// de área do pixel coberta pelo semi-plano.
 class CoverageLUT2D {
   /// Número de bins para o ângulo θ (0..π/2, explorando simetria)
-  static const int thetaBins = 256;
+  static const int thetaBins = kEplThetaBins;
 
   /// Número de bins para a distância s (tipicamente -1.0..+1.0 como folga)
-  static const int distBins = 256;
+  static const int distBins = kEplDistBins;
 
   /// Tabela de coberturas (0..255)
   final Uint8List _table;
+  static const double _halfPi = math.pi / 2.0;
+  static const double _distMin = kEplDistMin;
+  static const double _distSpan = kEplDistMax - kEplDistMin;
+  static const double _thetaScale = (thetaBins - 1) / _halfPi;
+  static const double _distScale = (distBins - 1) / _distSpan;
 
-  CoverageLUT2D() : _table = Uint8List(thetaBins * distBins) {
-    _precompute();
-  }
-
-  void _precompute() {
-    // Para cada combinação (θ, s), calcula a área do quadrado [-0.5,0.5]²
-    // que satisfaz n·p + s <= 0, onde n é o vetor normal unitário.
-    for (int t = 0; t < thetaBins; t++) {
-      // Ângulo no range [0, π/2] (simetria permite reduzir)
-      final theta = (t / thetaBins) * (math.pi / 2);
-      final nx = math.cos(theta);
-      final ny = math.sin(theta);
-
-      for (int d = 0; d < distBins; d++) {
-        // Distância signada no range [-1.25, +1.25]
-        final s = ((d / distBins) * 2.5) - 1.25;
-
-        // Calcular área de cobertura usando clipping de polígono
-        final coverage = _computeCoverage(nx, ny, s);
-        _table[t * distBins + d] = (coverage * 255).round().clamp(0, 255);
-      }
-    }
-  }
-
-  /// Calcula a área de cobertura exata usando Sutherland-Hodgman clipping
-  double _computeCoverage(double nx, double ny, double s) {
-    // Quadrado do pixel: vértices em coordenadas locais [-0.5, 0.5]²
-    // O semi-plano é n·p + s <= 0
-    List<List<double>> polygon = [
-      [-0.5, -0.5],
-      [0.5, -0.5],
-      [0.5, 0.5],
-      [-0.5, 0.5]
-    ];
-
-    // Clip do polígono pelo semi-plano
-    final clipped = _clipPolygon(polygon, nx, ny, s);
-
-    // Calcular área do polígono resultante
-    return _polygonArea(clipped);
-  }
-
-  /// Sutherland-Hodgman clipping de polígono por semi-plano
-  List<List<double>> _clipPolygon(
-      List<List<double>> poly, double nx, double ny, double s) {
-    if (poly.isEmpty) return [];
-
-    final result = <List<double>>[];
-
-    for (int i = 0; i < poly.length; i++) {
-      final current = poly[i];
-      final next = poly[(i + 1) % poly.length];
-
-      // Distância assinada de cada vértice
-      final currentDist = nx * current[0] + ny * current[1] + s;
-      final nextDist = nx * next[0] + ny * next[1] + s;
-
-      if (currentDist <= 0) {
-        // Vértice atual está dentro
-        result.add(current);
-
-        if (nextDist > 0) {
-          // Próximo está fora: adicionar interseção
-          final t = currentDist / (currentDist - nextDist);
-          result.add([
-            current[0] + t * (next[0] - current[0]),
-            current[1] + t * (next[1] - current[1])
-          ]);
-        }
-      } else {
-        // Vértice atual está fora
-        if (nextDist <= 0) {
-          // Próximo está dentro: adicionar interseção
-          final t = currentDist / (currentDist - nextDist);
-          result.add([
-            current[0] + t * (next[0] - current[0]),
-            current[1] + t * (next[1] - current[1])
-          ]);
-        }
-      }
-    }
-
-    return result;
-  }
-
-  /// Calcula área de um polígono usando fórmula do shoelace
-  double _polygonArea(List<List<double>> poly) {
-    if (poly.length < 3) return 0.0;
-
-    double area = 0.0;
-    for (int i = 0; i < poly.length; i++) {
-      final j = (i + 1) % poly.length;
-      area += poly[i][0] * poly[j][1];
-      area -= poly[j][0] * poly[i][1];
-    }
-
-    return area.abs() / 2.0;
-  }
+  CoverageLUT2D() : _table = kEplCoverageTable;
 
   /// Obtém cobertura para um ângulo e distância
+  @pragma('vm:prefer-inline')
   int getCoverage(double theta, double signedDist) {
     // Normalizar ângulo para [0, π/2]
     var normalizedTheta = theta.abs();
@@ -161,10 +71,27 @@ class CoverageLUT2D {
     final thetaIdx = ((normalizedTheta / (math.pi / 2)) * (thetaBins - 1))
         .round()
         .clamp(0, thetaBins - 1);
-    final distIdx = (((signedDist + 1.25) / 2.5) * (distBins - 1))
+    final distIdx = (((signedDist - _distMin) / _distSpan) * (distBins - 1))
         .round()
         .clamp(0, distBins - 1);
 
+    return _table[thetaIdx * distBins + distIdx];
+  }
+
+  @pragma('vm:prefer-inline')
+  int thetaToIndex(double theta) {
+    var normalizedTheta = theta.abs();
+    if (normalizedTheta > _halfPi) {
+      normalizedTheta = math.pi - normalizedTheta;
+      if (normalizedTheta < 0) normalizedTheta = -normalizedTheta;
+    }
+    return (normalizedTheta * _thetaScale).round().clamp(0, thetaBins - 1);
+  }
+
+  @pragma('vm:prefer-inline')
+  int getCoverageByThetaIndex(int thetaIdx, double signedDist) {
+    final distIdx =
+        ((signedDist - _distMin) * _distScale).round().clamp(0, distBins - 1);
     return _table[thetaIdx * distBins + distIdx];
   }
 }
@@ -175,12 +102,18 @@ class CoverageLUT2D {
 
 class EplProcessedEdge {
   final double x1, y1, x2, y2;
+  final double vx, vy;
+  final double vv;
 
   /// Normal unitária
   final double nx, ny;
 
+  /// Termo constante do plano: nx * px + ny * py + c = 0
+  final double planeC;
+
   /// Ângulo da normal
   final double theta;
+  final int thetaIdx;
 
   /// Comprimento da aresta
   final double length;
@@ -193,46 +126,61 @@ class EplProcessedEdge {
     required this.y1,
     required this.x2,
     required this.y2,
+    required this.vx,
+    required this.vy,
+    required this.vv,
     required this.nx,
     required this.ny,
+    required this.planeC,
     required this.theta,
+    required this.thetaIdx,
     required this.length,
     required this.invLength,
   });
 
   factory EplProcessedEdge.fromPoints(
-      double x1, double y1, double x2, double y2) {
+      double x1, double y1, double x2, double y2, CoverageLUT2D lut) {
     final dx = x2 - x1;
     final dy = y2 - y1;
     final len = math.sqrt(dx * dx + dy * dy);
     final invLen = len > 0 ? 1.0 / len : 0.0;
+    final vv = dx * dx + dy * dy;
 
     // Normal apontando para a direita do vetor (sentido horário)
     final nx = dy * invLen;
     final ny = -dx * invLen;
+    final planeC = -(nx * x1 + ny * y1);
 
     // Ângulo da normal
     final theta = math.atan2(ny, nx);
+    final thetaIdx = lut.thetaToIndex(theta);
 
     return EplProcessedEdge(
       x1: x1,
       y1: y1,
       x2: x2,
       y2: y2,
+      vx: dx,
+      vy: dy,
+      vv: vv,
       nx: nx,
       ny: ny,
+      planeC: planeC,
       theta: theta,
+      thetaIdx: thetaIdx,
       length: len,
       invLength: invLen,
     );
   }
 
   /// Calcula distância assinada de um ponto ao plano da aresta
+  @pragma('vm:prefer-inline')
   double signedDistance(double px, double py) {
-    return nx * (px - x1) + ny * (py - y1);
+    return nx * px + ny * py + planeC;
   }
 
   /// Verifica se o ponto está próximo de um endpoint (caso patológico)
+  @pragma('vm:prefer-inline')
   bool isNearEndpoint(double px, double py, double threshold) {
     final d1 = (px - x1).abs() + (py - y1).abs(); // Manhattan
     final d2 = (px - x2).abs() + (py - y2).abs();
@@ -256,6 +204,8 @@ class EPLRasterizer {
 
   /// Tamanho do tile para processamento
   static const int tileSize = 32;
+  static const double _farDistSq = 0.55 * 0.55;
+  static const double _pathologicalSecondDistSq = 0.6 * 0.6;
 
   EPLRasterizer({required this.width, required this.height})
       : _coverageLUT = CoverageLUT2D() {
@@ -273,6 +223,7 @@ class EPLRasterizer {
     // Converter para arestas processadas
     final n = vertices.length ~/ 2;
     final edges = <EplProcessedEdge>[];
+    edges.length = 0;
 
     for (int i = 0; i < n; i++) {
       final j = (i + 1) % n;
@@ -281,6 +232,7 @@ class EPLRasterizer {
         vertices[i * 2 + 1],
         vertices[j * 2],
         vertices[j * 2 + 1],
+        _coverageLUT,
       ));
     }
 
@@ -322,15 +274,29 @@ class EPLRasterizer {
   /// Computa a cobertura de um pixel usando a aresta dominante
   int _computePixelCoverage(
       List<EplProcessedEdge> edges, double centerX, double centerY) {
-    final centerInside = _isPointInsideWinding(edges, centerX, centerY);
-
-    // Encontrar a aresta dominante pela menor distância ao SEGMENTO
-    // (não à linha infinita), para evitar artefatos longe da borda real.
+    int winding = 0;
     EplProcessedEdge? dominantEdge;
     double minDistSq = double.infinity;
     double secondMinDistSq = double.infinity;
 
     for (final edge in edges) {
+      final x1 = edge.x1;
+      final y1 = edge.y1;
+      final x2 = edge.x2;
+      final y2 = edge.y2;
+
+      if (y1 <= centerY) {
+        if (y2 > centerY &&
+            ((x2 - x1) * (centerY - y1) - (centerX - x1) * (y2 - y1)) > 0) {
+          winding++;
+        }
+      } else {
+        if (y2 <= centerY &&
+            ((x2 - x1) * (centerY - y1) - (centerX - x1) * (y2 - y1)) < 0) {
+          winding--;
+        }
+      }
+
       final distSq = _distanceToSegmentSq(edge, centerX, centerY);
 
       if (distSq < minDistSq) {
@@ -343,16 +309,15 @@ class EPLRasterizer {
     }
 
     if (dominantEdge == null) return 0;
+    final centerInside = winding != 0;
 
     // Pixel longe da borda: classificação binária robusta.
-    if (minDistSq > 0.55 * 0.55) {
+    if (minDistSq > _farDistSq) {
       return centerInside ? 255 : 0;
     }
 
     // Verificar casos patológicos
-    final secondMinDist =
-        secondMinDistSq.isFinite ? math.sqrt(secondMinDistSq) : double.infinity;
-    final isPathological = secondMinDist < 0.6 ||
+    final isPathological = secondMinDistSq < _pathologicalSecondDistSq ||
         dominantEdge.isNearEndpoint(centerX, centerY, 1.0);
 
     if (isPathological) {
@@ -362,7 +327,8 @@ class EPLRasterizer {
 
     // Caso normal: usar LUT
     final signedDist = dominantEdge.signedDistance(centerX, centerY);
-    var coverage = _coverageLUT.getCoverage(dominantEdge.theta, signedDist);
+    var coverage =
+        _coverageLUT.getCoverageByThetaIndex(dominantEdge.thetaIdx, signedDist);
 
     // Alinhar o lado "inside" da LUT com a classificação global do polígono.
     final lineInside = signedDist <= 0.0;
@@ -430,12 +396,12 @@ class EPLRasterizer {
 
   @pragma('vm:prefer-inline')
   double _distanceToSegmentSq(EplProcessedEdge edge, double px, double py) {
-    final vx = edge.x2 - edge.x1;
-    final vy = edge.y2 - edge.y1;
+    final vx = edge.vx;
+    final vy = edge.vy;
     final wx = px - edge.x1;
     final wy = py - edge.y1;
 
-    final vv = vx * vx + vy * vy;
+    final vv = edge.vv;
     if (vv <= 1e-12) {
       return wx * wx + wy * wy;
     }

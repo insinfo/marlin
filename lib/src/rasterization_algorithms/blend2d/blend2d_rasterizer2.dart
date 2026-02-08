@@ -113,41 +113,48 @@ class Blend2DRasterizer2 {
   }
 
   /// API estilo Blend2D: acumula geometria, não faz resolve.
-  void addPolygon(List<double> vertices) {
+  void addPolygon(List<double> vertices, {List<int>? contourVertexCounts}) {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
-    double area2 = 0.0;
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      area2 += vertices[i * 2] * vertices[j * 2 + 1] -
-          vertices[j * 2] * vertices[i * 2 + 1];
-    }
+    final contours = _resolveContours(n, contourVertexCounts);
 
-    // Normaliza winding para evitar cancelamento entre polígonos sobrepostos
-    // no modo batch (os testes usam composição "over" com mesma cor).
-    final reverse = area2 > 0.0;
+    for (final contour in contours) {
+      if (contour.count < 3) continue;
 
-    if (!reverse) {
-      for (int i = 0; i < n; i++) {
-        final j = (i + 1) % n;
-        _rasterizeEdge(
-          vertices[i * 2],
-          vertices[i * 2 + 1],
-          vertices[j * 2],
-          vertices[j * 2 + 1],
-        );
+      // Mantém a lógica legada de normalização de winding por contorno.
+      double area2 = 0.0;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        area2 += vertices[i * 2] * vertices[j * 2 + 1] -
+            vertices[j * 2] * vertices[i * 2 + 1];
       }
-    } else {
-      for (int i = 0; i < n; i++) {
-        final idx = n - 1 - i;
-        final jdx = (idx - 1 + n) % n;
-        _rasterizeEdge(
-          vertices[idx * 2],
-          vertices[idx * 2 + 1],
-          vertices[jdx * 2],
-          vertices[jdx * 2 + 1],
-        );
+
+      final reverse = area2 > 0.0;
+      if (!reverse) {
+        for (int local = 0; local < contour.count; local++) {
+          final i = contour.start + local;
+          final j = contour.start + ((local + 1) % contour.count);
+          _rasterizeEdge(
+            vertices[i * 2],
+            vertices[i * 2 + 1],
+            vertices[j * 2],
+            vertices[j * 2 + 1],
+          );
+        }
+      } else {
+        for (int local = 0; local < contour.count; local++) {
+          final idx = contour.start + (contour.count - 1 - local);
+          final jdx = contour.start +
+              ((idx - contour.start - 1 + contour.count) % contour.count);
+          _rasterizeEdge(
+            vertices[idx * 2],
+            vertices[idx * 2 + 1],
+            vertices[jdx * 2],
+            vertices[jdx * 2 + 1],
+          );
+        }
       }
     }
   }
@@ -158,11 +165,35 @@ class Blend2DRasterizer2 {
     List<double> vertices,
     int color, {
     bool flushNow = true,
+    int? windingRule,
+    List<int>? contourVertexCounts,
   }) async {
-    addPolygon(vertices);
+    if (windingRule != null) fillRule = windingRule;
+    addPolygon(vertices, contourVertexCounts: contourVertexCounts);
     if (flushNow) {
       await flush(color);
     }
+  }
+
+  List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+    if (counts == null || counts.isEmpty) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+
+    int consumed = 0;
+    final out = <_ContourSpan>[];
+    for (final raw in counts) {
+      if (raw <= 0) continue;
+      if (consumed + raw > totalPoints) {
+        return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+      }
+      out.add(_ContourSpan(consumed, raw));
+      consumed += raw;
+    }
+    if (out.isEmpty || consumed != totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    return out;
   }
 
   /// Resolve (composição) apenas a região suja acumulada desde o último flush.
@@ -180,8 +211,8 @@ class Blend2DRasterizer2 {
     final int minTile = (_dirtyMinY ~/ th).clamp(0, _tiles.length - 1);
     final int maxTile = (_dirtyMaxY ~/ th).clamp(0, _tiles.length - 1);
 
-    // SIMD com even-odd fica caro/complexo; aqui garantimos correção.
-    final bool canUseSimd = config.useSimd && (fillRule == 1);
+    // SIMD agora suporta non-zero e even-odd com a mesma semântica do scalar.
+    final bool canUseSimd = config.useSimd;
 
     // Decide serial vs parallel
     final bool shouldParallel = config.useIsolates &&
@@ -334,8 +365,9 @@ class Blend2DRasterizer2 {
   void _addSegment(int y, double x0, double y0, double x1, double y1, int dir) {
     if (y < 0 || y >= height) return;
 
-    final double dy = (y1 - y0);
-    final int distY = (dy * kCovOne).toInt() * dir;
+    final int y0Fixed = (y0 * kCovOne).round();
+    final int y1Fixed = (y1 * kCovOne).round();
+    final int distY = (y1Fixed - y0Fixed) * dir;
     if (distY == 0) return;
 
     _markDirtyLine(y);
@@ -354,7 +386,7 @@ class Blend2DRasterizer2 {
 
     if (ix0 == ix1) {
       final double xAvg = (x0 + x1) * 0.5 - ix0;
-      final int areaVal = (distY * (xAvg * kCovOne)).toInt() >> kCovShift;
+      final int areaVal = (distY * (xAvg * kCovOne)).round() >> kCovShift;
 
       final int idx = rowOffset + ix0;
       tile.covers[idx] += distY;
@@ -369,20 +401,21 @@ class Blend2DRasterizer2 {
     double currX0 = x0;
     int currIX = ix0;
 
-    int currYFixed =
-        ((y0) * kCovOne).toInt(); // y0 já é relativo à linha (0..1)
+    int currYFixed = y0Fixed; // y0 já é relativo à linha (0..1)
+    int consumedDistY = 0;
 
     while (currIX != ix1) {
       final double t = (borderX - x0) / dx;
       final double nextY = y0 + t * (y1 - y0);
 
-      final int nextYFixed = ((nextY) * kCovOne).toInt();
+      final int nextYFixed = ((nextY) * kCovOne).round();
       final int distYLocal = (nextYFixed - currYFixed) * dir;
+      consumedDistY += distYLocal;
       currYFixed = nextYFixed;
 
       final double xAvgLocal = (currX0 + borderX) * 0.5 - currIX;
       final int areaValLocal =
-          (distYLocal * (xAvgLocal * kCovOne)).toInt() >> kCovShift;
+          (distYLocal * (xAvgLocal * kCovOne)).round() >> kCovShift;
 
       final int idx = rowOffset + currIX;
       tile.covers[idx] += distYLocal;
@@ -393,11 +426,10 @@ class Blend2DRasterizer2 {
       borderX += step;
     }
 
-    final int lastYFixed = ((y1) * kCovOne).toInt();
-    final int distYLocal = (lastYFixed - currYFixed) * dir;
+    final int distYLocal = distY - consumedDistY;
     final double xAvgLocal = (currX0 + x1) * 0.5 - ix1;
     final int areaValLocal =
-        (distYLocal * (xAvgLocal * kCovOne)).toInt() >> kCovShift;
+        (distYLocal * (xAvgLocal * kCovOne)).round() >> kCovShift;
 
     final int lastIdx = rowOffset + ix1;
     tile.covers[lastIdx] += distYLocal;
@@ -494,7 +526,7 @@ class Blend2DRasterizer2 {
     final int simdLimit = width & ~3;
 
     for (int y = 0; y < height; y++) {
-      int coverAcc = 0;
+      int cellAcc = 0;
       final int rowOffset = y * width;
 
       int x = 0;
@@ -509,10 +541,13 @@ class Blend2DRasterizer2 {
           covers[idx] = 0;
           areas[idx] = 0;
 
-          final int coverage = coverAcc + cv - ar;
-          coverAcc += cv;
+          final int cell0 = cv - ar;
+          final int cell1 = ar;
+          cellAcc += cell0;
+          final int coverage = cellAcc;
+          cellAcc += cell1;
 
-          if (coverage == 0 && ar == 0) continue;
+          if (coverage == 0 && cv == 0 && ar == 0) continue;
 
           int absCover = coverage;
           final int mask = absCover >> 31;
@@ -524,7 +559,7 @@ class Blend2DRasterizer2 {
           }
 
           int alpha = (absCover * 255) >> kCovShift;
-          if (alpha <= 0) continue;
+          if (alpha <= 1) continue;
           if (alpha > 255) alpha = 255;
 
           final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
@@ -550,10 +585,13 @@ class Blend2DRasterizer2 {
         covers[idx] = 0;
         areas[idx] = 0;
 
-        final int coverage = coverAcc + cv - ar;
-        coverAcc += cv;
+        final int cell0 = cv - ar;
+        final int cell1 = ar;
+        cellAcc += cell0;
+        final int coverage = cellAcc;
+        cellAcc += cell1;
 
-        if (coverage == 0 && ar == 0) continue;
+        if (coverage == 0 && cv == 0 && ar == 0) continue;
 
         int absCover = coverage;
         final int mask = absCover >> 31;
@@ -565,7 +603,7 @@ class Blend2DRasterizer2 {
         }
 
         int alpha = (absCover * 255) >> kCovShift;
-        if (alpha <= 0) continue;
+        if (alpha <= 1) continue;
         if (alpha > 255) alpha = 255;
 
         final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
@@ -584,7 +622,7 @@ class Blend2DRasterizer2 {
     }
   }
 
-  // SIMD: mantemos apenas para fillRule Non-Zero (correto e rápido).
+  // SIMD: suporta Non-Zero e Even-Odd preservando a mesma regra do scalar.
   static void resolveSimd(_ResolveDTO dto) {
     final int stride = dto.width;
 
@@ -592,10 +630,6 @@ class Blend2DRasterizer2 {
     final int g = (dto.color >> 8) & 0xFF;
     final int b = dto.color & 0xFF;
     final int a = (dto.color >> 24) & 0xFF;
-
-    final v255F = Float32x4.splat(255.0);
-    final vScaleF = Float32x4.splat(255.0 / 256.0);
-    final vZeroF = Float32x4.zero();
 
     final int simdLimit = stride & ~3;
 
@@ -610,7 +644,7 @@ class Blend2DRasterizer2 {
     final fb = dto.framebuffer;
 
     for (int y = 0; y < dto.height; y++) {
-      int coverAcc = 0;
+      int cellAcc = 0;
       final int rowOffset = y * stride;
       int rowSimdIdx = rowOffset >> 2;
 
@@ -626,34 +660,71 @@ class Blend2DRasterizer2 {
         final int c1 = vCov.y;
         final int c2 = vCov.z;
         final int c3 = vCov.w;
+        final int a0 = vArea.x;
+        final int a1 = vArea.y;
+        final int a2 = vArea.z;
+        final int a3 = vArea.w;
 
-        final int cov0 = coverAcc + c0;
-        final int cov1 = cov0 + c1;
-        final int cov2 = cov1 + c2;
-        final int cov3 = cov2 + c3;
-        coverAcc = cov3;
+        cellAcc += c0 - a0;
+        int absCover0 = cellAcc;
+        cellAcc += a0;
 
-        final Float32x4 vCoverageF = Float32x4(
-          (cov0 - vArea.x).toDouble(),
-          (cov1 - vArea.y).toDouble(),
-          (cov2 - vArea.z).toDouble(),
-          (cov3 - vArea.w).toDouble(),
-        );
+        cellAcc += c1 - a1;
+        int absCover1 = cellAcc;
+        cellAcc += a1;
 
-        var vAlphaF = vCoverageF.abs() * vScaleF; // (abs * 255 / 256)
-        vAlphaF = vAlphaF.min(v255F).max(vZeroF);
+        cellAcc += c2 - a2;
+        int absCover2 = cellAcc;
+        cellAcc += a2;
 
-        if (vAlphaF.x < 1.0 &&
-            vAlphaF.y < 1.0 &&
-            vAlphaF.z < 1.0 &&
-            vAlphaF.w < 1.0) {
+        cellAcc += c3 - a3;
+        int absCover3 = cellAcc;
+        cellAcc += a3;
+
+        final int mask0 = absCover0 >> 31;
+        final int mask1 = absCover1 >> 31;
+        final int mask2 = absCover2 >> 31;
+        final int mask3 = absCover3 >> 31;
+        absCover0 = (absCover0 ^ mask0) - mask0;
+        absCover1 = (absCover1 ^ mask1) - mask1;
+        absCover2 = (absCover2 ^ mask2) - mask2;
+        absCover3 = (absCover3 ^ mask3) - mask3;
+
+        if (dto.fillRule == 0) {
+          final int eoMask = (kCovOne * 2) - 1;
+          final int eoTwice = kCovOne * 2;
+
+          absCover0 &= eoMask;
+          if (absCover0 > kCovOne) absCover0 = eoTwice - absCover0;
+
+          absCover1 &= eoMask;
+          if (absCover1 > kCovOne) absCover1 = eoTwice - absCover1;
+
+          absCover2 &= eoMask;
+          if (absCover2 > kCovOne) absCover2 = eoTwice - absCover2;
+
+          absCover3 &= eoMask;
+          if (absCover3 > kCovOne) absCover3 = eoTwice - absCover3;
+        }
+
+        int alpha0 = (absCover0 * 255) >> kCovShift;
+        int alpha1 = (absCover1 * 255) >> kCovShift;
+        int alpha2 = (absCover2 * 255) >> kCovShift;
+        int alpha3 = (absCover3 * 255) >> kCovShift;
+
+        if (alpha0 > 255) alpha0 = 255;
+        if (alpha1 > 255) alpha1 = 255;
+        if (alpha2 > 255) alpha2 = 255;
+        if (alpha3 > 255) alpha3 = 255;
+
+        if (alpha0 <= 1 && alpha1 <= 1 && alpha2 <= 1 && alpha3 <= 1) {
           rowSimdIdx++;
           continue;
         }
 
         // blend (serial inlined)
-        int alphaInt = vAlphaF.x.toInt();
-        if (alphaInt > 0) {
+        int alphaInt = alpha0;
+        if (alphaInt > 1) {
           final int idx = rowOffset + x;
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
@@ -666,8 +737,8 @@ class Blend2DRasterizer2 {
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
-        alphaInt = vAlphaF.y.toInt();
-        if (alphaInt > 0) {
+        alphaInt = alpha1;
+        if (alphaInt > 1) {
           final int idx = rowOffset + x + 1;
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
@@ -680,8 +751,8 @@ class Blend2DRasterizer2 {
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
-        alphaInt = vAlphaF.z.toInt();
-        if (alphaInt > 0) {
+        alphaInt = alpha2;
+        if (alphaInt > 1) {
           final int idx = rowOffset + x + 2;
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
@@ -694,8 +765,8 @@ class Blend2DRasterizer2 {
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
-        alphaInt = vAlphaF.w.toInt();
-        if (alphaInt > 0) {
+        alphaInt = alpha3;
+        if (alphaInt > 1) {
           final int idx = rowOffset + x + 3;
           final int bg = fb[idx];
           final int finalAlpha = (alphaInt * a) >> 8;
@@ -719,15 +790,23 @@ class Blend2DRasterizer2 {
         dto.covers[idx] = 0;
         dto.areas[idx] = 0;
 
-        final int coverage = coverAcc + cv - ar;
-        coverAcc += cv;
+        final int cell0 = cv - ar;
+        final int cell1 = ar;
+        cellAcc += cell0;
+        final int coverage = cellAcc;
+        cellAcc += cell1;
 
         int absCover = coverage;
         final int mask = absCover >> 31;
         absCover = (absCover ^ mask) - mask;
 
+        if (dto.fillRule == 0) {
+          absCover &= (kCovOne * 2) - 1;
+          if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
+        }
+
         int alpha = (absCover * 255) >> kCovShift;
-        if (alpha <= 0) continue;
+        if (alpha <= 1) continue;
         if (alpha > 255) alpha = 255;
 
         _blendPixel(fb, idx, r, g, b, a, alpha);
@@ -801,6 +880,13 @@ class _ResolveDTO {
     required this.fillRule,
     required this.useSimd,
   });
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+
+  const _ContourSpan(this.start, this.count);
 }
 
 class _TileJob {
@@ -1045,7 +1131,7 @@ void _workerMain(SendPort readyPort) {
         fbBd.lengthInBytes ~/ 4,
       );
 
-      final bool canSimd = useSimd && (fillRule == 1);
+      final bool canSimd = useSimd;
 
       final dto = _ResolveDTO(
         width: width,

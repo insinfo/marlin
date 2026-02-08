@@ -1,5 +1,5 @@
 /// =============================================================================
-/// SVG PARSER - Robust Implementation
+/// SVG PARSER - Robust otimized Implementation
 /// =============================================================================
 ///
 /// A proper SVG parser using a state machine approach for correct handling
@@ -12,17 +12,23 @@ import 'dart:math' as math;
 /// Represents a polygon extracted from SVG
 class SvgPolygon {
   final List<double> vertices;
+  // Number of vertices (points, not doubles) for each subpath contour.
+  // Null means a single contour using all vertices.
+  final List<int>? contourVertexCounts;
   final int fillColor;
   final int strokeColor;
   final double strokeWidth;
   final bool evenOdd;
+  final bool fillSpecified;
 
   SvgPolygon({
     required this.vertices,
+    this.contourVertexCounts,
     this.fillColor = 0xFF000000,
     this.strokeColor = 0x00000000,
     this.strokeWidth = 0.0,
     this.evenOdd = true,
+    this.fillSpecified = false,
   });
 }
 
@@ -44,7 +50,12 @@ class Matrix2D {
   double a, b, c, d, e, f;
 
   Matrix2D.identity()
-      : a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
+      : a = 1,
+        b = 0,
+        c = 0,
+        d = 1,
+        e = 0,
+        f = 0;
 
   Matrix2D(this.a, this.b, this.c, this.d, this.e, this.f);
 
@@ -87,6 +98,9 @@ class _ParseContext {
   int strokeColor;
   double strokeWidth;
   String fillRule;
+  double opacity;
+  double fillOpacity;
+  bool fillSpecified;
 
   _ParseContext({
     Matrix2D? transform,
@@ -94,6 +108,9 @@ class _ParseContext {
     this.strokeColor = 0x00000000,
     this.strokeWidth = 1.0,
     this.fillRule = 'nonzero',
+    this.opacity = 1.0,
+    this.fillOpacity = 1.0,
+    this.fillSpecified = false,
   }) : transform = transform ?? Matrix2D.identity();
 
   _ParseContext copy() {
@@ -103,6 +120,9 @@ class _ParseContext {
       strokeColor: strokeColor,
       strokeWidth: strokeWidth,
       fillRule: fillRule,
+      opacity: opacity,
+      fillOpacity: fillOpacity,
+      fillSpecified: fillSpecified,
     );
   }
 }
@@ -115,19 +135,34 @@ class SvgParser {
     double height = 512;
     final polygons = <SvgPolygon>[];
 
-    // Parse viewBox or width/height
-    final viewBoxMatch = RegExp(r'viewBox="([^"]+)"').firstMatch(svgContent);
-    if (viewBoxMatch != null) {
-      final parts = viewBoxMatch.group(1)!.split(RegExp(r'[\s,]+'));
-      if (parts.length >= 4) {
-        width = double.tryParse(parts[2]) ?? width;
-        height = double.tryParse(parts[3]) ?? height;
+    // Parse dimensions from root SVG element.
+    final svgTagMatch =
+        RegExp(r'<svg\b[^>]*>', caseSensitive: false).firstMatch(svgContent);
+    final svgTag = svgTagMatch?.group(0);
+    if (svgTag != null) {
+      final viewBox = _extractAttr(svgTag, 'viewBox');
+      if (viewBox != null) {
+        final parts = viewBox.split(RegExp(r'[\s,]+'));
+        if (parts.length >= 4) {
+          width = _parseLength(parts[2], width);
+          height = _parseLength(parts[3], height);
+        }
+      } else {
+        final svgWidth = _extractAttr(svgTag, 'width');
+        final svgHeight = _extractAttr(svgTag, 'height');
+        if (svgWidth != null) width = _parseLength(svgWidth, width);
+        if (svgHeight != null) height = _parseLength(svgHeight, height);
       }
     } else {
-      final widthMatch = RegExp(r'width="([0-9.]+)').firstMatch(svgContent);
-      final heightMatch = RegExp(r'height="([0-9.]+)').firstMatch(svgContent);
-      if (widthMatch != null) width = double.tryParse(widthMatch.group(1)!) ?? width;
-      if (heightMatch != null) height = double.tryParse(heightMatch.group(1)!) ?? height;
+      // Fallback for malformed SVGs that still expose a viewBox.
+      final viewBoxMatch = RegExp(r'viewBox="([^"]+)"').firstMatch(svgContent);
+      if (viewBoxMatch != null) {
+        final parts = viewBoxMatch.group(1)!.split(RegExp(r'[\s,]+'));
+        if (parts.length >= 4) {
+          width = _parseLength(parts[2], width);
+          height = _parseLength(parts[3], height);
+        }
+      }
     }
 
     // Use a hierarchical parser approach
@@ -141,14 +176,15 @@ class SvgParser {
   }
 
   /// Parse SVG content hierarchically, handling nested groups
-  void _parseHierarchy(String content, _ParseContext ctx, List<SvgPolygon> polygons) {
+  void _parseHierarchy(
+      String content, _ParseContext ctx, List<SvgPolygon> polygons) {
     int pos = 0;
-    
+
     while (pos < content.length) {
       // Find next tag
       int tagStart = content.indexOf('<', pos);
       if (tagStart == -1) break;
-      
+
       // Skip comments
       if (content.substring(tagStart).startsWith('<!--')) {
         int commentEnd = content.indexOf('-->', tagStart);
@@ -157,22 +193,22 @@ class SvgParser {
           continue;
         }
       }
-      
+
       // Find tag name
       int tagNameEnd = tagStart + 1;
-      while (tagNameEnd < content.length && 
-             !RegExp(r'[\s/>]').hasMatch(content[tagNameEnd])) {
+      while (tagNameEnd < content.length &&
+          !RegExp(r'[\s/>]').hasMatch(content[tagNameEnd])) {
         tagNameEnd++;
       }
-      
+
       final tagName = content.substring(tagStart + 1, tagNameEnd).toLowerCase();
-      
+
       // Skip closing tags
       if (tagName.startsWith('/')) {
         pos = content.indexOf('>', tagStart) + 1;
         continue;
       }
-      
+
       // Find tag end
       int tagEnd = tagStart;
       bool inQuote = false;
@@ -188,35 +224,39 @@ class SvgParser {
         }
         tagEnd++;
       }
-      
+
       if (tagEnd >= content.length) break;
-      
+
       final tagContent = content.substring(tagStart, tagEnd + 1);
       final isSelfClosing = tagContent.endsWith('/>');
-      
+
       // Handle different elements
       if (tagName == 'g') {
         // Group - create child context
         final childCtx = ctx.copy();
         _applyAttributes(tagContent, childCtx);
-        
+
         if (!isSelfClosing) {
           // Find matching </g>
           int depth = 1;
           int searchPos = tagEnd + 1;
           int groupEnd = searchPos;
-          
+
           while (depth > 0 && searchPos < content.length) {
             int nextOpen = content.indexOf('<g', searchPos);
             int nextClose = content.indexOf('</g>', searchPos);
-            
+
             if (nextClose == -1) break;
-            
+
             if (nextOpen != -1 && nextOpen < nextClose) {
               // Check if it's really a <g> tag (not <gradient, etc.)
               if (nextOpen + 2 < content.length) {
                 final nextChar = content[nextOpen + 2];
-                if (nextChar == ' ' || nextChar == '>' || nextChar == '\t' || nextChar == '\n' || nextChar == '/') {
+                if (nextChar == ' ' ||
+                    nextChar == '>' ||
+                    nextChar == '\t' ||
+                    nextChar == '\n' ||
+                    nextChar == '/') {
                   depth++;
                 }
               }
@@ -229,117 +269,188 @@ class SvgParser {
               searchPos = nextClose + 4;
             }
           }
-          
+
           // Parse group content
           final groupContent = content.substring(tagEnd + 1, groupEnd);
           _parseHierarchy(groupContent, childCtx, polygons);
-          
+
           pos = groupEnd + 4;
           continue;
         }
       } else if (tagName == 'path') {
-        // Path element
         final childCtx = ctx.copy();
         _applyAttributes(tagContent, childCtx);
-        
-        final dMatch = RegExp(r'd="([^"]+)"').firstMatch(tagContent);
-        if (dMatch != null && childCtx.fillColor != 0x00000000) {
-          final vertices = _parsePathData(dMatch.group(1)!, childCtx.transform);
-          if (vertices.isNotEmpty) {
+
+        final d = _extractAttr(tagContent, 'd');
+        final effectiveFill = _applyOpacity(
+          childCtx.fillColor,
+          childCtx.opacity * childCtx.fillOpacity,
+        );
+        if (d != null && (effectiveFill >> 24) != 0) {
+          var subpaths = _parsePathData(d, childCtx.transform);
+          // NOTE:
+          // Reordering/reversing contours by area may change original path
+          // topology and create artificial bridges in complex SVGs (e.g. froggy).
+          // Keep source contour order here and let rasterizers apply fill-rule.
+          // Merge all subpaths into a single polygon so that even-odd /
+          // non-zero winding rules work correctly via scanline crossing
+          // counts.  Splitting them into separate SvgPolygons would lose
+          // the hole information and paint solid fills everywhere.
+          final allVertices = <double>[];
+          final contourVertexCounts = <int>[];
+          for (final sp in subpaths) {
+            allVertices.addAll(sp);
+            contourVertexCounts.add(sp.length ~/ 2);
+          }
+          if (allVertices.length >= 6) {
             polygons.add(SvgPolygon(
-              vertices: vertices,
-              fillColor: childCtx.fillColor,
+              vertices: allVertices,
+              contourVertexCounts:
+                  contourVertexCounts.length > 1 ? contourVertexCounts : null,
+              fillColor: effectiveFill,
               strokeColor: childCtx.strokeColor,
               strokeWidth: childCtx.strokeWidth,
               evenOdd: childCtx.fillRule == 'evenodd',
+              fillSpecified: childCtx.fillSpecified,
             ));
           }
         }
       } else if (tagName == 'polygon' || tagName == 'polyline') {
         final childCtx = ctx.copy();
         _applyAttributes(tagContent, childCtx);
-        
-        final pointsMatch = RegExp(r'points="([^"]+)"').firstMatch(tagContent);
-        if (pointsMatch != null && childCtx.fillColor != 0x00000000) {
-          final vertices = _parsePoints(pointsMatch.group(1)!, childCtx.transform);
-          if (vertices.isNotEmpty) {
+
+        final points = _extractAttr(tagContent, 'points');
+        final effectiveFill = _applyOpacity(
+          childCtx.fillColor,
+          childCtx.opacity * childCtx.fillOpacity,
+        );
+        if (points != null && (effectiveFill >> 24) != 0) {
+          final vertices = _parsePoints(points, childCtx.transform);
+          if (vertices.length >= 6) {
             polygons.add(SvgPolygon(
               vertices: vertices,
-              fillColor: childCtx.fillColor,
+              fillColor: effectiveFill,
+              fillSpecified: childCtx.fillSpecified,
             ));
           }
         }
       } else if (tagName == 'rect') {
         final childCtx = ctx.copy();
         _applyAttributes(tagContent, childCtx);
-        
-        if (childCtx.fillColor != 0x00000000) {
+
+        final effectiveFill = _applyOpacity(
+          childCtx.fillColor,
+          childCtx.opacity * childCtx.fillOpacity,
+        );
+        if ((effectiveFill >> 24) != 0) {
           final vertices = _parseRect(tagContent, childCtx.transform);
-          if (vertices.isNotEmpty) {
+          if (vertices.length >= 6) {
             polygons.add(SvgPolygon(
               vertices: vertices,
-              fillColor: childCtx.fillColor,
+              fillColor: effectiveFill,
+              fillSpecified: childCtx.fillSpecified,
             ));
           }
         }
       } else if (tagName == 'circle' || tagName == 'ellipse') {
         final childCtx = ctx.copy();
         _applyAttributes(tagContent, childCtx);
-        
-        if (childCtx.fillColor != 0x00000000) {
-          final vertices = _parseEllipse(tagContent, childCtx.transform, tagName == 'circle');
-          if (vertices.isNotEmpty) {
+
+        final effectiveFill = _applyOpacity(
+          childCtx.fillColor,
+          childCtx.opacity * childCtx.fillOpacity,
+        );
+        if ((effectiveFill >> 24) != 0) {
+          final vertices = _parseEllipse(
+              tagContent, childCtx.transform, tagName == 'circle');
+          if (vertices.length >= 6) {
             polygons.add(SvgPolygon(
               vertices: vertices,
-              fillColor: childCtx.fillColor,
+              fillColor: effectiveFill,
+              fillSpecified: childCtx.fillSpecified,
             ));
           }
         }
       }
-      
+
       pos = tagEnd + 1;
     }
   }
 
+  String? _extractAttr(String tagContent, String attrName) {
+    final name = RegExp.escape(attrName);
+    final re = RegExp(
+      '(?:^|\\s)$name\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))',
+      caseSensitive: false,
+    );
+    final m = re.firstMatch(tagContent);
+    if (m == null) return null;
+    return m.group(1) ?? m.group(2) ?? m.group(3);
+  }
+
+  double _parseLength(String value, double fallback) {
+    final m = RegExp(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?')
+        .firstMatch(value.trim());
+    if (m == null) return fallback;
+    return double.tryParse(m.group(0)!) ?? fallback;
+  }
+
+  int _applyOpacity(int color, double opacity) {
+    final clamped = opacity.clamp(0.0, 1.0);
+    final srcA = (color >> 24) & 0xFF;
+    final outA = (srcA * clamped).round().clamp(0, 255);
+    return (outA << 24) | (color & 0x00FFFFFF);
+  }
+
   /// Apply attributes from tag to context
   void _applyAttributes(String tagContent, _ParseContext ctx) {
-    // Transform
-    final transformMatch = RegExp(r'transform="([^"]+)"').firstMatch(tagContent);
-    if (transformMatch != null) {
-      final localTransform = _parseTransform(transformMatch.group(1)!);
+    final transformValue = _extractAttr(tagContent, 'transform');
+    if (transformValue != null && transformValue.isNotEmpty) {
+      final localTransform = _parseTransform(transformValue);
       ctx.transform = ctx.transform.multiply(localTransform);
     }
-    
-    // Fill
-    final fillMatch = RegExp(r'fill="([^"]+)"').firstMatch(tagContent);
-    if (fillMatch != null) {
-      final color = _parseColor(fillMatch.group(1)!);
-      if (color != -1) ctx.fillColor = color;
+
+    final fillValue = _extractAttr(tagContent, 'fill');
+    if (fillValue != null) {
+      final color = _parseColor(fillValue);
+      if (color != -1) {
+        ctx.fillColor = color;
+      } else {
+        ctx.fillColor = 0x00000000;
+      }
+      ctx.fillSpecified = true;
     }
-    
-    // Stroke
-    final strokeMatch = RegExp(r'stroke="([^"]+)"').firstMatch(tagContent);
-    if (strokeMatch != null) {
-      final color = _parseColor(strokeMatch.group(1)!);
+
+    final strokeValue = _extractAttr(tagContent, 'stroke');
+    if (strokeValue != null) {
+      final color = _parseColor(strokeValue);
       if (color != -1) ctx.strokeColor = color;
     }
-    
-    // Stroke width
-    final strokeWidthMatch = RegExp(r'stroke-width="([^"]+)"').firstMatch(tagContent);
-    if (strokeWidthMatch != null) {
-      ctx.strokeWidth = double.tryParse(strokeWidthMatch.group(1)!) ?? ctx.strokeWidth;
+
+    final strokeWidthValue = _extractAttr(tagContent, 'stroke-width');
+    if (strokeWidthValue != null) {
+      ctx.strokeWidth = _parseLength(strokeWidthValue, ctx.strokeWidth);
     }
-    
-    // Fill rule
-    final fillRuleMatch = RegExp(r'fill-rule="([^"]+)"').firstMatch(tagContent);
-    if (fillRuleMatch != null) {
-      ctx.fillRule = fillRuleMatch.group(1)!;
+
+    final fillRuleValue = _extractAttr(tagContent, 'fill-rule');
+    if (fillRuleValue != null && fillRuleValue.isNotEmpty) {
+      ctx.fillRule = fillRuleValue.trim().toLowerCase();
     }
-    
-    // Style attribute (inline CSS)
-    final styleMatch = RegExp(r'style="([^"]+)"').firstMatch(tagContent);
-    if (styleMatch != null) {
-      _parseStyle(styleMatch.group(1)!, ctx);
+
+    final opacityValue = _extractAttr(tagContent, 'opacity');
+    if (opacityValue != null) {
+      ctx.opacity = _parseLength(opacityValue, ctx.opacity).clamp(0.0, 1.0);
+    }
+
+    final fillOpacityValue = _extractAttr(tagContent, 'fill-opacity');
+    if (fillOpacityValue != null) {
+      ctx.fillOpacity =
+          _parseLength(fillOpacityValue, ctx.fillOpacity).clamp(0.0, 1.0);
+    }
+
+    final styleValue = _extractAttr(tagContent, 'style');
+    if (styleValue != null) {
+      _parseStyle(styleValue, ctx);
     }
   }
 
@@ -351,21 +462,33 @@ class SvgParser {
       if (kv.length != 2) continue;
       final key = kv[0].trim().toLowerCase();
       final value = kv[1].trim();
-      
+
       switch (key) {
         case 'fill':
           final color = _parseColor(value);
-          if (color != -1) ctx.fillColor = color;
+          if (color != -1) {
+            ctx.fillColor = color;
+          } else {
+            ctx.fillColor = 0x00000000;
+          }
+          ctx.fillSpecified = true;
           break;
         case 'stroke':
           final color = _parseColor(value);
           if (color != -1) ctx.strokeColor = color;
           break;
         case 'stroke-width':
-          ctx.strokeWidth = double.tryParse(value) ?? ctx.strokeWidth;
+          ctx.strokeWidth = _parseLength(value, ctx.strokeWidth);
           break;
         case 'fill-rule':
-          ctx.fillRule = value;
+          ctx.fillRule = value.toLowerCase();
+          break;
+        case 'opacity':
+          ctx.opacity = _parseLength(value, ctx.opacity).clamp(0.0, 1.0);
+          break;
+        case 'fill-opacity':
+          ctx.fillOpacity =
+              _parseLength(value, ctx.fillOpacity).clamp(0.0, 1.0);
           break;
       }
     }
@@ -374,59 +497,119 @@ class SvgParser {
   /// Parse SVG color
   int _parseColor(String color) {
     color = color.trim().toLowerCase();
-    
+
     if (color == 'none' || color == 'transparent') return 0x00000000;
     if (color.startsWith('url(')) return -1; // Gradients not supported
-    
+
     const namedColors = {
-      'black': 0xFF000000, 'white': 0xFFFFFFFF, 'red': 0xFFFF0000,
-      'green': 0xFF008000, 'blue': 0xFF0000FF, 'yellow': 0xFFFFFF00,
-      'cyan': 0xFF00FFFF, 'magenta': 0xFFFF00FF, 'gray': 0xFF808080,
-      'grey': 0xFF808080, 'orange': 0xFFFFA500, 'pink': 0xFFFFC0CB,
-      'purple': 0xFF800080, 'brown': 0xFFA52A2A, 'lime': 0xFF00FF00,
-      'navy': 0xFF000080, 'teal': 0xFF008080, 'silver': 0xFFC0C0C0,
-      'maroon': 0xFF800000, 'olive': 0xFF808000, 'aqua': 0xFF00FFFF,
+      'black': 0xFF000000,
+      'white': 0xFFFFFFFF,
+      'red': 0xFFFF0000,
+      'green': 0xFF008000,
+      'blue': 0xFF0000FF,
+      'yellow': 0xFFFFFF00,
+      'cyan': 0xFF00FFFF,
+      'magenta': 0xFFFF00FF,
+      'gray': 0xFF808080,
+      'grey': 0xFF808080,
+      'orange': 0xFFFFA500,
+      'pink': 0xFFFFC0CB,
+      'purple': 0xFF800080,
+      'brown': 0xFFA52A2A,
+      'lime': 0xFF00FF00,
+      'navy': 0xFF000080,
+      'teal': 0xFF008080,
+      'silver': 0xFFC0C0C0,
+      'maroon': 0xFF800000,
+      'olive': 0xFF808000,
+      'aqua': 0xFF00FFFF,
       'fuchsia': 0xFFFF00FF,
     };
-    
+
     if (namedColors.containsKey(color)) return namedColors[color]!;
-    
+
     if (color.startsWith('#')) {
       color = color.substring(1);
       if (color.length == 3) {
-        color = '${color[0]}${color[0]}${color[1]}${color[1]}${color[2]}${color[2]}';
+        color =
+            '${color[0]}${color[0]}${color[1]}${color[1]}${color[2]}${color[2]}';
+      } else if (color.length == 4) {
+        color =
+            '${color[0]}${color[0]}${color[1]}${color[1]}${color[2]}${color[2]}${color[3]}${color[3]}';
       }
+
       if (color.length == 6) {
         final value = int.tryParse(color, radix: 16);
         if (value != null) return 0xFF000000 | value;
+      } else if (color.length == 8) {
+        final value = int.tryParse(color, radix: 16);
+        if (value != null) {
+          final rgb = (value >> 8) & 0x00FFFFFF;
+          final alpha = value & 0xFF;
+          return (alpha << 24) | rgb;
+        }
       }
     }
-    
-    final rgbMatch = RegExp(r'rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)').firstMatch(color);
+
+    final rgbMatch = RegExp(
+      r'rgb\s*\(\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*\)',
+    ).firstMatch(color);
     if (rgbMatch != null) {
-      final r = int.parse(rgbMatch.group(1)!).clamp(0, 255);
-      final g = int.parse(rgbMatch.group(2)!).clamp(0, 255);
-      final b = int.parse(rgbMatch.group(3)!).clamp(0, 255);
+      final r = _parseRgbChannel(rgbMatch.group(1)!);
+      final g = _parseRgbChannel(rgbMatch.group(2)!);
+      final b = _parseRgbChannel(rgbMatch.group(3)!);
       return 0xFF000000 | (r << 16) | (g << 8) | b;
     }
-    
+
+    final rgbaMatch = RegExp(
+      r'rgba\s*\(\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*,\s*([0-9.]+%?)\s*\)',
+    ).firstMatch(color);
+    if (rgbaMatch != null) {
+      final r = _parseRgbChannel(rgbaMatch.group(1)!);
+      final g = _parseRgbChannel(rgbaMatch.group(2)!);
+      final b = _parseRgbChannel(rgbaMatch.group(3)!);
+      final a = _parseAlphaChannel(rgbaMatch.group(4)!);
+      return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
     return 0xFF000000;
+  }
+
+  int _parseRgbChannel(String input) {
+    final value = input.trim();
+    if (value.endsWith('%')) {
+      final p = double.tryParse(value.substring(0, value.length - 1)) ?? 0.0;
+      return ((p * 2.55).round()).clamp(0, 255);
+    }
+    return (double.tryParse(value)?.round() ?? 0).clamp(0, 255);
+  }
+
+  int _parseAlphaChannel(String input) {
+    final value = input.trim();
+    if (value.endsWith('%')) {
+      final p = double.tryParse(value.substring(0, value.length - 1)) ?? 0.0;
+      return ((p * 2.55).round()).clamp(0, 255);
+    }
+    final d = double.tryParse(value) ?? 1.0;
+    if (d <= 1.0) return (d * 255).round().clamp(0, 255);
+    return d.round().clamp(0, 255);
   }
 
   /// Parse SVG transformation
   Matrix2D _parseTransform(String transform) {
     Matrix2D result = Matrix2D.identity();
-    
+
     // Parse all transforms in sequence
     final transforms = RegExp(r'(\w+)\s*\(([^)]+)\)').allMatches(transform);
     for (final match in transforms) {
       final type = match.group(1)!.toLowerCase();
       final argsStr = match.group(2)!;
-      final args = argsStr.split(RegExp(r'[\s,]+'))
+      final args = argsStr
+          .split(RegExp(r'[\s,]+'))
           .where((s) => s.isNotEmpty)
           .map((s) => double.tryParse(s) ?? 0.0)
           .toList();
-      
+
       Matrix2D t;
       switch (type) {
         case 'matrix':
@@ -474,99 +657,121 @@ class SvgParser {
           break;
       }
     }
-    
+
     return result;
   }
 
-  /// Parse path data
-  List<double> _parsePathData(String pathData, Matrix2D transform) {
-    final vertices = <double>[];
+  /// Parse path data, splitting each subpath into an independent polygon.
+  List<List<double>> _parsePathData(String pathData, Matrix2D transform) {
+    final subpaths = <List<double>>[];
     final tokens = _tokenizePathData(pathData);
-    if (tokens.isEmpty) return vertices;
-    
+    if (tokens.isEmpty) return subpaths;
+
+    var currentVertices = <double>[];
     double currentX = 0, currentY = 0;
     double startX = 0, startY = 0;
     double lastControlX = 0, lastControlY = 0;
     String lastCommand = '';
-    
+
+    void ensureSubpathStarted() {
+      if (currentVertices.isNotEmpty) return;
+      currentVertices.addAll(transform.transform(currentX, currentY));
+    }
+
+    void startSubpath(double x, double y) {
+      _commitSubpath(currentVertices, subpaths);
+      currentVertices = <double>[];
+      startX = x;
+      startY = y;
+      currentVertices.addAll(transform.transform(x, y));
+    }
+
     int i = 0;
     while (i < tokens.length) {
       String command = tokens[i];
-      
+
       if (_isNumber(command)) {
+        if (lastCommand.isEmpty) {
+          i++;
+          continue;
+        }
         command = lastCommand;
         if (command == 'M') command = 'L';
         if (command == 'm') command = 'l';
       } else {
         i++;
       }
-      
+
       switch (command) {
         case 'M':
           if (_hasNumericTokens(tokens, i, 2)) {
             currentX = _parseDouble(tokens, i++);
             currentY = _parseDouble(tokens, i++);
-            startX = currentX;
-            startY = currentY;
-            vertices.addAll(transform.transform(currentX, currentY));
+            startSubpath(currentX, currentY);
           }
           break;
         case 'm':
           if (_hasNumericTokens(tokens, i, 2)) {
             currentX += _parseDouble(tokens, i++);
             currentY += _parseDouble(tokens, i++);
-            startX = currentX;
-            startY = currentY;
-            vertices.addAll(transform.transform(currentX, currentY));
+            startSubpath(currentX, currentY);
           }
           break;
         case 'L':
           if (_hasNumericTokens(tokens, i, 2)) {
+            ensureSubpathStarted();
             currentX = _parseDouble(tokens, i++);
             currentY = _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'l':
           if (_hasNumericTokens(tokens, i, 2)) {
+            ensureSubpathStarted();
             currentX += _parseDouble(tokens, i++);
             currentY += _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'H':
           if (_hasNumericTokens(tokens, i, 1)) {
+            ensureSubpathStarted();
             currentX = _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'h':
           if (_hasNumericTokens(tokens, i, 1)) {
+            ensureSubpathStarted();
             currentX += _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'V':
           if (_hasNumericTokens(tokens, i, 1)) {
+            ensureSubpathStarted();
             currentY = _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'v':
           if (_hasNumericTokens(tokens, i, 1)) {
+            ensureSubpathStarted();
             currentY += _parseDouble(tokens, i++);
-            vertices.addAll(transform.transform(currentX, currentY));
+            currentVertices.addAll(transform.transform(currentX, currentY));
           }
           break;
         case 'C':
           if (_hasNumericTokens(tokens, i, 6)) {
+            ensureSubpathStarted();
             final x1 = _parseDouble(tokens, i++);
             final y1 = _parseDouble(tokens, i++);
             final x2 = _parseDouble(tokens, i++);
             final y2 = _parseDouble(tokens, i++);
             final x = _parseDouble(tokens, i++);
             final y = _parseDouble(tokens, i++);
-            _addCubicBezier(vertices, currentX, currentY, x1, y1, x2, y2, x, y, transform);
+            _addCubicBezier(currentVertices, currentX, currentY, x1, y1, x2, y2,
+                x, y, transform);
             lastControlX = x2;
             lastControlY = y2;
             currentX = x;
@@ -575,13 +780,15 @@ class SvgParser {
           break;
         case 'c':
           if (_hasNumericTokens(tokens, i, 6)) {
+            ensureSubpathStarted();
             final x1 = currentX + _parseDouble(tokens, i++);
             final y1 = currentY + _parseDouble(tokens, i++);
             final x2 = currentX + _parseDouble(tokens, i++);
             final y2 = currentY + _parseDouble(tokens, i++);
             final x = currentX + _parseDouble(tokens, i++);
             final y = currentY + _parseDouble(tokens, i++);
-            _addCubicBezier(vertices, currentX, currentY, x1, y1, x2, y2, x, y, transform);
+            _addCubicBezier(currentVertices, currentX, currentY, x1, y1, x2, y2,
+                x, y, transform);
             lastControlX = x2;
             lastControlY = y2;
             currentX = x;
@@ -590,13 +797,15 @@ class SvgParser {
           break;
         case 'S':
           if (_hasNumericTokens(tokens, i, 4)) {
+            ensureSubpathStarted();
             final x1 = 2 * currentX - lastControlX;
             final y1 = 2 * currentY - lastControlY;
             final x2 = _parseDouble(tokens, i++);
             final y2 = _parseDouble(tokens, i++);
             final x = _parseDouble(tokens, i++);
             final y = _parseDouble(tokens, i++);
-            _addCubicBezier(vertices, currentX, currentY, x1, y1, x2, y2, x, y, transform);
+            _addCubicBezier(currentVertices, currentX, currentY, x1, y1, x2, y2,
+                x, y, transform);
             lastControlX = x2;
             lastControlY = y2;
             currentX = x;
@@ -605,13 +814,15 @@ class SvgParser {
           break;
         case 's':
           if (_hasNumericTokens(tokens, i, 4)) {
+            ensureSubpathStarted();
             final x1 = 2 * currentX - lastControlX;
             final y1 = 2 * currentY - lastControlY;
             final x2 = currentX + _parseDouble(tokens, i++);
             final y2 = currentY + _parseDouble(tokens, i++);
             final x = currentX + _parseDouble(tokens, i++);
             final y = currentY + _parseDouble(tokens, i++);
-            _addCubicBezier(vertices, currentX, currentY, x1, y1, x2, y2, x, y, transform);
+            _addCubicBezier(currentVertices, currentX, currentY, x1, y1, x2, y2,
+                x, y, transform);
             lastControlX = x2;
             lastControlY = y2;
             currentX = x;
@@ -620,11 +831,13 @@ class SvgParser {
           break;
         case 'Q':
           if (_hasNumericTokens(tokens, i, 4)) {
+            ensureSubpathStarted();
             final x1 = _parseDouble(tokens, i++);
             final y1 = _parseDouble(tokens, i++);
             final x = _parseDouble(tokens, i++);
             final y = _parseDouble(tokens, i++);
-            _addQuadraticBezier(vertices, currentX, currentY, x1, y1, x, y, transform);
+            _addQuadraticBezier(
+                currentVertices, currentX, currentY, x1, y1, x, y, transform);
             lastControlX = x1;
             lastControlY = y1;
             currentX = x;
@@ -633,11 +846,13 @@ class SvgParser {
           break;
         case 'q':
           if (_hasNumericTokens(tokens, i, 4)) {
+            ensureSubpathStarted();
             final x1 = currentX + _parseDouble(tokens, i++);
             final y1 = currentY + _parseDouble(tokens, i++);
             final x = currentX + _parseDouble(tokens, i++);
             final y = currentY + _parseDouble(tokens, i++);
-            _addQuadraticBezier(vertices, currentX, currentY, x1, y1, x, y, transform);
+            _addQuadraticBezier(
+                currentVertices, currentX, currentY, x1, y1, x, y, transform);
             lastControlX = x1;
             lastControlY = y1;
             currentX = x;
@@ -646,11 +861,13 @@ class SvgParser {
           break;
         case 'T':
           if (_hasNumericTokens(tokens, i, 2)) {
+            ensureSubpathStarted();
             final x1 = 2 * currentX - lastControlX;
             final y1 = 2 * currentY - lastControlY;
             final x = _parseDouble(tokens, i++);
             final y = _parseDouble(tokens, i++);
-            _addQuadraticBezier(vertices, currentX, currentY, x1, y1, x, y, transform);
+            _addQuadraticBezier(
+                currentVertices, currentX, currentY, x1, y1, x, y, transform);
             lastControlX = x1;
             lastControlY = y1;
             currentX = x;
@@ -659,11 +876,13 @@ class SvgParser {
           break;
         case 't':
           if (_hasNumericTokens(tokens, i, 2)) {
+            ensureSubpathStarted();
             final x1 = 2 * currentX - lastControlX;
             final y1 = 2 * currentY - lastControlY;
             final x = currentX + _parseDouble(tokens, i++);
             final y = currentY + _parseDouble(tokens, i++);
-            _addQuadraticBezier(vertices, currentX, currentY, x1, y1, x, y, transform);
+            _addQuadraticBezier(
+                currentVertices, currentX, currentY, x1, y1, x, y, transform);
             lastControlX = x1;
             lastControlY = y1;
             currentX = x;
@@ -672,8 +891,8 @@ class SvgParser {
           break;
         case 'A':
         case 'a':
-          // Arc - simplified approximation
           if (_hasNumericTokens(tokens, i, 7)) {
+            ensureSubpathStarted();
             final rx = _parseDouble(tokens, i++).abs();
             final ry = _parseDouble(tokens, i++).abs();
             final xRotation = _parseDouble(tokens, i++);
@@ -687,7 +906,8 @@ class SvgParser {
               x = currentX + _parseDouble(tokens, i++);
               y = currentY + _parseDouble(tokens, i++);
             }
-            _addArc(vertices, currentX, currentY, rx, ry, xRotation, largeArc, sweep, x, y, transform);
+            _addArc(currentVertices, currentX, currentY, rx, ry, xRotation,
+                largeArc, sweep, x, y, transform);
             currentX = x;
             currentY = y;
           }
@@ -696,26 +916,78 @@ class SvgParser {
         case 'z':
           currentX = startX;
           currentY = startY;
+          _commitSubpath(currentVertices, subpaths);
+          currentVertices = <double>[];
           break;
         default:
           break;
       }
-      
+
       if (!['C', 'c', 'S', 's', 'Q', 'q', 'T', 't'].contains(command)) {
         lastControlX = currentX;
         lastControlY = currentY;
       }
-      
+
       lastCommand = command;
     }
-    
-    return vertices;
+
+    _commitSubpath(currentVertices, subpaths);
+    return subpaths;
+  }
+
+  void _commitSubpath(List<double> raw, List<List<double>> out) {
+    if (raw.length < 6) return;
+
+    final cleaned = <double>[];
+    for (int i = 0; i + 1 < raw.length; i += 2) {
+      final x = raw[i];
+      final y = raw[i + 1];
+      if (!x.isFinite || !y.isFinite) continue;
+
+      if (cleaned.length >= 2) {
+        final lastX = cleaned[cleaned.length - 2];
+        final lastY = cleaned[cleaned.length - 1];
+        if ((x - lastX).abs() <= 1e-9 && (y - lastY).abs() <= 1e-9) {
+          continue;
+        }
+      }
+      cleaned.add(x);
+      cleaned.add(y);
+    }
+
+    if (cleaned.length < 6) return;
+
+    final firstX = cleaned[0];
+    final firstY = cleaned[1];
+    final lastX = cleaned[cleaned.length - 2];
+    final lastY = cleaned[cleaned.length - 1];
+    if ((firstX - lastX).abs() <= 1e-9 && (firstY - lastY).abs() <= 1e-9) {
+      cleaned.removeRange(cleaned.length - 2, cleaned.length);
+    }
+
+    if (cleaned.length < 6) return;
+
+    double area2 = 0.0;
+    final n = cleaned.length ~/ 2;
+    for (int i = 0; i < n; i++) {
+      final j = (i + 1) % n;
+      final x0 = cleaned[i * 2];
+      final y0 = cleaned[i * 2 + 1];
+      final x1 = cleaned[j * 2];
+      final y1 = cleaned[j * 2 + 1];
+      area2 += (x0 * y1) - (y0 * x1);
+    }
+    if (area2.abs() <= 1e-9) return;
+
+    out.add(cleaned);
   }
 
   /// Tokenize path data
   List<String> _tokenizePathData(String pathData) {
     final tokens = <String>[];
-    final regex = RegExp(r'([MmLlHhVvCcSsQqTtAaZz])|(-?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)');
+    final regex = RegExp(
+      r'([MmLlHhVvCcSsQqTtAaZz])|([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)',
+    );
     for (final match in regex.allMatches(pathData)) {
       tokens.add(match.group(0)!);
     }
@@ -740,8 +1012,16 @@ class SvgParser {
   }
 
   /// Add cubic bezier as line segments
-  void _addCubicBezier(List<double> vertices, double x0, double y0,
-      double x1, double y1, double x2, double y2, double x3, double y3,
+  void _addCubicBezier(
+      List<double> vertices,
+      double x0,
+      double y0,
+      double x1,
+      double y1,
+      double x2,
+      double y2,
+      double x3,
+      double y3,
       Matrix2D transform) {
     const steps = 16;
     for (int i = 1; i <= steps; i++) {
@@ -771,9 +1051,18 @@ class SvgParser {
   }
 
   /// Add arc approximation
-  void _addArc(List<double> vertices, double x0, double y0,
-      double rx, double ry, double xRotation, bool largeArc, bool sweep,
-      double x1, double y1, Matrix2D transform) {
+  void _addArc(
+      List<double> vertices,
+      double x0,
+      double y0,
+      double rx,
+      double ry,
+      double xRotation,
+      bool largeArc,
+      bool sweep,
+      double x1,
+      double y1,
+      Matrix2D transform) {
     // Simple line approximation for arcs
     // A full implementation would use the endpoint parameterization
     const steps = 16;
@@ -788,11 +1077,12 @@ class SvgParser {
   /// Parse points attribute
   List<double> _parsePoints(String points, Matrix2D transform) {
     final vertices = <double>[];
-    final nums = points.split(RegExp(r'[\s,]+'))
+    final nums = points
+        .split(RegExp(r'[\s,]+'))
         .where((s) => s.isNotEmpty)
         .map((s) => double.tryParse(s))
         .toList();
-    
+
     for (int i = 0; i < nums.length - 1; i += 2) {
       if (nums[i] != null && nums[i + 1] != null) {
         vertices.addAll(transform.transform(nums[i]!, nums[i + 1]!));
@@ -804,53 +1094,53 @@ class SvgParser {
   /// Parse rect element
   List<double> _parseRect(String tagContent, Matrix2D transform) {
     final vertices = <double>[];
-    
+
     double x = 0, y = 0, w = 0, h = 0;
-    
-    final xMatch = RegExp(r'(?:^|\s)x="([^"]+)"').firstMatch(tagContent);
-    final yMatch = RegExp(r'(?:^|\s)y="([^"]+)"').firstMatch(tagContent);
-    final wMatch = RegExp(r'width="([^"]+)"').firstMatch(tagContent);
-    final hMatch = RegExp(r'height="([^"]+)"').firstMatch(tagContent);
-    
-    if (xMatch != null) x = double.tryParse(xMatch.group(1)!) ?? 0;
-    if (yMatch != null) y = double.tryParse(yMatch.group(1)!) ?? 0;
-    if (wMatch != null) w = double.tryParse(wMatch.group(1)!) ?? 0;
-    if (hMatch != null) h = double.tryParse(hMatch.group(1)!) ?? 0;
-    
+
+    final xValue = _extractAttr(tagContent, 'x');
+    final yValue = _extractAttr(tagContent, 'y');
+    final wValue = _extractAttr(tagContent, 'width');
+    final hValue = _extractAttr(tagContent, 'height');
+
+    if (xValue != null) x = _parseLength(xValue, 0);
+    if (yValue != null) y = _parseLength(yValue, 0);
+    if (wValue != null) w = _parseLength(wValue, 0);
+    if (hValue != null) h = _parseLength(hValue, 0);
+
     if (w <= 0 || h <= 0) return vertices;
-    
+
     vertices.addAll(transform.transform(x, y));
     vertices.addAll(transform.transform(x + w, y));
     vertices.addAll(transform.transform(x + w, y + h));
     vertices.addAll(transform.transform(x, y + h));
-    
+
     return vertices;
   }
 
   /// Parse circle/ellipse element
-  List<double> _parseEllipse(String tagContent, Matrix2D transform, bool isCircle) {
+  List<double> _parseEllipse(
+      String tagContent, Matrix2D transform, bool isCircle) {
     final vertices = <double>[];
-    
+
     double cx = 0, cy = 0, rx = 0, ry = 0;
-    
-    final cxMatch = RegExp(r'cx="([^"]+)"').firstMatch(tagContent);
-    final cyMatch = RegExp(r'cy="([^"]+)"').firstMatch(tagContent);
-    
-    if (cxMatch != null) cx = double.tryParse(cxMatch.group(1)!) ?? 0;
-    if (cyMatch != null) cy = double.tryParse(cyMatch.group(1)!) ?? 0;
-    
+
+    final cxValue = _extractAttr(tagContent, 'cx');
+    final cyValue = _extractAttr(tagContent, 'cy');
+    if (cxValue != null) cx = _parseLength(cxValue, 0);
+    if (cyValue != null) cy = _parseLength(cyValue, 0);
+
     if (isCircle) {
-      final rMatch = RegExp(r'(?:^|\s)r="([^"]+)"').firstMatch(tagContent);
-      if (rMatch != null) rx = ry = double.tryParse(rMatch.group(1)!) ?? 0;
+      final rValue = _extractAttr(tagContent, 'r');
+      if (rValue != null) rx = ry = _parseLength(rValue, 0);
     } else {
-      final rxMatch = RegExp(r'rx="([^"]+)"').firstMatch(tagContent);
-      final ryMatch = RegExp(r'ry="([^"]+)"').firstMatch(tagContent);
-      if (rxMatch != null) rx = double.tryParse(rxMatch.group(1)!) ?? 0;
-      if (ryMatch != null) ry = double.tryParse(ryMatch.group(1)!) ?? 0;
+      final rxValue = _extractAttr(tagContent, 'rx');
+      final ryValue = _extractAttr(tagContent, 'ry');
+      if (rxValue != null) rx = _parseLength(rxValue, 0);
+      if (ryValue != null) ry = _parseLength(ryValue, 0);
     }
-    
+
     if (rx <= 0 || ry <= 0) return vertices;
-    
+
     const steps = 32;
     for (int i = 0; i < steps; i++) {
       final angle = 2 * math.pi * i / steps;
@@ -858,7 +1148,7 @@ class SvgParser {
       final y = cy + ry * math.sin(angle);
       vertices.addAll(transform.transform(x, y));
     }
-    
+
     return vertices;
   }
 }

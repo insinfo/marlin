@@ -69,24 +69,57 @@ class Blend2DRasterizer {
     _areas.fillRange(0, _areas.length, 0);
   }
 
-  Future<void> drawPolygon(List<double> vertices, int color) async {
+  Future<void> drawPolygon(
+    List<double> vertices,
+    int color, {
+    int? windingRule,
+    List<int>? contourVertexCounts,
+  }) async {
     if (vertices.length < 6) return;
+    if (windingRule != null) fillRule = windingRule;
 
     // Fase 1: Geometria (Rápida, mantida na thread principal)
     // Paralelizar isso é complexo devido à natureza sequencial das arestas
     final n = vertices.length ~/ 2;
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      _rasterizeEdge(
-        vertices[i * 2],
-        vertices[i * 2 + 1],
-        vertices[j * 2],
-        vertices[j * 2 + 1],
-      );
+    final contours = _resolveContours(n, contourVertexCounts);
+    for (final contour in contours) {
+      if (contour.count < 3) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        _rasterizeEdge(
+          vertices[i * 2],
+          vertices[i * 2 + 1],
+          vertices[j * 2],
+          vertices[j * 2 + 1],
+        );
+      }
     }
 
     // Fase 2: Resolução (O gargalo, onde aplicamos SIMD e Isolates)
     await _resolve(color);
+  }
+
+  List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+    if (counts == null || counts.isEmpty) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+
+    int consumed = 0;
+    final out = <_ContourSpan>[];
+    for (final raw in counts) {
+      if (raw <= 0) continue;
+      if (consumed + raw > totalPoints) {
+        return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+      }
+      out.add(_ContourSpan(consumed, raw));
+      consumed += raw;
+    }
+
+    if (out.isEmpty || consumed != totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    return out;
   }
 
   void _rasterizeEdge(double x0, double y0, double x1, double y1) {
@@ -131,8 +164,9 @@ class Blend2DRasterizer {
   }
 
   void _addSegment(int y, double x0, double y0, double x1, double y1, int dir) {
-    double dy = (y1 - y0);
-    int distY = (dy * kCovOne).toInt() * dir;
+    final int y0Fixed = (y0 * kCovOne).round();
+    final int y1Fixed = (y1 * kCovOne).round();
+    final int distY = (y1Fixed - y0Fixed) * dir;
     if (distY == 0) return;
 
     // Otimização: Aresta vertical simples alinhada
@@ -154,7 +188,7 @@ class Blend2DRasterizer {
       // Aqui usamos a fórmula simplificada do Blend2D: Area += dy * (x0 + x1 - 2*ix) * 0.5
       // Mas para manter compatibilidade com sua lógica anterior:
       int areaVal =
-          (distY * (xAvg * kCovOne)).toInt() >> kCovShift; // Ajuste de escala
+          (distY * (xAvg * kCovOne)).round() >> kCovShift; // Ajuste de escala
 
       _covers[rowOffset + ix0] += distY;
       _areas[rowOffset + ix0] += areaVal;
@@ -168,20 +202,22 @@ class Blend2DRasterizer {
       int currIX = ix0;
 
       // Usamos acumuladores de ponto fixo para evitar erro de arredondamento (winding error)
-      int currYFixed = ((y0 - y) * kCovOne).toInt();
+      int currYFixed = y0Fixed;
+      int consumedDistY = 0;
 
       while (currIX != ix1) {
         // Intersecção com a próxima borda vertical
         final double t = (borderX - x0) / dx;
         final double nextY = y0 + t * (y1 - y0);
 
-        final int nextYFixed = ((nextY - y) * kCovOne).toInt();
+        final int nextYFixed = (nextY * kCovOne).round();
         final int distYLocal = (nextYFixed - currYFixed) * dir;
+        consumedDistY += distYLocal;
         currYFixed = nextYFixed;
 
         final double xAvgLocal = (currX0 + borderX) * 0.5 - currIX;
         final int areaValLocal =
-            (distYLocal * (xAvgLocal * kCovOne)).toInt() >> kCovShift;
+            (distYLocal * (xAvgLocal * kCovOne)).round() >> kCovShift;
 
         _covers[rowOffset + currIX] += distYLocal;
         _areas[rowOffset + currIX] += areaValLocal;
@@ -192,11 +228,10 @@ class Blend2DRasterizer {
       }
 
       // Último pixel da série
-      final int lastYFixed = ((y1 - y) * kCovOne).toInt();
-      final int distYLocal = (lastYFixed - currYFixed) * dir;
+      final int distYLocal = distY - consumedDistY;
       final double xAvgLocal = (currX0 + x1) * 0.5 - ix1;
       final int areaValLocal =
-          (distYLocal * (xAvgLocal * kCovOne)).toInt() >> kCovShift;
+          (distYLocal * (xAvgLocal * kCovOne)).round() >> kCovShift;
 
       _covers[rowOffset + ix1] += distYLocal;
       _areas[rowOffset + ix1] += areaValLocal;
@@ -245,48 +280,49 @@ class Blend2DRasterizer {
           Int32List.sublistView(_areas, startOffset, startOffset + length);
 
       // Prepara a fatia do framebuffer atual para blending
-      var sliceFb = Uint32List.sublistView(_framebuffer, startOffset, startOffset + length);
+      var sliceFb = Uint32List.sublistView(
+          _framebuffer, startOffset, startOffset + length);
 
       // Dispara o Isolate
-    futures.add(Isolate.run(() {
-      // Criar uma cópia local para o Isolate trabalhar.
-      // Usamos Uint32List.fromList para manter o que já foi desenhado (composição).
-      final localFb = Uint32List.fromList(sliceFb);
+      futures.add(Isolate.run(() {
+        // Criar uma cópia local para o Isolate trabalhar.
+        // Usamos Uint32List.fromList para manter o que já foi desenhado (composição).
+        final localFb = Uint32List.fromList(sliceFb);
 
-      _resolveSlice(ResolveSliceDTO(
-        width: width,
-        startLine: 0,
-        endLine: endY - startY,
-        covers: sliceCovers,
-        areas: sliceAreas,
-        framebuffer: localFb,
-        color: color,
-        fillRule: fillRule,
-        useSimd: config.useSimd,
-      ));
-      return localFb;
-    }));
+        _resolveSlice(ResolveSliceDTO(
+          width: width,
+          startLine: 0,
+          endLine: endY - startY,
+          covers: sliceCovers,
+          areas: sliceAreas,
+          framebuffer: localFb,
+          color: color,
+          fillRule: fillRule,
+          useSimd: config.useSimd,
+        ));
+        return localFb;
+      }));
+    }
+
+    final results = await Future.wait(futures);
+
+    // Remonta o framebuffer principal
+    int currentOffset = 0;
+    for (var chunk in results) {
+      _framebuffer.setAll(currentOffset, chunk);
+      currentOffset += chunk.length;
+    }
+
+    // CORREÇÃO: Limpeza dos Buffers Originais (Corrige o "Retângulo Furado")
+    // .fillRange é extremamente rápido.
+    _covers.fillRange(0, _covers.length, 0);
+    _areas.fillRange(0, _areas.length, 0);
   }
-
-  final results = await Future.wait(futures);
-
-  // Remonta o framebuffer principal
-  int currentOffset = 0;
-  for (var chunk in results) {
-    _framebuffer.setAll(currentOffset, chunk);
-    currentOffset += chunk.length;
-  }
-
-  // CORREÇÃO: Limpeza dos Buffers Originais (Corrige o "Retângulo Furado")
-  // .fillRange é extremamente rápido.
-  _covers.fillRange(0, _covers.length, 0);
-  _areas.fillRange(0, _areas.length, 0);
-}
 
   /// Função estática que executa a lógica de resolve.
   /// Pode rodar na main thread ou em um Isolate.
   static void _resolveSlice(ResolveSliceDTO dto) {
-    if (dto.useSimd) {
+    if (dto.useSimd && dto.fillRule == 1) {
       _resolveSimd(dto);
     } else {
       _resolveScalar(dto);
@@ -296,7 +332,8 @@ class Blend2DRasterizer {
   // --- IMPLEMENTAÇÃO ESCALAR ALTAMENTE OTIMIZADA ---
   static void _resolveScalar(ResolveSliceDTO dto) {
     final int width = dto.width;
-    final int height = dto.endLine; // endLine aqui é o número de linhas na fatia
+    final int height =
+        dto.endLine; // endLine aqui é o número de linhas na fatia
     final Int32List covers = dto.covers;
     final Int32List areas = dto.areas;
     final Uint32List fb = dto.framebuffer;
@@ -335,7 +372,7 @@ class Blend2DRasterizer {
               if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
             }
             int alpha = (absCover * 255) >> kCovShift;
-            if (alpha > 0) {
+            if (alpha > 1) {
               if (alpha > 255) alpha = 255;
               final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
               if (fAlpha > 0) {
@@ -370,7 +407,7 @@ class Blend2DRasterizer {
               if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
             }
             int alpha = (absCover * 255) >> kCovShift;
-            if (alpha > 0) {
+            if (alpha > 1) {
               if (alpha > 255) alpha = 255;
               final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
               if (fAlpha > 0) {
@@ -405,7 +442,7 @@ class Blend2DRasterizer {
               if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
             }
             int alpha = (absCover * 255) >> kCovShift;
-            if (alpha > 0) {
+            if (alpha > 1) {
               if (alpha > 255) alpha = 255;
               final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
               if (fAlpha > 0) {
@@ -440,7 +477,7 @@ class Blend2DRasterizer {
               if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
             }
             int alpha = (absCover * 255) >> kCovShift;
-            if (alpha > 0) {
+            if (alpha > 1) {
               if (alpha > 255) alpha = 255;
               final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
               if (fAlpha > 0) {
@@ -476,7 +513,7 @@ class Blend2DRasterizer {
             if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
           }
           int alpha = (absCover * 255) >> kCovShift;
-          if (alpha > 0) {
+          if (alpha > 1) {
             if (alpha > 255) alpha = 255;
             final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
             if (fAlpha > 0) {
@@ -515,8 +552,8 @@ class Blend2DRasterizer {
     // Views
     final coverView = dto.covers.buffer.asInt32x4List(
         dto.covers.offsetInBytes, dto.covers.lengthInBytes ~/ 16);
-    final areaView = dto.areas.buffer.asInt32x4List(
-        dto.areas.offsetInBytes, dto.areas.lengthInBytes ~/ 16);
+    final areaView = dto.areas.buffer
+        .asInt32x4List(dto.areas.offsetInBytes, dto.areas.lengthInBytes ~/ 16);
     // Acesso direto ao array de pixels para evitar getters/setters repetidos
     final fb = dto.framebuffer;
 
@@ -652,7 +689,7 @@ class Blend2DRasterizer {
 
         int alpha = (coverage.abs() * 255) >> kCovShift;
         if (alpha > 255) alpha = 255;
-        if (alpha > 0) {
+        if (alpha > 1) {
           _blendPixel(dto.framebuffer, idx, r, g, b, a, alpha);
         }
       }
@@ -698,4 +735,11 @@ class ResolveSliceDTO {
     required this.fillRule,
     required this.useSimd,
   });
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+
+  const _ContourSpan(this.start, this.count);
 }
