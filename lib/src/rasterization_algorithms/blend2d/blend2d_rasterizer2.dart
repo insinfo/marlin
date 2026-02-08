@@ -58,6 +58,7 @@ class Blend2DRasterizer2 {
   /// Constantes de ponto fixo (cobertura)
   static const int kCovShift = 8;
   static const int kCovOne = 1 << kCovShift;
+  static const int kMaskWordBits = 32;
 
   late final List<_Tile> _tiles;
 
@@ -104,6 +105,7 @@ class Blend2DRasterizer2 {
       t.fb.fillRange(0, t.fb.length, backgroundColor);
       t.covers.fillRange(0, t.covers.length, 0);
       t.areas.fillRange(0, t.areas.length, 0);
+      t.activeMask.fillRange(0, t.activeMask.length, 0);
       t.dirty = false;
     }
     _hasDirty = false;
@@ -275,6 +277,8 @@ class Blend2DRasterizer2 {
         useSimd: canUseSimd,
         covers: tile.covers,
         areas: tile.areas,
+        activeMask: tile.activeMask,
+        wordsPerRow: tile.wordsPerRow,
         fb: tile.fb,
       )));
     }
@@ -286,6 +290,7 @@ class Blend2DRasterizer2 {
       final tile = _tiles[r.tileIndex];
       tile.covers = r.covers;
       tile.areas = r.areas;
+      tile.activeMask = r.activeMask;
       tile.fb = r.fb;
       tile.dirty = false;
     }
@@ -391,6 +396,7 @@ class Blend2DRasterizer2 {
       final int idx = rowOffset + ix0;
       tile.covers[idx] += distY;
       tile.areas[idx] += areaVal;
+      _markCellActive(tile, localY, ix0);
       return;
     }
 
@@ -420,6 +426,7 @@ class Blend2DRasterizer2 {
       final int idx = rowOffset + currIX;
       tile.covers[idx] += distYLocal;
       tile.areas[idx] += areaValLocal;
+      _markCellActive(tile, localY, currIX);
 
       currX0 = borderX;
       currIX += step;
@@ -434,6 +441,15 @@ class Blend2DRasterizer2 {
     final int lastIdx = rowOffset + ix1;
     tile.covers[lastIdx] += distYLocal;
     tile.areas[lastIdx] += areaValLocal;
+    _markCellActive(tile, localY, ix1);
+  }
+
+  @pragma('vm:prefer-inline')
+  void _markCellActive(_Tile tile, int localY, int x) {
+    final int rowWordOffset = localY * tile.wordsPerRow;
+    final int word = x >> 5;
+    final int bit = x & 31;
+    tile.activeMask[rowWordOffset + word] |= (1 << bit);
   }
 
   _Tile _tileForY(int y) {
@@ -489,22 +505,127 @@ class Blend2DRasterizer2 {
     required int fillRule,
     required bool useSimd,
   }) {
-    final dto = _ResolveDTO(
+    _resolveMaskedScalar(tile: tile, color: color, fillRule: fillRule);
+  }
+
+  static void _resolveMaskedScalar({
+    required _Tile tile,
+    required int color,
+    required int fillRule,
+  }) {
+    _resolveMaskedBuffers(
       width: tile.width,
       height: tile.height,
       covers: tile.covers,
       areas: tile.areas,
-      framebuffer: tile.fb,
+      activeMask: tile.activeMask,
+      wordsPerRow: tile.wordsPerRow,
+      fb: tile.fb,
       color: color,
       fillRule: fillRule,
-      useSimd: useSimd,
     );
+  }
 
-    if (dto.useSimd) {
-      resolveSimd(dto);
-    } else {
-      resolveScalar(dto);
+  static void _resolveMaskedBuffers({
+    required int width,
+    required int height,
+    required Int32List covers,
+    required Int32List areas,
+    required Uint32List activeMask,
+    required int wordsPerRow,
+    required Uint32List fb,
+    required int color,
+    required int fillRule,
+  }) {
+    final int r = (color >> 16) & 0xFF;
+    final int g = (color >> 8) & 0xFF;
+    final int b = color & 0xFF;
+    final int a = (color >> 24) & 0xFF;
+
+    for (int y = 0; y < height; y++) {
+      final int rowWordOffset = y * wordsPerRow;
+      int firstWord = -1;
+      int lastWord = -1;
+
+      for (int w = 0; w < wordsPerRow; w++) {
+        final int word = activeMask[rowWordOffset + w];
+        if (word != 0) {
+          if (firstWord < 0) firstWord = w;
+          lastWord = w;
+        }
+      }
+
+      if (firstWord < 0) continue;
+
+      final int firstX = (firstWord << 5) +
+          _firstSetBit(activeMask[rowWordOffset + firstWord]);
+      int lastX =
+          (lastWord << 5) + _lastSetBit(activeMask[rowWordOffset + lastWord]);
+      if (lastX >= width) lastX = width - 1;
+
+      activeMask.fillRange(rowWordOffset, rowWordOffset + wordsPerRow, 0);
+
+      int cellAcc = 0;
+      final int rowOffset = y * width;
+      for (int x = firstX; x < width; x++) {
+        final int idx = rowOffset + x;
+        final int cv = covers[idx];
+        final int ar = areas[idx];
+        covers[idx] = 0;
+        areas[idx] = 0;
+
+        final int cell0 = cv - ar;
+        final int cell1 = ar;
+        cellAcc += cell0;
+        final int coverage = cellAcc;
+        cellAcc += cell1;
+
+        if (coverage != 0 || cv != 0 || ar != 0) {
+          int absCover = coverage;
+          final int mask = absCover >> 31;
+          absCover = (absCover ^ mask) - mask;
+
+          if (fillRule == 0) {
+            absCover &= (kCovOne * 2) - 1;
+            if (absCover > kCovOne) absCover = (kCovOne * 2) - absCover;
+          }
+
+          int alpha = (absCover * 255) >> kCovShift;
+          if (alpha > 1) {
+            if (alpha > 255) alpha = 255;
+            final int fAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
+            if (fAlpha > 0) {
+              final int bg = fb[idx];
+              final int bgR = (bg >> 16) & 0xFF;
+              final int bgG = (bg >> 8) & 0xFF;
+              final int bgB = bg & 0xFF;
+              fb[idx] = 0xFF000000 |
+                  (((bgR + (((r - bgR) * fAlpha) >> 8)) & 0xFF) << 16) |
+                  (((bgG + (((g - bgG) * fAlpha) >> 8)) & 0xFF) << 8) |
+                  ((bgB + (((b - bgB) * fAlpha) >> 8)) & 0xFF);
+            }
+          }
+        }
+
+        if (x > lastX && cellAcc == 0) {
+          break;
+        }
+      }
     }
+  }
+
+  static int _firstSetBit(int word) {
+    for (int i = 0; i < 32; i++) {
+      if (((word >> i) & 1) != 0) return i;
+    }
+    return 0;
+  }
+
+  static int _lastSetBit(int word) {
+    for (int i = 31; i >= 0; i--) {
+      if (((word >> i) & 1) != 0) return i;
+    }
+    return 0;
   }
 
   // DTO interno para resolve.
@@ -849,14 +970,19 @@ class _Tile {
   // buffers (podem ser substituídos ao voltar do isolate)
   Int32List covers;
   Int32List areas;
+  Uint32List activeMask;
+  final int wordsPerRow;
   Uint32List fb;
 
   _Tile({
     required this.startY,
     required this.height,
     required this.width,
-  })  : covers = Int32List(width * height),
+  })  : wordsPerRow = (width + (Blend2DRasterizer2.kMaskWordBits - 1)) >> 5,
+        covers = Int32List(width * height),
         areas = Int32List(width * height),
+        activeMask = Uint32List(
+            ((width + (Blend2DRasterizer2.kMaskWordBits - 1)) >> 5) * height),
         fb = Uint32List(width * height);
 }
 
@@ -898,6 +1024,8 @@ class _TileJob {
   final bool useSimd;
   final Int32List covers;
   final Int32List areas;
+  final Uint32List activeMask;
+  final int wordsPerRow;
   final Uint32List fb;
 
   _TileJob({
@@ -909,6 +1037,8 @@ class _TileJob {
     required this.useSimd,
     required this.covers,
     required this.areas,
+    required this.activeMask,
+    required this.wordsPerRow,
     required this.fb,
   });
 }
@@ -917,12 +1047,14 @@ class _TileResult {
   final int tileIndex;
   final Int32List covers;
   final Int32List areas;
+  final Uint32List activeMask;
   final Uint32List fb;
 
   _TileResult({
     required this.tileIndex,
     required this.covers,
     required this.areas,
+    required this.activeMask,
     required this.fb,
   });
 }
@@ -957,16 +1089,20 @@ class _IsolatePool {
 
         final TransferableTypedData tC = msg['covers'] as TransferableTypedData;
         final TransferableTypedData tA = msg['areas'] as TransferableTypedData;
+        final TransferableTypedData tM =
+            msg['activeMask'] as TransferableTypedData;
         final TransferableTypedData tF = msg['fb'] as TransferableTypedData;
 
         final covers = _materializeInt32List(tC);
         final areas = _materializeInt32List(tA);
+        final activeMask = _materializeUint32List(tM);
         final fb = _materializeUint32List(tF);
 
         completer.complete(_TileResult(
           tileIndex: tileIndex,
           covers: covers,
           areas: areas,
+          activeMask: activeMask,
           fb: fb,
         ));
       }
@@ -1055,6 +1191,7 @@ class _Worker {
       'color': job.color,
       'fillRule': job.fillRule,
       'useSimd': job.useSimd,
+      'wordsPerRow': job.wordsPerRow,
       'covers': TransferableTypedData.fromList([
         job.covers.buffer
             .asUint8List(job.covers.offsetInBytes, job.covers.lengthInBytes)
@@ -1062,6 +1199,10 @@ class _Worker {
       'areas': TransferableTypedData.fromList([
         job.areas.buffer
             .asUint8List(job.areas.offsetInBytes, job.areas.lengthInBytes)
+      ]),
+      'activeMask': TransferableTypedData.fromList([
+        job.activeMask.buffer.asUint8List(
+            job.activeMask.offsetInBytes, job.activeMask.lengthInBytes)
       ]),
       'fb': TransferableTypedData.fromList([
         job.fb.buffer.asUint8List(job.fb.offsetInBytes, job.fb.lengthInBytes)
@@ -1102,20 +1243,26 @@ void _workerMain(SendPort readyPort) {
     final int height = msg['height'] as int;
     final int color = msg['color'] as int;
     final int fillRule = msg['fillRule'] as int;
-    final bool useSimd = msg['useSimd'] as bool;
+    // Ignorado no worker: resolve paralelo usa caminho mascarado.
+    msg['useSimd'] as bool;
+    final int wordsPerRow = msg['wordsPerRow'] as int;
 
     try {
       final TransferableTypedData tC = msg['covers'] as TransferableTypedData;
       final TransferableTypedData tA = msg['areas'] as TransferableTypedData;
+      final TransferableTypedData tM =
+          msg['activeMask'] as TransferableTypedData;
       final TransferableTypedData tF = msg['fb'] as TransferableTypedData;
 
       // ✅ Materialize com await conforme solicitado para garantir integridade
       final ByteBuffer coversBuffer = await (tC.materialize() as dynamic);
       final ByteBuffer areasBuffer = await (tA.materialize() as dynamic);
+      final ByteBuffer activeMaskBuffer = await (tM.materialize() as dynamic);
       final ByteBuffer fbBuffer = await (tF.materialize() as dynamic);
 
       final ByteData coversBd = ByteData.view(coversBuffer);
       final ByteData areasBd = ByteData.view(areasBuffer);
+      final ByteData activeMaskBd = ByteData.view(activeMaskBuffer);
       final ByteData fbBd = ByteData.view(fbBuffer);
 
       final Int32List covers = coversBd.buffer.asInt32List(
@@ -1126,35 +1273,34 @@ void _workerMain(SendPort readyPort) {
         areasBd.offsetInBytes,
         areasBd.lengthInBytes ~/ 4,
       );
+      final Uint32List activeMask = activeMaskBd.buffer.asUint32List(
+        activeMaskBd.offsetInBytes,
+        activeMaskBd.lengthInBytes ~/ 4,
+      );
       final Uint32List fb = fbBd.buffer.asUint32List(
         fbBd.offsetInBytes,
         fbBd.lengthInBytes ~/ 4,
       );
 
-      final bool canSimd = useSimd;
-
-      final dto = _ResolveDTO(
+      // Path com isolate usa resolve mascarado para preservar o ganho de bitset.
+      Blend2DRasterizer2._resolveMaskedBuffers(
         width: width,
         height: height,
         covers: covers,
         areas: areas,
-        framebuffer: fb,
+        activeMask: activeMask,
+        wordsPerRow: wordsPerRow,
+        fb: fb,
         color: color,
         fillRule: fillRule,
-        useSimd: canSimd,
       );
-
-      if (dto.useSimd) {
-        Blend2DRasterizer2.resolveSimd(dto);
-      } else {
-        Blend2DRasterizer2.resolveScalar(dto);
-      }
 
       replyTo.send(<String, Object?>{
         'id': id,
         'tileIndex': tileIndex,
         'covers': _ttdFromInt32List(covers),
         'areas': _ttdFromInt32List(areas),
+        'activeMask': _ttdFromUint32List(activeMask),
         'fb': _ttdFromUint32List(fb),
         'err': null,
       });

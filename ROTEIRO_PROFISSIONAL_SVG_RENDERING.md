@@ -32,6 +32,13 @@ entre outros
 - [x] `Skia scanline`: fast-path de AET com insercao ordenada + verificacao de ordenacao, evitando sort completo quando a lista ja esta ordenada.
 - [x] `Marlin`: `drawPolygon` agora aceita `contourVertexCounts` e renderiza subpaths separados (corrige geometria com furos/contornos em SVG real, removendo artefato diagonal no sapo).
 - [x] Limpeza de warnings do analyzer nos arquivos de benchmark/svg/parser/edge_flag/marlin.
+- [x] `Blend2D v2`: packing de celulas ativas por linha (bitmask) no caminho serial para pular linhas vazias e iniciar resolve no primeiro x ativo.
+- [x] `Skia scanline`: bucketizacao por tile-Y (32px) para pular tiles sem arestas iniciando quando AET esta vazia.
+- [x] `Marlin`: ajuste de ciclo de subpath (`moveTo`/`closePath`) para nao fechar caminho inexistente no primeiro `moveTo` (remove cortes espurios).
+- [x] Benchmark SVG agora emite contornos (`stroke`) como geometria de preenchimento, tornando visivel o contorno do tigre em todos os backends.
+- [x] `MarlinCache`: correcao de limpeza da faixa de tiles tocados em `resetTileLine` (remove limpeza incorreta que podia deixar residuos visuais).
+- [x] Stroker central do benchmark migrado de "quad por segmento" para "anel por contorno" com join miter/bevel (reduz emendas visuais e custo de geometria de stroke).
+- [x] `Blend2D v2` com isolates agora usa o mesmo resolve mascarado por bitset de celulas ativas (paridade com caminho serial).
 
 Medicoes observadas (benchmark `benchmark/svg_render_benchmark.dart`):
 - DAA em `Ghostscript_Tiger`: ~8594ms -> ~95ms.
@@ -44,6 +51,9 @@ Observacao:
 - Estado atual Blend2D (apos ajustes numericos): banding horizontal caiu e ficou mais estavel entre scalar/SIMD, mas ainda ha resquicio fraco em fundos planos.
 - Estado atual Blend2D: `B2D_v2` com `evenodd` agora roda em scalar e SIMD com mesma regra de fill; proxima etapa e aproximar layout/resolve de celulas ao `cell_merge` original para reduzir diferencas residuais.
 - Estado atual Blend2D: `B2D_v2` ja usa resolve no estilo 2-canais (cell-merge-like) e ficou mais proximo da referencia; proximo passo e portar packing/bitmasks de celulas para reduzir custo de resolve e alinhar ainda mais com o Blend2D original.
+- Estado atual Blend2D: packing/bitmask ja ativo no resolve serial; proximo passo e estender o mesmo esquema para o caminho com isolates (serializacao de bitmask + resolve paralelo com mascaras).
+- Estado atual strokes: suporte atual e de benchmark (stroke-to-fill simplificado por segmento, join/cap basicos). Proximo passo e mover esse pipeline para IR de path/stroker central para qualidade de join/cap igual entre backends.
+- Estado atual strokes: benchmark ja usa stroker de anel por contorno (miter/bevel). Proximo passo e suportar caps/joins completos por estilo SVG (`linecap`, `linejoin`, `miterlimit`) no IR central.
 
 Proximo foco imediato:
 - Corrigir `banding` horizontal do Blend2D (`_addSegment`/conservacao de cobertura em clipping horizontal) e validar contra referencia.

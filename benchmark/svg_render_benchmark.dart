@@ -13,6 +13,7 @@ library benchmark;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:marlin/marlin.dart';
@@ -43,6 +44,13 @@ class PreparedPolygon {
     this.windingRule, {
     this.contourVertexCounts,
   });
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+
+  const _ContourSpan(this.start, this.count);
 }
 
 abstract class RasterizerAdapter {
@@ -76,20 +84,190 @@ List<PreparedPolygon> _preparePolygons(
   final prepared = <PreparedPolygon>[];
   for (final poly in polygons) {
     if (poly.vertices.length < 6) continue;
-    final color = poly.fillColor;
-    if (((color >> 24) & 0xFF) == 0) continue;
-
     final scaled = _scaleVertices(poly.vertices, scaleX, scaleY);
-    // Map poly.evenOdd (bool) to int. EvenOdd=0, NonZero=1
     final windingRule = poly.evenOdd ? 0 : 1;
-    prepared.add(PreparedPolygon(
-      scaled,
-      color,
-      windingRule,
-      contourVertexCounts: poly.contourVertexCounts,
-    ));
+
+    final fillColor = poly.fillColor;
+    if (((fillColor >> 24) & 0xFF) != 0) {
+      prepared.add(PreparedPolygon(
+        scaled,
+        fillColor,
+        windingRule,
+        contourVertexCounts: poly.contourVertexCounts,
+      ));
+    }
+
+    final strokeAlpha = (poly.strokeColor >> 24) & 0xFF;
+    if (strokeAlpha != 0 && poly.strokeWidth > 0.0) {
+      final strokePx = poly.strokeWidth * ((scaleX.abs() + scaleY.abs()) * 0.5);
+      if (strokePx > 0.0) {
+        _appendStrokePolygons(
+          prepared: prepared,
+          vertices: scaled,
+          contourVertexCounts: poly.contourVertexCounts,
+          strokeColor: poly.strokeColor,
+          strokeWidthPx: strokePx,
+        );
+      }
+    }
   }
   return prepared;
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
+}
+
+void _appendStrokePolygons({
+  required List<PreparedPolygon> prepared,
+  required List<double> vertices,
+  required List<int>? contourVertexCounts,
+  required int strokeColor,
+  required double strokeWidthPx,
+}) {
+  final int pointCount = vertices.length ~/ 2;
+  final contours = _resolveContours(pointCount, contourVertexCounts);
+
+  for (final contour in contours) {
+    final ring = _buildStrokeRing(
+      vertices: vertices,
+      startPoint: contour.start,
+      count: contour.count,
+      halfWidth: strokeWidthPx * 0.5,
+      miterLimit: 4.0,
+    );
+    if (ring.isEmpty) continue;
+    prepared.add(PreparedPolygon(
+      ring,
+      strokeColor,
+      1,
+      contourVertexCounts: <int>[ring.length ~/ 2],
+    ));
+  }
+}
+
+List<double> _buildStrokeRing({
+  required List<double> vertices,
+  required int startPoint,
+  required int count,
+  required double halfWidth,
+  required double miterLimit,
+}) {
+  if (count < 3 || halfWidth <= 0) return const <double>[];
+  const eps = 1e-9;
+
+  final left = List<double>.filled(count * 2, 0.0);
+  final right = List<double>.filled(count * 2, 0.0);
+
+  for (int i = 0; i < count; i++) {
+    final prev = startPoint + ((i - 1 + count) % count);
+    final curr = startPoint + i;
+    final next = startPoint + ((i + 1) % count);
+
+    final px = vertices[prev * 2];
+    final py = vertices[prev * 2 + 1];
+    final cx = vertices[curr * 2];
+    final cy = vertices[curr * 2 + 1];
+    final nx = vertices[next * 2];
+    final ny = vertices[next * 2 + 1];
+
+    double inDx = cx - px;
+    double inDy = cy - py;
+    double outDx = nx - cx;
+    double outDy = ny - cy;
+
+    double inLen2 = inDx * inDx + inDy * inDy;
+    double outLen2 = outDx * outDx + outDy * outDy;
+
+    if (inLen2 <= eps && outLen2 <= eps) {
+      left[i * 2] = cx;
+      left[i * 2 + 1] = cy;
+      right[i * 2] = cx;
+      right[i * 2 + 1] = cy;
+      continue;
+    }
+    if (inLen2 <= eps) {
+      inDx = outDx;
+      inDy = outDy;
+      inLen2 = outLen2;
+    }
+    if (outLen2 <= eps) {
+      outDx = inDx;
+      outDy = inDy;
+      outLen2 = inLen2;
+    }
+
+    final invInLen = 1.0 / math.sqrt(inLen2);
+    final invOutLen = 1.0 / math.sqrt(outLen2);
+    inDx *= invInLen;
+    inDy *= invInLen;
+    outDx *= invOutLen;
+    outDy *= invOutLen;
+
+    final inNx = -inDy;
+    final inNy = inDx;
+    final outNx = -outDy;
+    final outNy = outDx;
+
+    double bisX = inNx + outNx;
+    double bisY = inNy + outNy;
+    final bisLen2 = bisX * bisX + bisY * bisY;
+
+    double offX;
+    double offY;
+
+    if (bisLen2 <= eps) {
+      offX = outNx * halfWidth;
+      offY = outNy * halfWidth;
+    } else {
+      final invBis = 1.0 / math.sqrt(bisLen2);
+      bisX *= invBis;
+      bisY *= invBis;
+      final denom = (bisX * outNx + bisY * outNy).abs();
+      double miterLen = halfWidth;
+      if (denom > eps) {
+        miterLen = halfWidth / denom;
+      }
+      final maxMiter = halfWidth * miterLimit;
+      if (miterLen > maxMiter) {
+        miterLen = maxMiter;
+      }
+      offX = bisX * miterLen;
+      offY = bisY * miterLen;
+    }
+
+    left[i * 2] = cx + offX;
+    left[i * 2 + 1] = cy + offY;
+    right[i * 2] = cx - offX;
+    right[i * 2 + 1] = cy - offY;
+  }
+
+  final ring = <double>[];
+  for (int i = 0; i < count; i++) {
+    ring.add(left[i * 2]);
+    ring.add(left[i * 2 + 1]);
+  }
+  for (int i = count - 1; i >= 0; i--) {
+    ring.add(right[i * 2]);
+    ring.add(right[i * 2 + 1]);
+  }
+  return ring;
 }
 
 List<double> _scaleVertices(

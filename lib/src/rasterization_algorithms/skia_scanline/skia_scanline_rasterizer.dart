@@ -1,6 +1,7 @@
 //C:\MyDartProjects\marlin\lib\src\rasterization_algorithms\skia_scanline\skia_scanline_rasterizer.dart
 
 import 'dart:typed_data';
+import 'dart:math' as math;
 
 /// Regra de preenchimento para o rasterizador
 enum FillRule { nonZero, evenOdd }
@@ -15,6 +16,8 @@ const int kFixedMask = kFixedOne - 1;
 const int kSubpixelBits = 3;
 const int kSubpixelCount = 1 << kSubpixelBits;
 const int kSubpixelMask = kSubpixelCount - 1;
+const int kTileYShift = 5; // 32px tile
+const int kTileYSize = 1 << kTileYShift;
 
 /// Representação de uma aresta para o algoritmo de scanline
 class SkEdge {
@@ -187,53 +190,68 @@ class SkiaRasterizer {
 
     final subHeight = height << kSubpixelBits;
     final edgeTable = List<SkEdge?>.filled(subHeight, null);
+    final tileCount = (height + kTileYSize - 1) >> kTileYShift;
+    final tileHasStarts = Uint8List(tileCount);
     for (final edge in edges) {
       final y = edge.fFirstY.clamp(0, subHeight - 1);
       edge.fNextY = edgeTable[y];
       edgeTable[y] = edge;
+      final int tileIdx = ((edge.fFirstY >> kSubpixelBits) >> kTileYShift)
+          .clamp(0, tileCount - 1);
+      tileHasStarts[tileIdx] = 1;
     }
 
     final aet = EdgeList();
     final startY = (minYSub >> kSubpixelBits).clamp(0, height - 1);
     final stopY = (maxYSub >> kSubpixelBits).clamp(0, height - 1);
+    final int startTile = startY >> kTileYShift;
+    final int stopTile = stopY >> kTileYShift;
 
-    for (int y = startY; y <= stopY; y++) {
-      _scanlineAccumulator.fillRange(0, width, 0);
-
-      for (int s = 0; s < kSubpixelCount; s++) {
-        final subY = (y << kSubpixelBits) + s;
-        if (subY >= subHeight) break;
-
-        // 1. Manutenção da AET
-        var e = edgeTable[subY];
-        while (e != null) {
-          final next = e.fNextY;
-          aet.addSorted(e);
-          e = next;
-        }
-        _removeFinished(aet, subY);
-        if (!_isAETSorted(aet.head)) {
-          aet.sort();
-        }
-
-        // 2. Preenchimento de sub-scanline
-        if (aet.head != null) {
-          if (useSimd) {
-            _fillSubScanlineSIMD(aet);
-          } else {
-            _fillSubScanlineScalar(aet);
-          }
-        }
-
-        // 3. Avançar para próxima sub-scanline
-        _advanceEdges(aet);
+    for (int tile = startTile; tile <= stopTile; tile++) {
+      final int tileY0 = math.max(startY, tile << kTileYShift);
+      final int tileY1 = math.min(stopY, ((tile + 1) << kTileYShift) - 1);
+      if (tileHasStarts[tile] == 0 && aet.head == null) {
+        continue;
       }
 
-      // 4. Blit final com AA
-      if (useSimd) {
-        _blitAccumulatedSIMD(y, color);
-      } else {
-        _blitAccumulatedScalar(y, color);
+      for (int y = tileY0; y <= tileY1; y++) {
+        _scanlineAccumulator.fillRange(0, width, 0);
+
+        for (int s = 0; s < kSubpixelCount; s++) {
+          final subY = (y << kSubpixelBits) + s;
+          if (subY >= subHeight) break;
+
+          // 1. Manutenção da AET
+          var e = edgeTable[subY];
+          while (e != null) {
+            final next = e.fNextY;
+            aet.addSorted(e);
+            e = next;
+          }
+          _removeFinished(aet, subY);
+          if (!_isAETSorted(aet.head)) {
+            aet.sort();
+          }
+
+          // 2. Preenchimento de sub-scanline
+          if (aet.head != null) {
+            if (useSimd) {
+              _fillSubScanlineSIMD(aet);
+            } else {
+              _fillSubScanlineScalar(aet);
+            }
+          }
+
+          // 3. Avançar para próxima sub-scanline
+          _advanceEdges(aet);
+        }
+
+        // 4. Blit final com AA
+        if (useSimd) {
+          _blitAccumulatedSIMD(y, color);
+        } else {
+          _blitAccumulatedScalar(y, color);
+        }
       }
     }
   }
