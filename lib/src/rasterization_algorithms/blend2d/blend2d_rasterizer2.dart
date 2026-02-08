@@ -505,7 +505,23 @@ class Blend2DRasterizer2 {
     required int fillRule,
     required bool useSimd,
   }) {
-    _resolveMaskedScalar(tile: tile, color: color, fillRule: fillRule);
+    if (useSimd) {
+      final dto = _ResolveDTO(
+        width: tile.width,
+        height: tile.height,
+        covers: tile.covers,
+        areas: tile.areas,
+        framebuffer: tile.fb,
+        color: color,
+        fillRule: fillRule,
+        useSimd: true,
+      );
+      resolveSimd(dto);
+      // No path SIMD, activeMask não é consumido. Limpamos para evitar lixo entre flushes.
+      tile.activeMask.fillRange(0, tile.activeMask.length, 0);
+    } else {
+      _resolveMaskedScalar(tile: tile, color: color, fillRule: fillRule);
+    }
   }
 
   static void _resolveMaskedScalar({
@@ -848,13 +864,13 @@ class Blend2DRasterizer2 {
         if (alphaInt > 1) {
           final int idx = rowOffset + x;
           final int bg = fb[idx];
-          final int finalAlpha = (alphaInt * a) >> 8;
-          final int invAlpha = 255 - finalAlpha;
-          final int outR =
-              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG =
-              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
-          final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
+          final int bgR = (bg >> 16) & 0xFF;
+          final int bgG = (bg >> 8) & 0xFF;
+          final int bgB = bg & 0xFF;
+          final int finalAlpha = (a == 255) ? alphaInt : (alphaInt * a) >> 8;
+          final int outR = bgR + (((r - bgR) * finalAlpha) >> 8);
+          final int outG = bgG + (((g - bgG) * finalAlpha) >> 8);
+          final int outB = bgB + (((b - bgB) * finalAlpha) >> 8);
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
@@ -862,13 +878,13 @@ class Blend2DRasterizer2 {
         if (alphaInt > 1) {
           final int idx = rowOffset + x + 1;
           final int bg = fb[idx];
-          final int finalAlpha = (alphaInt * a) >> 8;
-          final int invAlpha = 255 - finalAlpha;
-          final int outR =
-              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG =
-              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
-          final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
+          final int bgR = (bg >> 16) & 0xFF;
+          final int bgG = (bg >> 8) & 0xFF;
+          final int bgB = bg & 0xFF;
+          final int finalAlpha = (a == 255) ? alphaInt : (alphaInt * a) >> 8;
+          final int outR = bgR + (((r - bgR) * finalAlpha) >> 8);
+          final int outG = bgG + (((g - bgG) * finalAlpha) >> 8);
+          final int outB = bgB + (((b - bgB) * finalAlpha) >> 8);
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
@@ -876,13 +892,13 @@ class Blend2DRasterizer2 {
         if (alphaInt > 1) {
           final int idx = rowOffset + x + 2;
           final int bg = fb[idx];
-          final int finalAlpha = (alphaInt * a) >> 8;
-          final int invAlpha = 255 - finalAlpha;
-          final int outR =
-              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG =
-              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
-          final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
+          final int bgR = (bg >> 16) & 0xFF;
+          final int bgG = (bg >> 8) & 0xFF;
+          final int bgB = bg & 0xFF;
+          final int finalAlpha = (a == 255) ? alphaInt : (alphaInt * a) >> 8;
+          final int outR = bgR + (((r - bgR) * finalAlpha) >> 8);
+          final int outG = bgG + (((g - bgG) * finalAlpha) >> 8);
+          final int outB = bgB + (((b - bgB) * finalAlpha) >> 8);
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
@@ -890,13 +906,13 @@ class Blend2DRasterizer2 {
         if (alphaInt > 1) {
           final int idx = rowOffset + x + 3;
           final int bg = fb[idx];
-          final int finalAlpha = (alphaInt * a) >> 8;
-          final int invAlpha = 255 - finalAlpha;
-          final int outR =
-              (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-          final int outG =
-              (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
-          final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
+          final int bgR = (bg >> 16) & 0xFF;
+          final int bgG = (bg >> 8) & 0xFF;
+          final int bgB = bg & 0xFF;
+          final int finalAlpha = (a == 255) ? alphaInt : (alphaInt * a) >> 8;
+          final int outR = bgR + (((r - bgR) * finalAlpha) >> 8);
+          final int outG = bgG + (((g - bgG) * finalAlpha) >> 8);
+          final int outB = bgB + (((b - bgB) * finalAlpha) >> 8);
           fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
         }
 
@@ -945,12 +961,13 @@ class Blend2DRasterizer2 {
     int alpha,
   ) {
     final int bg = fb[idx];
-    final int finalAlpha = (alpha * a) >> 8;
-    final int invAlpha = 255 - finalAlpha;
-
-    final int outR = (r * finalAlpha + ((bg >> 16) & 0xFF) * invAlpha) >> 8;
-    final int outG = (g * finalAlpha + ((bg >> 8) & 0xFF) * invAlpha) >> 8;
-    final int outB = (b * finalAlpha + (bg & 0xFF) * invAlpha) >> 8;
+    final int bgR = (bg >> 16) & 0xFF;
+    final int bgG = (bg >> 8) & 0xFF;
+    final int bgB = bg & 0xFF;
+    final int finalAlpha = (a == 255) ? alpha : (alpha * a) >> 8;
+    final int outR = bgR + (((r - bgR) * finalAlpha) >> 8);
+    final int outG = bgG + (((g - bgG) * finalAlpha) >> 8);
+    final int outB = bgB + (((b - bgB) * finalAlpha) >> 8);
 
     fb[idx] = 0xFF000000 | (outR << 16) | (outG << 8) | outB;
   }
@@ -1243,8 +1260,7 @@ void _workerMain(SendPort readyPort) {
     final int height = msg['height'] as int;
     final int color = msg['color'] as int;
     final int fillRule = msg['fillRule'] as int;
-    // Ignorado no worker: resolve paralelo usa caminho mascarado.
-    msg['useSimd'] as bool;
+    final bool useSimd = msg['useSimd'] as bool;
     final int wordsPerRow = msg['wordsPerRow'] as int;
 
     try {
@@ -1282,18 +1298,32 @@ void _workerMain(SendPort readyPort) {
         fbBd.lengthInBytes ~/ 4,
       );
 
-      // Path com isolate usa resolve mascarado para preservar o ganho de bitset.
-      Blend2DRasterizer2._resolveMaskedBuffers(
-        width: width,
-        height: height,
-        covers: covers,
-        areas: areas,
-        activeMask: activeMask,
-        wordsPerRow: wordsPerRow,
-        fb: fb,
-        color: color,
-        fillRule: fillRule,
-      );
+      if (useSimd) {
+        final dto = _ResolveDTO(
+          width: width,
+          height: height,
+          covers: covers,
+          areas: areas,
+          framebuffer: fb,
+          color: color,
+          fillRule: fillRule,
+          useSimd: true,
+        );
+        Blend2DRasterizer2.resolveSimd(dto);
+        activeMask.fillRange(0, activeMask.length, 0);
+      } else {
+        Blend2DRasterizer2._resolveMaskedBuffers(
+          width: width,
+          height: height,
+          covers: covers,
+          areas: areas,
+          activeMask: activeMask,
+          wordsPerRow: wordsPerRow,
+          fb: fb,
+          color: color,
+          fillRule: fillRule,
+        );
+      }
 
       replyTo.send(<String, Object?>{
         'id': id,

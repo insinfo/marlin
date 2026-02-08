@@ -137,6 +137,11 @@ class SkiaRasterizer {
   late Uint32List framebuffer;
   late Int32List _scanlineAccumulator;
   late Int32x4List _accSIMD;
+  late Int32x4List _fbSIMD;
+
+  final Int32x4List _simdLaneScratch = Int32x4List(1);
+  late final Int32List _simdLaneInts = _simdLaneScratch.buffer.asInt32List();
+  static final Int32x4 _simdOne = Int32x4(1, 1, 1, 1);
 
   final bool useSimd;
   FillRule fillRule = FillRule.nonZero;
@@ -145,8 +150,17 @@ class SkiaRasterizer {
       {required this.width, required this.height, this.useSimd = true}) {
     framebuffer = Uint32List(width * height);
     _scanlineAccumulator = Int32List(width);
-    // View SIMD para incrementos rápidos
-    _accSIMD = _scanlineAccumulator.buffer.asInt32x4List();
+    // Views SIMD explícitas (evita exceções em larguras não múltiplas de 4).
+    _accSIMD = Int32x4List.view(
+      _scanlineAccumulator.buffer,
+      _scanlineAccumulator.offsetInBytes,
+      width >> 2,
+    );
+    _fbSIMD = Int32x4List.view(
+      framebuffer.buffer,
+      framebuffer.offsetInBytes,
+      framebuffer.length >> 2,
+    );
   }
 
   void clear([int backgroundColor = 0xFFFFFFFF]) {
@@ -382,10 +396,9 @@ class SkiaRasterizer {
     }
     // Corpo SIMD
     if (i + 4 <= end) {
-      final one = Int32x4(1, 1, 1, 1);
       int simdIdx = i >> 2;
       while (i + 4 <= end) {
-        _accSIMD[simdIdx] = _accSIMD[simdIdx] + one;
+        _accSIMD[simdIdx] = _accSIMD[simdIdx] + _simdOne;
         simdIdx++;
         i += 4;
       }
@@ -405,29 +418,75 @@ class SkiaRasterizer {
     final colorA = (color >> 24) & 0xFF;
 
     final int simdWidth = width >> 2;
+    final bool rowStartsAligned = (rowOffset & 3) == 0;
+    final int simdRowBase = rowOffset >> 2;
+    final Int32x4 color4 = Int32x4(color, color, color, color);
+    final List<int> alphaLut = List<int>.generate(
+      kSubpixelCount + 1,
+      (count) => (count * colorA) >> kSubpixelBits,
+      growable: false,
+    );
 
     for (int i = 0; i < simdWidth; i++) {
-      final counts = _accSIMD[i];
-      // Pular blocos vazios rapidamente
-      if (counts.x == 0 && counts.y == 0 && counts.z == 0 && counts.w == 0)
+      _simdLaneScratch[0] = _accSIMD[i];
+      final int c0 = _simdLaneInts[0];
+      final int c1 = _simdLaneInts[1];
+      final int c2 = _simdLaneInts[2];
+      final int c3 = _simdLaneInts[3];
+      if ((c0 | c1 | c2 | c3) == 0) continue;
+
+      if (rowStartsAligned &&
+          c0 >= kSubpixelCount &&
+          c1 >= kSubpixelCount &&
+          c2 >= kSubpixelCount &&
+          c3 >= kSubpixelCount) {
+        _fbSIMD[simdRowBase + i] = color4;
         continue;
+      }
 
-      final baseIdx = i << 2;
-      for (int k = 0; k < 4; k++) {
-        final x = baseIdx + k;
-        final count = _scanlineAccumulator[x];
-        if (count == 0) continue;
+      final int baseX = i << 2;
 
-        if (count >= kSubpixelCount) {
-          framebuffer[rowOffset + x] = color;
-        } else {
-          final int alpha = (count * colorA) >> kSubpixelBits;
-          final bg = framebuffer[rowOffset + x];
-          final int invA = 255 - alpha;
-          final int r = (colorR * alpha + ((bg >> 16) & 0xFF) * invA) >> 8;
-          final int g = (colorG * alpha + ((bg >> 8) & 0xFF) * invA) >> 8;
-          final int b = (colorB * alpha + (bg & 0xFF) * invA) >> 8;
-          framebuffer[rowOffset + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+      if (c0 >= kSubpixelCount) {
+        framebuffer[rowOffset + baseX] = color;
+      } else if (c0 > 0) {
+        final int alpha = alphaLut[c0];
+        if (alpha > 0) {
+          final int idx = rowOffset + baseX;
+          framebuffer[idx] =
+              _blendPixelAA(framebuffer[idx], colorR, colorG, colorB, alpha);
+        }
+      }
+
+      if (c1 >= kSubpixelCount) {
+        framebuffer[rowOffset + baseX + 1] = color;
+      } else if (c1 > 0) {
+        final int alpha = alphaLut[c1];
+        if (alpha > 0) {
+          final int idx = rowOffset + baseX + 1;
+          framebuffer[idx] =
+              _blendPixelAA(framebuffer[idx], colorR, colorG, colorB, alpha);
+        }
+      }
+
+      if (c2 >= kSubpixelCount) {
+        framebuffer[rowOffset + baseX + 2] = color;
+      } else if (c2 > 0) {
+        final int alpha = alphaLut[c2];
+        if (alpha > 0) {
+          final int idx = rowOffset + baseX + 2;
+          framebuffer[idx] =
+              _blendPixelAA(framebuffer[idx], colorR, colorG, colorB, alpha);
+        }
+      }
+
+      if (c3 >= kSubpixelCount) {
+        framebuffer[rowOffset + baseX + 3] = color;
+      } else if (c3 > 0) {
+        final int alpha = alphaLut[c3];
+        if (alpha > 0) {
+          final int idx = rowOffset + baseX + 3;
+          framebuffer[idx] =
+              _blendPixelAA(framebuffer[idx], colorR, colorG, colorB, alpha);
         }
       }
     }
@@ -438,15 +497,22 @@ class SkiaRasterizer {
       if (count >= kSubpixelCount) {
         framebuffer[rowOffset + x] = color;
       } else {
-        final int alpha = (count * colorA) >> kSubpixelBits;
-        final bg = framebuffer[rowOffset + x];
-        final int invA = 255 - alpha;
-        final int r = (colorR * alpha + ((bg >> 16) & 0xFF) * invA) >> 8;
-        final int g = (colorG * alpha + ((bg >> 8) & 0xFF) * invA) >> 8;
-        final int b = (colorB * alpha + (bg & 0xFF) * invA) >> 8;
-        framebuffer[rowOffset + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        final int alpha = alphaLut[count];
+        if (alpha <= 0) continue;
+        final int idx = rowOffset + x;
+        framebuffer[idx] =
+            _blendPixelAA(framebuffer[idx], colorR, colorG, colorB, alpha);
       }
     }
+  }
+
+  @pragma('vm:prefer-inline')
+  int _blendPixelAA(int bg, int colorR, int colorG, int colorB, int alpha) {
+    final int invA = 255 - alpha;
+    final int r = (colorR * alpha + ((bg >> 16) & 0xFF) * invA) >> 8;
+    final int g = (colorG * alpha + ((bg >> 8) & 0xFF) * invA) >> 8;
+    final int b = (colorB * alpha + (bg & 0xFF) * invA) >> 8;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
   }
 
   void _advanceEdges(EdgeList aet) {

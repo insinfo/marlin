@@ -2,7 +2,7 @@
 Foco em rasterização de vetores e SVGs de mais alta performace 
 foco principal é performace
 Este roteiro define como transformar o `marlin` em uma biblioteca de graficos 2D de alta performace dando flexibilidade para o utilizador escolher o algoritmo de rasterização desejado. 
-otimizar o codigo ao maximo sem perder as identidades de cada algoritomo definidos nos papers C:\MyDartProjects\marlin\pesquisa
+otimizar o codigo ao maximo sem perder as identidades de cada algoritmo definidos nos papers C:\MyDartProjects\marlin\pesquisa
 
 Base normativa e tecnica usada:
 - C:\MyDartProjects\marlin\pesquisa
