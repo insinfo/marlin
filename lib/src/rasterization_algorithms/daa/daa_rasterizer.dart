@@ -133,6 +133,8 @@ class DAARasterizer {
 
   /// Tabela de cobertura pré-computada
   final CoverageLUT _coverageLUT;
+  // 0: EvenOdd, 1: NonZero
+  int fillRule = 1;
 
   DAARasterizer({required this.width, required this.height})
       : _coverageLUT = CoverageLUT() {
@@ -262,37 +264,64 @@ class DAARasterizer {
     framebuffer[index] = 0xFF000000 | (r << 16) | (g << 8) | b;
   }
 
-  /// Desenha um polígono convexo (decomposição em triângulos)
-  void drawPolygon(List<double> vertices, int color) {
+  /// Desenha um polígono com scanline e suporte a múltiplos contornos.
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int? windingRule,
+    List<int>? contourVertexCounts,
+  }) {
+    if (windingRule != null) fillRule = windingRule;
     if (vertices.length < 6) return; // Mínimo 3 vértices (6 coordenadas)
 
     final n = vertices.length ~/ 2;
-    final edgeX1 = List<double>.filled(n, 0.0);
-    final edgeY1 = List<double>.filled(n, 0.0);
-    final edgeX2 = List<double>.filled(n, 0.0);
-    final edgeY2 = List<double>.filled(n, 0.0);
+    final contours = _resolveContours(n, contourVertexCounts);
+    final edgeX1 = <double>[];
+    final edgeY1 = <double>[];
+    final edgeInvSlope = <double>[];
+    final edgeYMin = <double>[];
+    final edgeYMax = <double>[];
+    final edgeWinding = <int>[];
 
     var minX = vertices[0];
     var maxX = vertices[0];
     var minY = vertices[1];
     var maxY = vertices[1];
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x1 = vertices[i * 2];
-      final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[j * 2];
-      final y2 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      final start = contour.start;
+      final count = contour.count;
+      if (count < 3) continue;
+      for (int local = 0; local < count; local++) {
+        final i = start + local;
+        final j = start + ((local + 1) % count);
+        final x1 = vertices[i * 2];
+        final y1 = vertices[i * 2 + 1];
+        final x2 = vertices[j * 2];
+        final y2 = vertices[j * 2 + 1];
 
-      edgeX1[i] = x1;
-      edgeY1[i] = y1;
-      edgeX2[i] = x2;
-      edgeY2[i] = y2;
+        if ((y2 - y1).abs() > 1e-12) {
+          final winding = y2 > y1 ? 1 : -1;
+          if (winding > 0) {
+            edgeX1.add(x1);
+            edgeY1.add(y1);
+            edgeYMin.add(y1);
+            edgeYMax.add(y2);
+          } else {
+            edgeX1.add(x2);
+            edgeY1.add(y2);
+            edgeYMin.add(y2);
+            edgeYMax.add(y1);
+          }
+          edgeInvSlope.add((x2 - x1) / (y2 - y1));
+          edgeWinding.add(winding);
+        }
 
-      if (x1 < minX) minX = x1;
-      if (x1 > maxX) maxX = x1;
-      if (y1 < minY) minY = y1;
-      if (y1 > maxY) maxY = y1;
+        if (x1 < minX) minX = x1;
+        if (x1 > maxX) maxX = x1;
+        if (y1 < minY) minY = y1;
+        if (y1 > maxY) maxY = y1;
+      }
     }
 
     final minXi = minX.floor().clamp(0, width - 1);
@@ -300,106 +329,134 @@ class DAARasterizer {
     final minYi = minY.floor().clamp(0, height - 1);
     final maxYi = maxY.ceil().clamp(0, height - 1);
 
+    final crossings = <_DAAScanCross>[];
+    final edgeCount = edgeX1.length;
+
     for (int y = minYi; y <= maxYi; y++) {
       final py = y + 0.5;
       final rowOffset = y * width;
+      crossings.clear();
 
-      for (int x = minXi; x <= maxXi; x++) {
-        final px = x + 0.5;
-        final alpha = _computePolygonAlpha(
-          edgeCount: n,
-          edgeX1: edgeX1,
-          edgeY1: edgeY1,
-          edgeX2: edgeX2,
-          edgeY2: edgeY2,
-          px: px,
-          py: py,
-        );
+      for (int e = 0; e < edgeCount; e++) {
+        if (py < edgeYMin[e] || py >= edgeYMax[e]) continue;
+        final x = edgeX1[e] + (py - edgeY1[e]) * edgeInvSlope[e];
+        crossings.add(_DAAScanCross(x, edgeWinding[e]));
+      }
+      if (crossings.isEmpty) continue;
+      crossings.sort((a, b) => a.x.compareTo(b.x));
 
-        if (alpha == 255) {
-          framebuffer[rowOffset + x] = color;
-        } else if (alpha > 0) {
-          _blendPixel(rowOffset + x, color, alpha);
+      if (fillRule == 0) {
+        for (int i = 0; i + 1 < crossings.length; i += 2) {
+          _rasterizeSpan(
+            rowOffset: rowOffset,
+            y: y,
+            left: crossings[i].x,
+            right: crossings[i + 1].x,
+            color: color,
+            minXi: minXi,
+            maxXi: maxXi,
+          );
+        }
+      } else {
+        int winding = 0;
+        double? left;
+        for (final c in crossings) {
+          final prevWinding = winding;
+          winding += c.winding;
+          final wasInside = prevWinding != 0;
+          final isInside = winding != 0;
+
+          if (!wasInside && isInside) {
+            left = c.x;
+          } else if (wasInside && !isInside && left != null) {
+            _rasterizeSpan(
+              rowOffset: rowOffset,
+              y: y,
+              left: left,
+              right: c.x,
+              color: color,
+              minXi: minXi,
+              maxXi: maxXi,
+            );
+            left = null;
+          }
         }
       }
     }
   }
 
+  List<_DAAContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+    if (counts == null || counts.isEmpty) {
+      return <_DAAContourSpan>[_DAAContourSpan(0, totalPoints)];
+    }
+
+    int consumed = 0;
+    final out = <_DAAContourSpan>[];
+    for (final raw in counts) {
+      if (raw <= 0) continue;
+      if (consumed + raw > totalPoints) {
+        return <_DAAContourSpan>[_DAAContourSpan(0, totalPoints)];
+      }
+      out.add(_DAAContourSpan(consumed, raw));
+      consumed += raw;
+    }
+
+    if (out.isEmpty || consumed != totalPoints) {
+      return <_DAAContourSpan>[_DAAContourSpan(0, totalPoints)];
+    }
+    return out;
+  }
+
   @pragma('vm:prefer-inline')
-  int _computePolygonAlpha({
-    required int edgeCount,
-    required List<double> edgeX1,
-    required List<double> edgeY1,
-    required List<double> edgeX2,
-    required List<double> edgeY2,
-    required double px,
-    required double py,
+  void _rasterizeSpan({
+    required int rowOffset,
+    required int y,
+    required double left,
+    required double right,
+    required int color,
+    required int minXi,
+    required int maxXi,
   }) {
-    int winding = 0;
-    double minDistSq = double.infinity;
+    if (!(left.isFinite && right.isFinite)) return;
+    if (right <= left) return;
 
-    for (int i = 0; i < edgeCount; i++) {
-      final x1 = edgeX1[i];
-      final y1 = edgeY1[i];
-      final x2 = edgeX2[i];
-      final y2 = edgeY2[i];
+    final startX = (left.floor() - 1).clamp(minXi, maxXi);
+    final endX = (right.ceil() + 1).clamp(minXi, maxXi);
 
-      if (y1 <= py) {
-        if (y2 > py && _isLeft(x1, y1, x2, y2, px, py) > 0) winding++;
+    for (int x = startX; x <= endX; x++) {
+      final cx = x + 0.5;
+      double signedDist;
+
+      if (cx < left) {
+        signedDist = left - cx;
+      } else if (cx > right) {
+        signedDist = cx - right;
       } else {
-        if (y2 <= py && _isLeft(x1, y1, x2, y2, px, py) < 0) winding--;
+        final distToLeft = cx - left;
+        final distToRight = right - cx;
+        signedDist = -math.min(distToLeft, distToRight);
       }
 
-      final distSq = _distanceToSegmentSq(x1, y1, x2, y2, px, py);
-      if (distSq < minDistSq) minDistSq = distSq;
+      final alpha = _coverageLUT.getAlpha((signedDist * _fixedOne).toInt());
+      if (alpha == 255) {
+        framebuffer[rowOffset + x] = color;
+      } else if (alpha > 0) {
+        _blendPixel(rowOffset + x, color, alpha);
+      }
     }
-
-    final inside = winding != 0;
-    final minDist = minDistSq.isFinite ? math.sqrt(minDistSq) : 0.0;
-    final signedDist = inside ? -minDist : minDist;
-    return _coverageLUT.getAlpha((signedDist * _fixedOne).toInt());
   }
+}
 
-  @pragma('vm:prefer-inline')
-  double _distanceToSegmentSq(
-    double x1,
-    double y1,
-    double x2,
-    double y2,
-    double px,
-    double py,
-  ) {
-    final vx = x2 - x1;
-    final vy = y2 - y1;
-    final wx = px - x1;
-    final wy = py - y1;
-    final vv = vx * vx + vy * vy;
+class _DAAScanCross {
+  final double x;
+  final int winding;
 
-    if (vv <= 1e-12) return wx * wx + wy * wy;
+  const _DAAScanCross(this.x, this.winding);
+}
 
-    var t = (wx * vx + wy * vy) / vv;
-    if (t < 0.0) {
-      t = 0.0;
-    } else if (t > 1.0) {
-      t = 1.0;
-    }
+class _DAAContourSpan {
+  final int start;
+  final int count;
 
-    final cx = x1 + vx * t;
-    final cy = y1 + vy * t;
-    final dx = px - cx;
-    final dy = py - cy;
-    return dx * dx + dy * dy;
-  }
-
-  @pragma('vm:prefer-inline')
-  double _isLeft(
-    double x1,
-    double y1,
-    double x2,
-    double y2,
-    double px,
-    double py,
-  ) {
-    return (x2 - x1) * (py - y1) - (px - x1) * (y2 - y1);
-  }
+  const _DAAContourSpan(this.start, this.count);
 }

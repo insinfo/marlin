@@ -68,9 +68,9 @@ class EdgeFlagAARasterizer {
 
   /// Framebuffer de saída (ARGB)
   late final Uint32List _framebuffer;
+  // 0: EvenOdd, 1: NonZero
+  int fillRule = 1;
 
-  int _prevDirtyMinX = 1;
-  int _prevDirtyMaxX = 0;
   int _pendingMinY = 1;
   int _pendingMaxY = 0;
 
@@ -95,28 +95,58 @@ class EdgeFlagAARasterizer {
       _activeEdges = null;
     }
     _activeEdges = null;
-    _prevDirtyMinX = 1;
-    _prevDirtyMaxX = 0;
     _pendingMinY = 1;
     _pendingMaxY = 0;
   }
 
-  void drawPolygon(List<double> vertices, int color) {
+  void drawPolygon(
+    List<double> vertices,
+    int color, {
+    int? windingRule,
+    List<int>? contourVertexCounts,
+  }) {
     if (vertices.length < 6 || (color >> 24) == 0) return;
+    if (windingRule != null) fillRule = windingRule;
 
     _pendingMinY = height;
     _pendingMaxY = -1;
 
     final n = vertices.length ~/ 2;
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      _addEdge(vertices[i * 2], vertices[i * 2 + 1], vertices[j * 2],
-          vertices[j * 2 + 1]);
+    final contours = _resolveContours(n, contourVertexCounts);
+    for (final contour in contours) {
+      if (contour.count < 3) continue;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        _addEdge(vertices[i * 2], vertices[i * 2 + 1], vertices[j * 2],
+            vertices[j * 2 + 1]);
+      }
     }
 
     if (_pendingMinY <= _pendingMaxY) {
       _render(color, _pendingMinY, _pendingMaxY);
     }
+  }
+
+  List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+    if (counts == null || counts.isEmpty) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+
+    int consumed = 0;
+    final out = <_ContourSpan>[];
+    for (final raw in counts) {
+      if (raw <= 0) continue;
+      if (consumed + raw > totalPoints) {
+        return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+      }
+      out.add(_ContourSpan(consumed, raw));
+      consumed += raw;
+    }
+    if (out.isEmpty || consumed != totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    return out;
   }
 
   void _addEdge(double x0, double y0, double x1, double y1) {
@@ -198,12 +228,8 @@ class EdgeFlagAARasterizer {
     final sourceOpaque = colorA >= 255;
 
     for (int y = yStart; y <= yEnd; y++) {
-      // Limpa apenas faixa suja da scanline anterior.
-      if (_prevDirtyMinX <= _prevDirtyMaxX) {
-        final clearStart = _prevDirtyMinX * kSubpixelCount;
-        final clearEnd = (_prevDirtyMaxX + 1) * kSubpixelCount;
-        _nzScanline.fillRange(clearStart, clearEnd, 0);
-      }
+      // Clear full scanline to avoid residual flags creating horizontal banding.
+      _nzScanline.fillRange(0, width * kSubpixelCount, 0);
 
       // 1. Ativar novas arestas
       ScanEdge? e = _edgeTable[y];
@@ -216,8 +242,6 @@ class EdgeFlagAARasterizer {
       _edgeTable[y] = null;
 
       if (_activeEdges == null) {
-        _prevDirtyMinX = 1;
-        _prevDirtyMaxX = 0;
         continue;
       }
 
@@ -272,8 +296,6 @@ class EdgeFlagAARasterizer {
       }
 
       if (dirtyMaxX < 0) {
-        _prevDirtyMinX = 1;
-        _prevDirtyMaxX = 0;
         continue;
       }
 
@@ -310,14 +332,25 @@ class EdgeFlagAARasterizer {
         if (f7 != 0) acc7 += f7;
 
         int mask = 0;
-        if (acc0 != 0) mask |= 1;
-        if (acc1 != 0) mask |= 2;
-        if (acc2 != 0) mask |= 4;
-        if (acc3 != 0) mask |= 8;
-        if (acc4 != 0) mask |= 16;
-        if (acc5 != 0) mask |= 32;
-        if (acc6 != 0) mask |= 64;
-        if (acc7 != 0) mask |= 128;
+        if (fillRule == 0) {
+          if ((acc0 & 1) != 0) mask |= 1;
+          if ((acc1 & 1) != 0) mask |= 2;
+          if ((acc2 & 1) != 0) mask |= 4;
+          if ((acc3 & 1) != 0) mask |= 8;
+          if ((acc4 & 1) != 0) mask |= 16;
+          if ((acc5 & 1) != 0) mask |= 32;
+          if ((acc6 & 1) != 0) mask |= 64;
+          if ((acc7 & 1) != 0) mask |= 128;
+        } else {
+          if (acc0 != 0) mask |= 1;
+          if (acc1 != 0) mask |= 2;
+          if (acc2 != 0) mask |= 4;
+          if (acc3 != 0) mask |= 8;
+          if (acc4 != 0) mask |= 16;
+          if (acc5 != 0) mask |= 32;
+          if (acc6 != 0) mask |= 64;
+          if (acc7 != 0) mask |= 128;
+        }
 
         if (mask != 0) {
           final alphaBase = kPopCountAlpha8[mask];
@@ -335,9 +368,6 @@ class EdgeFlagAARasterizer {
           break;
         }
       }
-
-      _prevDirtyMinX = dirtyMinX;
-      _prevDirtyMaxX = dirtyMaxX;
     }
   }
 
@@ -402,4 +432,11 @@ class EdgeFlagAARasterizer {
   }
 
   Uint32List get buffer => _framebuffer;
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+
+  const _ContourSpan(this.start, this.count);
 }
