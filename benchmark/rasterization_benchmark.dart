@@ -109,6 +109,116 @@ class BenchmarkResult {
   }
 }
 
+class _SimdPairRule {
+  final String scalarSuffix;
+  final String simdSuffix;
+  final String? variantLabel;
+
+  const _SimdPairRule(
+    this.scalarSuffix,
+    this.simdSuffix, {
+    this.variantLabel,
+  });
+}
+
+class _SimdGapEntry {
+  final String label;
+  final BenchmarkResult scalar;
+  final BenchmarkResult simd;
+
+  const _SimdGapEntry({
+    required this.label,
+    required this.scalar,
+    required this.simd,
+  });
+
+  double get deltaMs => simd.timeMs - scalar.timeMs;
+  double get deltaPercent => ((simd.timeMs / scalar.timeMs) - 1.0) * 100.0;
+  double get speedup => scalar.timeMs / simd.timeMs;
+}
+
+const List<_SimdPairRule> _simdPairRules = <_SimdPairRule>[
+  _SimdPairRule(' (Scalar)', ' (SIMD)'),
+  _SimdPairRule(' (Imm Scalar)', ' (Imm SIMD)', variantLabel: 'Imm'),
+  _SimdPairRule(' (Batch Scalar)', ' (Batch SIMD)', variantLabel: 'Batch'),
+  _SimdPairRule(' (Scalar+Iso)', ' (SIMD+Iso)', variantLabel: 'Iso'),
+  _SimdPairRule(' (Batch Scalar+Iso)', ' (Batch SIMD+Iso)',
+      variantLabel: 'Batch+Iso'),
+];
+
+List<_SimdGapEntry> _collectSimdGapEntries(List<BenchmarkResult> results) {
+  final byName = <String, BenchmarkResult>{
+    for (final r in results) r.name: r,
+  };
+  final out = <_SimdGapEntry>[];
+  final seen = <String>{};
+
+  for (final scalar in results) {
+    for (final rule in _simdPairRules) {
+      if (!scalar.name.endsWith(rule.scalarSuffix)) continue;
+      final baseName = scalar.name
+          .substring(0, scalar.name.length - rule.scalarSuffix.length);
+      final simdName = '$baseName${rule.simdSuffix}';
+      final simd = byName[simdName];
+      if (simd == null) continue;
+
+      final dedupKey = '${scalar.name}|${simd.name}';
+      if (!seen.add(dedupKey)) continue;
+
+      final label = (rule.variantLabel == null || rule.variantLabel!.isEmpty)
+          ? baseName
+          : '$baseName (${rule.variantLabel})';
+      out.add(_SimdGapEntry(label: label, scalar: scalar, simd: simd));
+    }
+  }
+
+  out.sort((a, b) => b.deltaPercent.compareTo(a.deltaPercent));
+  return out;
+}
+
+String _formatSimdGapReport(List<_SimdGapEntry> gaps) {
+  final sb = StringBuffer();
+  sb.writeln('SIMD GAP REPORT (Scalar vs SIMD, lower is better)');
+  sb.writeln(
+      'Algorithm                      Scalar      SIMD        Delta       Status');
+  sb.writeln(
+      '--------------------------------------------------------------------------');
+
+  if (gaps.isEmpty) {
+    sb.writeln('No Scalar/SIMD pairs found.');
+    return sb.toString();
+  }
+
+  for (final gap in gaps) {
+    final scalarMs = '${gap.scalar.timeMs.toStringAsFixed(2)}ms';
+    final simdMs = '${gap.simd.timeMs.toStringAsFixed(2)}ms';
+    final deltaMs =
+        '${gap.deltaMs >= 0 ? '+' : ''}${gap.deltaMs.toStringAsFixed(2)}ms';
+    final deltaPct =
+        '${gap.deltaPercent >= 0 ? '+' : ''}${gap.deltaPercent.toStringAsFixed(1)}%';
+    final status = gap.deltaMs <= 0
+        ? 'SIMD faster (${gap.speedup.toStringAsFixed(2)}x)'
+        : 'SIMD slower (${(1.0 / gap.speedup).toStringAsFixed(2)}x)';
+
+    sb.writeln(
+      '${gap.label.padRight(30)} '
+      '${scalarMs.padLeft(9)} '
+      '${simdMs.padLeft(9)} '
+      '${('$deltaMs $deltaPct').padLeft(15)} '
+      '$status',
+    );
+  }
+
+  return sb.toString();
+}
+
+Future<void> _writeSimdGapReportFile(String reportText) async {
+  final dir = Directory('output/rasterization_benchmark');
+  await dir.create(recursive: true);
+  final file = File('${dir.path}/simd_gap_report.txt');
+  await file.writeAsString('$reportText\n');
+}
+
 typedef RasterizeFunc = FutureOr<void> Function(
     List<double> vertices, int color);
 
@@ -876,4 +986,23 @@ Future<void> main() async {
   }
 
   print('╚══════════════════════════════════════════════════════════════════╝');
+
+  final simdGaps = _collectSimdGapEntries(results);
+  final simdGapText = _formatSimdGapReport(simdGaps);
+
+  print('');
+  for (final line in simdGapText.split('\n')) {
+    if (line.isEmpty) continue;
+    print(line);
+  }
+
+  try {
+    await _writeSimdGapReportFile(simdGapText);
+    print('');
+    print(
+        'SIMD gap report saved to: output/rasterization_benchmark/simd_gap_report.txt');
+  } catch (e) {
+    print('');
+    print('Failed to save SIMD gap report file: $e');
+  }
 }
