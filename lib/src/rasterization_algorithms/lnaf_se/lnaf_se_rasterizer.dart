@@ -554,53 +554,192 @@ class LNAFSERasterizer implements PolygonContract {
     final row = y * width;
 
     if (leftPix == rightPix) {
+      // Single-pixel span: both edges in same pixel.
+      // Analytic area: integrate width between left and right edges.
       final pix = leftPix;
       if (pix < 0 || pix >= width) return;
-      int wFixed = xb - xa;
-      if (wFixed <= 0) return;
-      if (wFixed > kScale) wFixed = kScale;
-      final cover = (wFixed * 255 + 127) >> 8;
-      final effA = (cover * srcA0 + 127) ~/ 255;
+      final dxL = _eDx[eL];
+      final dxR = _eDx[eR];
+      final xLTop = xa - (dxL >> 1);
+      final xLBot = xa + (dxL >> 1);
+      final xRTop = xb - (dxR >> 1);
+      final xRBot = xb + (dxR >> 1);
+      final pxLeft = pix << 8;
+      final covR = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
+      final covL = _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
+      int cov = covR - covL;
+      if (cov < 0) cov = 0;
+      if (cov > 255) cov = 255;
+      final effA = (cov * srcA0 + 127) ~/ 255;
       if (effA <= 0) return;
       final idx = row + pix;
       _pixels32[idx] = _blendOver(_pixels32[idx], srcR, srcG, srcB, effA);
       return;
     }
 
-    final midPix = ((leftPix + rightPix) >> 1).clamp(0, width - 1);
-    final xMidC = midPix * kScale + kHalf;
-    final fillStart = math.max(leftPix + 1, 0);
-    final fillEnd = math.min(rightPix, width);
-    if (fillStart < fillEnd) {
+    // ── Analytic trapezoid coverage for boundary pixels ───────────────
+    // Edge sweeps from xTop to xBot within pixel height. Coverage =
+    // ∫₀¹ clamp(u(t), 0, 1) dt  where u(t) = (edgeX(t) - pxLeft) / 256.
+    // _integrateCovLeft/Right compute this integral analytically in Q8
+    // fixed-point, giving exact coverage for any edge angle.
+    //
+    // Band width = ceil(|dxStep| / 256) + 1  pixels, extending the
+    // transition zone for shallow edges.
+
+    final dxL = _eDx[eL];
+    final dxR = _eDx[eR];
+    final absDxL = dxL < 0 ? -dxL : dxL;
+    final absDxR = dxR < 0 ? -dxR : dxR;
+    final bandL = (absDxL >> 8) + 1;
+    final bandR = (absDxR >> 8) + 1;
+
+    // Edge x at top/bottom of this pixel row
+    final xLTop = xa - (dxL >> 1);
+    final xLBot = xa + (dxL >> 1);
+    final xRTop = xb - (dxR >> 1);
+    final xRBot = xb + (dxR >> 1);
+
+    final spanWidth = rightPix - leftPix + 1;
+
+    if (bandL + bandR >= spanWidth) {
+      // Thin span: both edges affect all pixels
+      final pxS = leftPix < 0 ? 0 : leftPix;
+      final pxE = rightPix >= width ? width - 1 : rightPix;
+      for (int px = pxS; px <= pxE; px++) {
+        final pxLeft = px << 8;
+        final covR = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
+        final covL = _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
+        int a = covR - covL;
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        final effA = (a * srcA0 + 127) ~/ 255;
+        if (effA > 0) {
+          _pixels32[row + px] =
+              _blendOver(_pixels32[row + px], srcR, srcG, srcB, effA);
+        }
+      }
+      return;
+    }
+
+    // Left AA band
+    {
+      final pxS = leftPix < 0 ? 0 : leftPix;
+      final pxE = (leftPix + bandL) > width ? width : (leftPix + bandL);
+      for (int px = pxS; px < pxE; px++) {
+        final pxLeft = px << 8;
+        // Coverage = fraction of pixel to the RIGHT of left edge (inside)
+        // = 1 - ∫₀¹ clamp((edgeX(t) - pxLeft) / 256, 0, 1) dt
+        final a = 255 - _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
+        final effA = (a * srcA0 + 127) ~/ 255;
+        if (effA > 0) {
+          _pixels32[row + px] =
+              _blendOver(_pixels32[row + px], srcR, srcG, srcB, effA);
+        }
+      }
+    }
+
+    // Solid interior
+    final fs = (leftPix + bandL).clamp(0, width);
+    final fe = (rightPix - bandR + 1).clamp(0, width);
+    if (fs < fe) {
       _fillSolidSpan(
-        row,
-        fillStart,
-        fillEnd,
-        (srcA0 << 24) | (srcR << 16) | (srcG << 8) | srcB,
-      );
+          row, fs, fe, (srcA0 << 24) | (srcR << 16) | (srcG << 8) | srcB);
     }
 
-    if (leftPix >= 0 && leftPix < width) {
-      final xLC = leftPix * kScale + kHalf;
-      final insidePos = _evalF(eL, xMidC, yCenter) >= 0;
-      final a = _alphaAt(eL, xLC, yCenter, insidePos);
-      final effA = (a * srcA0 + 127) ~/ 255;
-      if (effA > 0) {
-        final idx = row + leftPix;
-        _pixels32[idx] = _blendOver(_pixels32[idx], srcR, srcG, srcB, effA);
+    // Right AA band
+    {
+      final pxS = (rightPix - bandR + 1) < 0 ? 0 : (rightPix - bandR + 1);
+      final pxE = (rightPix + 1) > width ? width : (rightPix + 1);
+      for (int px = pxS; px < pxE; px++) {
+        final pxLeft = px << 8;
+        // Coverage = fraction of pixel to the LEFT of right edge (inside)
+        // = ∫₀¹ clamp((edgeX(t) - pxLeft) / 256, 0, 1) dt
+        final a = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
+        final effA = (a * srcA0 + 127) ~/ 255;
+        if (effA > 0) {
+          _pixels32[row + px] =
+              _blendOver(_pixels32[row + px], srcR, srcG, srcB, effA);
+        }
       }
+    }
+  }
+
+  /// Analytic integral of clamp((u(t))/256, 0, 1) for t ∈ [0,1],
+  /// where u(t) = u0 + (u1 - u0)*t.  u0,u1 in Q8 (256 = 1 pixel).
+  /// Returns coverage 0..255 — the fraction of the pixel width that
+  /// lies to the LEFT of the midpoint 256 (i.e. inside the pixel).
+  ///
+  /// This is the exact area-under-curve for a linear edge sweeping
+  /// from u0 (top) to u1 (bottom) within a single pixel column.
+  @pragma('vm:prefer-inline')
+  static int _integrateCovRight(int u0, int u1) {
+    // Ensure u0 <= u1 (swap if needed, integral is symmetric)
+    if (u0 > u1) {
+      final t = u0;
+      u0 = u1;
+      u1 = t;
+    }
+    // Both outside left → 0
+    if (u1 <= 0) return 0;
+    // Both outside right → 255
+    if (u0 >= 256) return 255;
+
+    final du = u1 - u0;
+
+    if (du == 0) {
+      // Horizontal edge segment in this pixel row
+      if (u0 <= 0) return 0;
+      if (u0 >= 256) return 255;
+      return (u0 * 255 + 128) >> 8;
     }
 
-    if (rightPix >= 0 && rightPix < width) {
-      final xRC = rightPix * kScale + kHalf;
-      final insidePos = _evalF(eR, xMidC, yCenter) >= 0;
-      final a = _alphaAt(eR, xRC, yCenter, insidePos);
-      final effA = (a * srcA0 + 127) ~/ 255;
-      if (effA > 0) {
-        final idx = row + rightPix;
-        _pixels32[idx] = _blendOver(_pixels32[idx], srcR, srcG, srcB, effA);
-      }
-    }
+    // Clamp bounds: find t-range where u(t) ∈ [0, 256]
+    // u(t) = u0 + du*t  →  t = (u - u0) / du
+    // t_enter = max(0, (0 - u0) / du) = max(0, -u0/du)
+    // t_exit  = min(1, (256 - u0) / du)
+    //
+    // Area = ∫₀¹ clamp(u(t)/256, 0, 1) dt
+    //      = (integral of 0 below 0) + (integral of u/256 in [0,256]) + (integral of 1 above 256)
+    //
+    // Using Q16 for precision in intermediate calculations.
+
+    // t values scaled by du to avoid division:
+    // t_low  = max(0, -u0)   [times when u(t) = 0]
+    // t_high = min(du, 256 - u0) [times when u(t) = 256]
+    int tLow = -u0;
+    if (tLow < 0) tLow = 0;
+    int tHigh = 256 - u0;
+    if (tHigh > du) tHigh = du;
+
+    // Area of the ramp portion (where 0 < u < 256):
+    // ∫_{tLow/du}^{tHigh/du} (u0 + du*t) / 256 dt
+    // = 1/256 * [ u0*(tHigh-tLow)/du + du/2 * (tHigh²-tLow²)/du² ]
+    // = 1/(256*du) * [ u0*(tHigh-tLow) + (tHigh²-tLow²)/2 ]
+    // = 1/(256*du) * [ u0*(tHigh-tLow) + (tHigh+tLow)*(tHigh-tLow)/2 ]
+    // = (tHigh-tLow) / (256*du) * [ u0 + (tHigh+tLow)/2 ]
+    //
+    // Let mid = u0 + (tHigh+tLow)/2  — this is the average u value
+    // Area_ramp = (tHigh-tLow) * mid / (256 * du)
+    //
+    // Area of the saturated portion (where u >= 256):
+    // = (du - tHigh) / du   [fraction of t where u >= 256]
+
+    final span = tHigh - tLow;
+    // mid * 2 = 2*u0 + tHigh + tLow
+    final mid2 = 2 * u0 + tHigh + tLow;
+
+    // Total area * 256 * du * 2:
+    //   ramp:      span * mid2
+    //   saturated: (du - tHigh) * 256 * 2
+    final rampArea = span * mid2;
+    final satArea = (du - tHigh) * 512;
+    final totalNumer = rampArea + satArea;
+    final totalDenom = 512 * du; // = 256 * du * 2
+
+    int result = (totalNumer * 255 + (totalDenom >> 1)) ~/ totalDenom;
+    if (result < 0) result = 0;
+    if (result > 255) result = 255;
+    return result;
   }
 
   @pragma('vm:prefer-inline')
