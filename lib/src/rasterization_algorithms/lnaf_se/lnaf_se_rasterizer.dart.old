@@ -73,9 +73,8 @@ _LnafSeQualityConfig _qualityConfigFor(LnafSeQualityMode mode) {
       );
     case LnafSeQualityMode.high:
       return const _LnafSeQualityConfig(
-        // Keep the same analytic AA envelope as fast to avoid regressions.
-        bandBias: 1,
-        maxBand: 2,
+        bandBias: 3,
+        maxBand: 4,
         lutMix: 0,
         softnessQ8: 512,
         cinematicPasses: 0,
@@ -85,12 +84,12 @@ _LnafSeQualityConfig _qualityConfigFor(LnafSeQualityMode mode) {
         polygonFallbackMix: 0,
         internalBandPx: 0,
         wideSweepFullSpan: true,
-        wideSweepBoost: 0,
+        wideSweepBoost: 40,
       );
     case LnafSeQualityMode.ultra:
       return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
+        bandBias: 4,
+        maxBand: 5,
         lutMix: 0,
         softnessQ8: 768,
         cinematicPasses: 0,
@@ -98,12 +97,12 @@ _LnafSeQualityConfig _qualityConfigFor(LnafSeQualityMode mode) {
         polygonFallbackMix: 0,
         internalBandPx: 0,
         wideSweepFullSpan: true,
-        wideSweepBoost: 0,
+        wideSweepBoost: 56,
       );
     case LnafSeQualityMode.extreme:
       return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
+        bandBias: 6,
+        maxBand: 6,
         lutMix: 0,
         softnessQ8: 1024,
         cinematicPasses: 0,
@@ -111,20 +110,20 @@ _LnafSeQualityConfig _qualityConfigFor(LnafSeQualityMode mode) {
         polygonFallbackMix: 0,
         internalBandPx: 0,
         wideSweepFullSpan: true,
-        wideSweepBoost: 0,
+        wideSweepBoost: 72,
       );
     case LnafSeQualityMode.cinematic:
       return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
+        bandBias: 8,
+        maxBand: 8,
         lutMix: 0,
         softnessQ8: 1536,
-        cinematicPasses: 0,
+        cinematicPasses: 1,
         polygonFallbackGrid: 0,
         polygonFallbackMix: 0,
         internalBandPx: 0,
         wideSweepFullSpan: true,
-        wideSweepBoost: 0,
+        wideSweepBoost: 96,
       );
   }
 }
@@ -321,7 +320,6 @@ class LNAFSERasterizer implements PolygonContract {
   static const int kScale = 256;
   static const int kHalf = 128;
   static const int kInvQ = 20;
-  static const int kMinEdgeDy = 2; // 2/256 px
 
   final int width;
   final int height;
@@ -472,8 +470,7 @@ class LNAFSERasterizer implements PolygonContract {
         final p1 = start + ((i + 1) % count);
         final y0 = (vertices[(p0 << 1) + 1] * kScale).round();
         final y1 = (vertices[(p1 << 1) + 1] * kScale).round();
-        final dyAbs = (y1 - y0).abs();
-        if (dyAbs <= kMinEdgeDy) continue;
+        if (y0 == y1) continue;
         edgeCount++;
       }
     });
@@ -528,8 +525,7 @@ class LNAFSERasterizer implements PolygonContract {
         int y0 = (vertices[p0x + 1] * kScale).round();
         int x1 = (vertices[p1x] * kScale).round();
         int y1 = (vertices[p1x + 1] * kScale).round();
-        final dyAbs = (y1 - y0).abs();
-        if (dyAbs <= kMinEdgeDy) continue;
+        if (y0 == y1) continue;
 
         final winding = (y1 > y0) ? 1 : -1;
 
@@ -1016,8 +1012,6 @@ class LNAFSERasterizer implements PolygonContract {
         spanCov: spanCov,
         useCinematicFilter: false,
         coverageBoost: _qualityCfg.wideSweepBoost,
-        centerSolidFromPx: leftPix + 1,
-        centerSolidToExPx: rightPix,
       );
       return;
     }
@@ -1047,8 +1041,6 @@ class LNAFSERasterizer implements PolygonContract {
         spanCov: spanCov,
         useCinematicFilter: useCinematicFilter,
         coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
       return;
     }
@@ -1078,8 +1070,6 @@ class LNAFSERasterizer implements PolygonContract {
         spanCov: spanCov,
         useCinematicFilter: useCinematicFilter,
         coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
     }
 
@@ -1115,8 +1105,6 @@ class LNAFSERasterizer implements PolygonContract {
         spanCov: spanCov,
         useCinematicFilter: useCinematicFilter,
         coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
     }
   }
@@ -1273,19 +1261,6 @@ class LNAFSERasterizer implements PolygonContract {
     bool insidePositiveL,
     bool insidePositiveR,
   ) {
-    final leftMin = xLTop < xLBot ? xLTop : xLBot;
-    final leftMax = xLTop > xLBot ? xLTop : xLBot;
-    final rightMin = xRTop < xRBot ? xRTop : xRBot;
-    final rightMax = xRTop > xRBot ? xRTop : xRBot;
-    final pxRight = pxLeft + kScale;
-
-    // Strong classify to avoid horizontal artifact bands:
-    // if pixel column stays fully between swept left/right edges for the entire
-    // scanline strip, force solid 255.
-    if (leftMax <= pxLeft && rightMin >= pxRight) return 255;
-    // If no overlap with strip, force 0.
-    if (rightMax <= pxLeft || leftMin >= pxRight) return 0;
-
     final covR = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
     final covL = _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
     int cov = covR - covL;
@@ -1414,8 +1389,6 @@ class LNAFSERasterizer implements PolygonContract {
     required int spanCov,
     required bool useCinematicFilter,
     required int coverageBoost,
-    required int centerSolidFromPx,
-    required int centerSolidToExPx,
   }) {
     final len = pxEEx - pxS;
     if (len <= 0) return;
@@ -1446,11 +1419,6 @@ class LNAFSERasterizer implements PolygonContract {
     i = 0;
     for (int px = pxS; px < pxEEx; px++, i++) {
       int a = _aaWorkA[i];
-      if (centerSolidFromPx < centerSolidToExPx &&
-          px >= centerSolidFromPx &&
-          px < centerSolidToExPx) {
-        a = 255;
-      }
       if (coverageBoost > 0 && a > 0 && a < 255) {
         a = a + (((255 - a) * coverageBoost + 127) >> 8);
         if (a > 255) a = 255;
@@ -1738,6 +1706,12 @@ class LNAFSERasterizer implements PolygonContract {
   }
 
   @pragma('vm:prefer-inline')
+  static int _div255Fast(int x) {
+    final y = x + 128;
+    return (y + (y >> 8)) >> 8;
+  }
+
+  @pragma('vm:prefer-inline')
   static int _blendOver(int dst, int sr, int sg, int sb, int sa) {
     if (sa <= 0) return dst;
     if (sa >= 255) return (0xFF << 24) | (sr << 16) | (sg << 8) | sb;
@@ -1746,10 +1720,10 @@ class LNAFSERasterizer implements PolygonContract {
     final dg = (dst >>> 8) & 255;
     final db = dst & 255;
     final invA = 255 - sa;
-    final outA = sa + ((da * invA + 127) ~/ 255);
-    final outR = ((sr * sa + dr * invA) + 127) ~/ 255;
-    final outG = ((sg * sa + dg * invA) + 127) ~/ 255;
-    final outB = ((sb * sa + db * invA) + 127) ~/ 255;
+    final outA = sa + _div255Fast(da * invA);
+    final outR = _div255Fast(sr * sa + dr * invA);
+    final outG = _div255Fast(sg * sa + dg * invA);
+    final outB = _div255Fast(sb * sa + db * invA);
     return (outA << 24) | (outR << 16) | (outG << 8) | outB;
   }
 

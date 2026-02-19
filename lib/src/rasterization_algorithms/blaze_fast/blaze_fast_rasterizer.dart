@@ -6,8 +6,6 @@
 /// Sem AA: escreve pixels sólidos (even-odd) para polígonos simples.
 /// ============================================================================
 
-
-
 import 'dart:typed_data';
 
 class ScanlineRasterizer {
