@@ -442,6 +442,41 @@ Future<void> main() async {
     print('  SSAA failed: $e');
   }
 
+  // ─── MSAA ──────────────────────────────────────────────────────────────
+  print('Testing MSAA (4x4)...');
+  try {
+    final msaa =
+        MSAARasterizer(width: width, height: height, samplesPerAxis: 4, enableTileCulling: false);
+    results.add(await runBenchmark(
+      'MSAA 4x4',
+      (vertices, color) => msaa.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => msaa.clear(0xFFFFFFFF),
+    ));
+    await saveImage('MSAA_4x4', msaa.buffer, width, height);
+  } catch (e) {
+    print('  MSAA failed: $e');
+  }
+
+  // ─── TESSELLATION ──────────────────────────────────────────────────────
+  print('Testing TESSELLATION...');
+  try {
+    final tess = TessellationRasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'TESSELLATION',
+      (vertices, color) => tess.drawPolygon(vertices, color),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => tess.clear(0xFFFFFFFF),
+    ));
+    await saveImage('TESSELLATION', tess.buffer, width, height);
+  } catch (e) {
+    print('  TESSELLATION failed: $e');
+  }
+
   // ─── WAVELET_HAAR ──────────────────────────────────────────────────────
   print('Testing WAVELET_HAAR...');
   try {
@@ -606,16 +641,75 @@ Future<void> main() async {
   // ─── LNAF_SE ────────────────────────────────────────────────────────────
   print('Testing LNAF_SE (Lattice-Normal Alpha Field)...');
   try {
-    final lnaf = LNAFSERasterizer(width: width, height: height);
-    results.add(await runBenchmark(
-      'LNAF_SE',
-      (vertices, color) => lnaf.drawPolygon(vertices, color),
-      polygons,
-      warmup,
-      iterations,
-      clear: () => lnaf.clear(0xFFFFFFFF),
-    ));
-    await saveImage('LNAF_SE', lnaf.buffer, width, height);
+    Future<void> warmupLnafMode(LnafSeQualityMode quality) async {
+      final warm = LNAFSERasterizer(
+        width: width,
+        height: height,
+        qualityMode: quality,
+      );
+      warm.clear(0xFFFFFFFF);
+      for (final poly in polygons) {
+        warm.drawPolygon(poly, 0xFFFF0000);
+      }
+    }
+
+    Future<void> runLnafVariant({
+      required String label,
+      required String imageName,
+      required LnafSeQualityMode quality,
+      String? extraImageName,
+    }) async {
+      final lnaf = LNAFSERasterizer(
+        width: width,
+        height: height,
+        qualityMode: quality,
+      );
+      results.add(await runBenchmark(
+        label,
+        (vertices, color) => lnaf.drawPolygon(vertices, color),
+        polygons,
+        warmup,
+        iterations,
+        clear: () => lnaf.clear(0xFFFFFFFF),
+      ));
+      await saveImage(imageName, lnaf.buffer, width, height);
+      if (extraImageName != null && extraImageName.isNotEmpty) {
+        await saveImage(extraImageName, lnaf.buffer, width, height);
+      }
+    }
+
+    await warmupLnafMode(LnafSeQualityMode.fast);
+    await warmupLnafMode(LnafSeQualityMode.high);
+    await warmupLnafMode(LnafSeQualityMode.ultra);
+    await warmupLnafMode(LnafSeQualityMode.extreme);
+    await warmupLnafMode(LnafSeQualityMode.cinematic);
+
+    await runLnafVariant(
+      label: 'LNAF_SE (Fast)',
+      imageName: 'LNAF_SE_FAST',
+      quality: LnafSeQualityMode.fast,
+    );
+    await runLnafVariant(
+      label: 'LNAF_SE (High)',
+      imageName: 'LNAF_SE_HIGH',
+      quality: LnafSeQualityMode.high,
+    );
+    await runLnafVariant(
+      label: 'LNAF_SE (Ultra)',
+      imageName: 'LNAF_SE_ULTRA',
+      quality: LnafSeQualityMode.ultra,
+    );
+    await runLnafVariant(
+      label: 'LNAF_SE (Extreme)',
+      imageName: 'LNAF_SE_EXTREME',
+      quality: LnafSeQualityMode.extreme,
+    );
+    await runLnafVariant(
+      label: 'LNAF_SE',
+      imageName: 'LNAF_SE',
+      quality: LnafSeQualityMode.fast,
+      extraImageName: 'LNAF_SE_FAST_DEFAULT',
+    );
   } catch (e) {
     print('  LNAF_SE failed: $e');
   }

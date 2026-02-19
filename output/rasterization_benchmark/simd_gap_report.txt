@@ -1,10 +1,10 @@
 SIMD GAP REPORT (Scalar vs SIMD, lower is better)
 Algorithm                      Scalar      SIMD        Delta       Status
 --------------------------------------------------------------------------
-B2D v2 (Imm)                      2.53ms  147.30ms +144.77ms +5718.8% SIMD slower (58.19x)
-B2D v1                           12.92ms  524.19ms +511.27ms +3956.0% SIMD slower (40.56x)
-B2D v2 (Batch)                    2.32ms   37.81ms +35.49ms +1526.4% SIMD slower (16.26x)
-B2D v2 (Batch+Iso)                6.91ms   23.99ms +17.08ms +247.2% SIMD slower (3.47x)
-B2D v1 (Iso)                    190.19ms  402.75ms +212.56ms +111.8% SIMD slower (2.12x)
-SKIA                              4.05ms    7.89ms  +3.84ms +94.7% SIMD slower (1.95x)
+B2D v2 (Imm)                      2.81ms  154.85ms +152.04ms +5410.5% SIMD slower (55.11x)
+B2D v1                           13.50ms  516.47ms +502.98ms +3726.8% SIMD slower (38.27x)
+B2D v2 (Batch)                    2.44ms   38.81ms +36.36ms +1487.4% SIMD slower (15.87x)
+B2D v2 (Batch+Iso)                6.98ms   25.72ms +18.74ms +268.4% SIMD slower (3.68x)
+SKIA                              4.10ms    8.49ms +4.39ms +107.0% SIMD slower (2.07x)
+B2D v1 (Iso)                    209.33ms  428.26ms +218.93ms +104.6% SIMD slower (2.05x)
 

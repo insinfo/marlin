@@ -457,6 +457,44 @@ List<RasterizerAdapter> _buildAdapters() {
 
       return _uint32ToRGBA(r.buffer);
     }),
+    FunctionAdapter('MSAA_4x4', (polygons) async {
+      final r = MSAARasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        samplesPerAxis: 4,
+        enableTileCulling: false,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('TESSELLATION', (polygons) async {
+      final r = TessellationRasterizer(
+        width: renderWidth,
+        height: renderHeight,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
     /*
     FunctionAdapter('SSAA', (polygons) async {
       final r = SSAARasterizer(
@@ -598,8 +636,107 @@ List<RasterizerAdapter> _buildAdapters() {
 
       return _uint32ToRGBA(r.buffer);
     }),
+    FunctionAdapter('LNAF_SE (Fast)', (polygons) async {
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.fast,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('LNAF_SE (High)', (polygons) async {
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.high,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('LNAF_SE (Ultra)', (polygons) async {
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.ultra,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('LNAF_SE (Extreme)', (polygons) async {
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.extreme,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
+    FunctionAdapter('LNAF_SE (Cinematic)', (polygons) async {
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.cinematic,
+      );
+      r.clear(0xFFFFFFFF);
+
+      for (final poly in polygons) {
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
+      }
+
+      return _uint32ToRGBA(r.buffer);
+    }),
     FunctionAdapter('LNAF_SE', (polygons) async {
-      final r = LNAFSERasterizer(width: renderWidth, height: renderHeight);
+      final r = LNAFSERasterizer(
+        width: renderWidth,
+        height: renderHeight,
+        qualityMode: LnafSeQualityMode.fast,
+      );
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {

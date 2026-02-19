@@ -55,8 +55,10 @@ export 'src/rasterization_algorithms/skia_scanline/skia_scanline_rasterizer.dart
 export 'src/rasterization_algorithms/edge_flag_aa/edge_flag_aa_rasterizer.dart'
     hide ScanEdge;
 export 'src/rasterization_algorithms/blaze_fast/blaze_fast_rasterizer.dart';
-export 'src/rasterization_algorithms/ultra_quality/ssaa_rasterizer.dart';
+export 'src/rasterization_algorithms/ssaa/ssaa_rasterizer.dart';
 export 'src/rasterization_algorithms/wavelet_haar/wavelet_haar_rasterizer.dart';
+export 'src/rasterization_algorithms/msaa_2d/msaa_rasterizer.dart';
+export 'src/rasterization_algorithms/tessellation/tessellation_rasterizer.dart';
 export 'src/rasterization_algorithms/common/polygon_contract.dart';
 
 
