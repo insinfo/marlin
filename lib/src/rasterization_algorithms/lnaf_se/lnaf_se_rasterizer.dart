@@ -321,7 +321,9 @@ class LNAFSERasterizer implements PolygonContract {
   static const int kScale = 256;
   static const int kHalf = 128;
   static const int kInvQ = 20;
-  static const int kMinEdgeDy = 2; // 2/256 px
+  static const int kMinEdgeDy = 0; // keep all non-horizontal edges
+  static const int kFlatEdgeDy = 4; // 4/256 px
+  static const int kFlatSlopeShift = 5; // dx >= dy * 32 => near-horizontal
 
   final int width;
   final int height;
@@ -430,6 +432,16 @@ class LNAFSERasterizer implements PolygonContract {
     return -(((-num) + (den >> 1)) ~/ den);
   }
 
+  @pragma('vm:prefer-inline')
+  static bool _skipEdgeBySlope(int dxAbs, int dyAbs) {
+    if (dyAbs <= kMinEdgeDy) return true;
+    // Suppress ultra-flat micro-edges that create horizontal streak artifacts.
+    if (dyAbs <= kFlatEdgeDy && dxAbs >= (dyAbs << kFlatSlopeShift)) {
+      return true;
+    }
+    return false;
+  }
+
   void _buildEdges(List<double> vertices, List<int>? contourCounts) {
     final totalPoints = vertices.length >> 1;
     bool useSingleContour;
@@ -470,10 +482,13 @@ class LNAFSERasterizer implements PolygonContract {
       for (int i = 0; i < count; i++) {
         final p0 = start + i;
         final p1 = start + ((i + 1) % count);
+        final x0 = (vertices[p0 << 1] * kScale).round();
+        final x1 = (vertices[p1 << 1] * kScale).round();
         final y0 = (vertices[(p0 << 1) + 1] * kScale).round();
         final y1 = (vertices[(p1 << 1) + 1] * kScale).round();
+        final dxAbs = (x1 - x0).abs();
         final dyAbs = (y1 - y0).abs();
-        if (dyAbs <= kMinEdgeDy) continue;
+        if (_skipEdgeBySlope(dxAbs, dyAbs)) continue;
         edgeCount++;
       }
     });
@@ -528,8 +543,9 @@ class LNAFSERasterizer implements PolygonContract {
         int y0 = (vertices[p0x + 1] * kScale).round();
         int x1 = (vertices[p1x] * kScale).round();
         int y1 = (vertices[p1x + 1] * kScale).round();
+        final dxAbs = (x1 - x0).abs();
         final dyAbs = (y1 - y0).abs();
-        if (dyAbs <= kMinEdgeDy) continue;
+        if (_skipEdgeBySlope(dxAbs, dyAbs)) continue;
 
         final winding = (y1 > y0) ? 1 : -1;
 
@@ -706,9 +722,9 @@ class LNAFSERasterizer implements PolygonContract {
       for (int i = 0; i < _activeCount; i++) {
         final e = _active[i];
         if (y >= _eYEnd[e]) continue;
-        _ix[n] = _eX[e];
+        // Use exact per-scanline intersection to avoid DDA drift artifacts.
+        _ix[n] = _edgeXAtY(e, yCenter);
         _ie[n] = e;
-        _eX[e] = _eX[e] + _eDx[e];
         _active[n] = e;
         n++;
       }
@@ -1274,17 +1290,10 @@ class LNAFSERasterizer implements PolygonContract {
     bool insidePositiveR,
   ) {
     final leftMin = xLTop < xLBot ? xLTop : xLBot;
-    final leftMax = xLTop > xLBot ? xLTop : xLBot;
-    final rightMin = xRTop < xRBot ? xRTop : xRBot;
     final rightMax = xRTop > xRBot ? xRTop : xRBot;
-    final pxRight = pxLeft + kScale;
 
-    // Strong classify to avoid horizontal artifact bands:
-    // if pixel column stays fully between swept left/right edges for the entire
-    // scanline strip, force solid 255.
-    if (leftMax <= pxLeft && rightMin >= pxRight) return 255;
-    // If no overlap with strip, force 0.
-    if (rightMax <= pxLeft || leftMin >= pxRight) return 0;
+    // Invalid or inverted span at this row; reject to avoid horizontal streaks.
+    if (rightMax <= leftMin) return 0;
 
     final covR = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
     final covL = _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
@@ -1304,6 +1313,10 @@ class LNAFSERasterizer implements PolygonContract {
         softnessQ8: _qualityCfg.softnessQ8,
       );
     }
+    // Suppress very-low/high quantization residue that appears as horizontal
+    // streaks on real SVGs with many near-horizontal micro-segments.
+    if (cov <= 2) return 0;
+    if (cov >= 253) return 255;
     return cov;
   }
 

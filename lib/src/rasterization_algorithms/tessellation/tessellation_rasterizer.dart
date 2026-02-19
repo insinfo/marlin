@@ -119,16 +119,27 @@ class TessellationRasterizer {
     }
     if (_contourScratch.isEmpty) return;
 
+    // Earcut path in this rasterizer is fragile with many contours/holes from
+    // real-world SVGs. Use a robust scanline fallback for multi-contour paths.
+    if (_contourScratch.length > 1) {
+      _rasterizeContoursFallback(_contourScratch, color, windingRule);
+      return;
+    }
+
     _trianglesScratch.clear();
     List<double> triangles;
     try {
       triangles =
           _triangulateContours(_contourScratch, _trianglesScratch, windingRule);
     } catch (e) {
-      _debug('Triangulation skipped polygon due to error: $e');
+      _debug('Triangulation fallback due to error: $e');
+      _rasterizeContoursFallback(_contourScratch, color, windingRule);
       return;
     }
-    if (triangles.isEmpty) return;
+    if (triangles.isEmpty) {
+      _rasterizeContoursFallback(_contourScratch, color, windingRule);
+      return;
+    }
 
     _rasterizeTriangles(triangles, color);
   }
@@ -289,6 +300,115 @@ class TessellationRasterizer {
       cursor += step;
     }
     return out;
+  }
+
+  void _rasterizeContoursFallback(
+      List<List<double>> contours, int color, int windingRule) {
+    if (contours.isEmpty) return;
+
+    double minX = double.infinity;
+    double minY = double.infinity;
+    double maxX = double.negativeInfinity;
+    double maxY = double.negativeInfinity;
+    for (final contour in contours) {
+      final n = contour.length >> 1;
+      for (int i = 0; i < n; i++) {
+        final x = contour[i << 1];
+        final y = contour[(i << 1) + 1];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (!minX.isFinite || !minY.isFinite || !maxX.isFinite || !maxY.isFinite) {
+      return;
+    }
+
+    int xStart = minX.floor();
+    int yStart = minY.floor();
+    int xEndEx = maxX.ceil();
+    int yEnd = maxY.ceil() - 1;
+    if (xStart < 0) xStart = 0;
+    if (yStart < 0) yStart = 0;
+    if (xEndEx > width) xEndEx = width;
+    if (yEnd >= height) yEnd = height - 1;
+    if (xEndEx <= xStart || yEnd < yStart) return;
+
+    final offsets = _sampleOffsets;
+    final samplesLen = offsets.length;
+    final srcA = (color >>> 24) & 255;
+
+    for (int y = yStart; y <= yEnd; y++) {
+      final row = y * width;
+      for (int x = xStart; x < xEndEx; x++) {
+        int hits = 0;
+        for (int s = 0; s < samplesLen; s += 2) {
+          final px = x + offsets[s];
+          final py = y + offsets[s + 1];
+          if (_pointInContours(px, py, contours, windingRule)) {
+            hits++;
+          }
+        }
+        if (hits == 0) continue;
+        final aa = _alphaLut[hits];
+        if (aa <= 0) continue;
+        final effA = srcA >= 255 ? aa : ((aa * srcA + 127) ~/ 255);
+        if (effA >= 255) {
+          _buffer[row + x] = color;
+        } else if (effA > 0) {
+          _blendPixel(x, y, color, effA);
+        }
+      }
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  bool _pointInContours(
+      double x, double y, List<List<double>> contours, int windingRule) {
+    if (windingRule == 0) {
+      bool inside = false;
+      for (final poly in contours) {
+        final n = poly.length >> 1;
+        int j = n - 1;
+        double xj = poly[j << 1];
+        double yj = poly[(j << 1) + 1];
+        for (int i = 0; i < n; i++) {
+          final xi = poly[i << 1];
+          final yi = poly[(i << 1) + 1];
+          if ((yi > y) != (yj > y)) {
+            final t = (y - yi) / (yj - yi);
+            final ix = xi + (xj - xi) * t;
+            if (ix >= x) inside = !inside;
+          }
+          j = i;
+          xj = xi;
+          yj = yi;
+        }
+      }
+      return inside;
+    }
+
+    int winding = 0;
+    for (final poly in contours) {
+      final n = poly.length >> 1;
+      int j = n - 1;
+      double xj = poly[j << 1];
+      double yj = poly[(j << 1) + 1];
+      for (int i = 0; i < n; i++) {
+        final xi = poly[i << 1];
+        final yi = poly[(i << 1) + 1];
+        if ((yi > y) != (yj > y)) {
+          final t = (y - yi) / (yj - yi);
+          final ix = xi + (xj - xi) * t;
+          if (ix >= x) winding += yj > yi ? 1 : -1;
+        }
+        j = i;
+        xj = xi;
+        yj = yi;
+      }
+    }
+    return winding != 0;
   }
 
   List<double> _triangulateContours(
