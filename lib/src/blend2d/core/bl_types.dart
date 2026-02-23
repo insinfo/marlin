@@ -127,3 +127,97 @@ class BLPattern {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Stroke types (Fase 5 - port do PathStroker do Blend2D)
+// ---------------------------------------------------------------------------
+
+/// Estilo de cap para extremidades de contornos abertos.
+/// Alinhado com BLStrokeCap do C++.
+enum BLStrokeCap {
+  /// Termina exatamente no ponto final (padrão).
+  butt,
+
+  /// Estende o cap em halfWidth além do ponto final (forma quadrada).
+  square,
+
+  /// Cap circular com raio = halfWidth.
+  round,
+
+  /// Cap circular recuado (inverso do round).
+  roundRev,
+
+  /// Cap triangular apontando para fora.
+  triangle,
+
+  /// Cap triangular apontando para dentro.
+  triangleRev,
+}
+
+/// Estilo de join para vértices internos de contornos.
+/// Alinhado com BLStrokeJoin do C++.
+enum BLStrokeJoin {
+  /// Chanfrado simples (bevel).
+  bevel,
+
+  /// Miter cortado quando excede o limite.
+  miterClip,
+
+  /// Miter com fallback para bevel.
+  miterBevel,
+
+  /// Miter com fallback para round.
+  miterRound,
+
+  /// Join circular.
+  round,
+}
+
+/// Opções de stroke usadas por BLContext.strokePath() e BLStroker.
+/// Equivalente a BLStrokeOptions do C++.
+class BLStrokeOptions {
+  /// Largura total do stroke.
+  final double width;
+
+  /// Limite do miter (em múltiplos de halfWidth).
+  /// Default 4.0 corresponde a BL_STROKE_MITER_LIMIT_DEFAULT.
+  final double miterLimit;
+
+  /// Cap do início do contorno.
+  final BLStrokeCap startCap;
+
+  /// Cap do fim do contorno.
+  final BLStrokeCap endCap;
+
+  /// Estilo de join nos vértices internos.
+  final BLStrokeJoin join;
+
+  /// Tolerância de flatten para curvas (De Casteljau).
+  final double flattenTolerance;
+
+  const BLStrokeOptions({
+    this.width = 1.0,
+    this.miterLimit = 4.0,
+    this.startCap = BLStrokeCap.butt,
+    this.endCap = BLStrokeCap.butt,
+    this.join = BLStrokeJoin.bevel,
+    this.flattenTolerance = 0.25,
+  });
+
+  BLStrokeOptions copyWith({
+    double? width,
+    double? miterLimit,
+    BLStrokeCap? startCap,
+    BLStrokeCap? endCap,
+    BLStrokeJoin? join,
+    double? flattenTolerance,
+  }) {
+    return BLStrokeOptions(
+      width: width ?? this.width,
+      miterLimit: miterLimit ?? this.miterLimit,
+      startCap: startCap ?? this.startCap,
+      endCap: endCap ?? this.endCap,
+      join: join ?? this.join,
+      flattenTolerance: flattenTolerance ?? this.flattenTolerance,
+    );
+  }
+}

@@ -4,6 +4,7 @@ export 'context/bl_context.dart';
 export 'core/bl_image.dart';
 export 'core/bl_types.dart';
 export 'geometry/bl_path.dart';
+export 'geometry/bl_stroker.dart';
 export 'pipeline/bl_compop_kernel.dart';
 export 'pipeline/bl_fetch_linear_gradient.dart';
 export 'pipeline/bl_fetch_pattern.dart';

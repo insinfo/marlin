@@ -2,9 +2,14 @@ class BLPathData {
   final List<double> vertices;
   final List<int>? contourVertexCounts;
 
+  /// `contourClosed[i]` é true se o contorno i foi fechado explicitamente
+  /// via `close()`. Usado pelo stroker para decidir caps vs join de fechamento.
+  final List<bool>? contourClosed;
+
   const BLPathData({
     required this.vertices,
     required this.contourVertexCounts,
+    this.contourClosed,
   });
 }
 
@@ -12,6 +17,7 @@ class BLPathData {
 class BLPath {
   final List<double> _vertices = <double>[];
   final List<int> _contourCounts = <int>[];
+  final List<bool> _contourClosed = <bool>[];
   static const int _maxCurveDepth = 16;
 
   bool _hasCurrent = false;
@@ -74,10 +80,11 @@ class BLPath {
     _flattenCubic(_lastX, _lastY, c1x, c1y, c2x, c2y, x, y, tolSq, 0);
   }
 
-  /// Fecha o contorno atual (fechamento implicito no raster).
+  /// Fecha o contorno atual explicitamente.
+  /// Marca o contorno como closed para o stroker (sem cap nas extremidades).
   void close() {
     if (!_hasCurrent) return;
-    _finishContour();
+    _finishContour(closed: true);
   }
 
   BLPathData toPathData() {
@@ -86,20 +93,26 @@ class BLPath {
       vertices: List<double>.from(_vertices),
       contourVertexCounts:
           _contourCounts.isEmpty ? null : List<int>.from(_contourCounts),
+      contourClosed:
+          _contourClosed.isEmpty ? null : List<bool>.from(_contourClosed),
     );
   }
 
   void clear() {
     _vertices.clear();
     _contourCounts.clear();
+    _contourClosed.clear();
     _hasCurrent = false;
     _currentCount = 0;
   }
 
-  void _finishContour() {
+  void _finishContour({bool closed = false}) {
     if (!_hasCurrent) return;
-    if (_currentCount >= 3) {
+    if (_currentCount >= 2) {
+      // Aceita contornos de 2+ pontos para stroke (linhas abertas).
+      // O raster ignora contornos com < 3 pontos via fillPolygon.
       _contourCounts.add(_currentCount);
+      _contourClosed.add(closed);
     } else {
       // Remove vertices insuficientes do contorno atual.
       final removeCount = _currentCount * 2;

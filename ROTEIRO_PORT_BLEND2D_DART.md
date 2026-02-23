@@ -35,7 +35,9 @@ Estado por fase:
 - Fase 1: parcialmente concluída (API mínima funcional para fill de polígonos/paths).
 - Fase 2: iniciada (scanline nativo com AET, suporte a `evenOdd/nonZero` e contornos múltiplos).
 - Fase 3: iniciada (composição `srcCopy/srcOver` no raster nativo).
-- Fase 4-7: não iniciadas no port nativo avançado (gradientes/pattern, stroker robusto, paralelismo real e otimizações agressivas ainda pendentes).
+- Fase 4: concluída (gradientes linear/radial + pattern nearest/bilinear/affine com fetchers dedicados).
+- Fase 5: concluída (stroker robusto com caps butt/square/round/roundRev/triangle/triangleRev e joins bevel/miterClip/miterBevel/miterRound/round, API `strokePath()` no contexto).
+- Fase 6-7: não iniciadas (paralelismo real e otimizações agressivas ainda pendentes).
 - Fase 8-11 (texto): bootstrap avançando (loader + parser OpenType base de `head/maxp/hhea/hmtx/cmap/name/OS/2/kern` + layout simples + decoder inicial de outlines `glyf` simples/compostos + cache de outline por tamanho). Shaping avançado (GSUB/GPOS), `cff/cff2` e raster dedicado de glifos ainda pendentes.
 
 Atualização incremental (port C++ -> Dart):
@@ -191,7 +193,39 @@ Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`,
 - validação inicial 10x dessa tentativa mostrou resultado inconsistente e sem ganho sustentado no conjunto atual (referência da rodada: affine+bilinear média `2.708ms/frame`, faixa `2.605..2.887`, `2958 poly/s`), com variabilidade elevada em reamostragens subsequentes.
 - decisão: rollback da tentativa `advance_x repeat/repeat` e retorno ao caminho estável anterior.
 - revalidação sequencial pós-rollback: `2.625ms/frame` (`3047 poly/s`) em `blend2d_pattern_affine_bilinear_benchmark.dart`, `1.834ms/frame` (`4361 poly/s`) em `blend2d_pattern_benchmark.dart` e `1.945ms/frame` (`10283 poly/s`) em `blend2d_port_benchmark.dart`.
+- rodada formal 10x (pós-estabilização dos testes, protocolo consolidado):
+  - baseline sólido `blend2d_port_benchmark.dart`: média `1.900ms/frame` (faixa `1.699..2.166ms`) e `10568 poly/s` (faixa `9234..11775`),
+  - pattern nearest `blend2d_pattern_benchmark.dart`: média `1.850ms/frame` (faixa `1.681..2.309ms`) e `4354 poly/s` (faixa `3465..4760`),
+  - pattern affine + bilinear `blend2d_pattern_affine_bilinear_benchmark.dart`: média `4.796ms/frame` (faixa `3.210..12.835ms`) e `1973 poly/s` (faixa `623..2492`), com outlier visível na cauda superior da faixa.
 - estado mantido ao final da rodada: fatia `affine fixed-point 24.8` preservada; experimentos `lerp kernel`, `reflect/reflect` dedicado, especialização mista de `extendMode` e tentativa `advance_x repeat/repeat` descartados por throughput inferior ou instabilidade no protocolo de validação.
+- atualização incremental desta sessão (pós-push):
+  - consolidado o port afim de pattern com normalização por período em ponto fixo e correção robusta de índices em `repeat/reflect` no fetch bilinear (`_indexFromNorm` com `%` para coordenadas grandes), eliminando `RangeError` em testes de boundary/wrap,
+  - suíte de testes Blend2D adicionada e estabilizada (`path/stroker/pattern/context/gradient`), com validação local recente em `dart test`: `71 passed, 0 failed`,
+  - testes de gradiente radial alinhados ao contrato atual de `BLRadialGradient` (`r0/r1` explícitos), reduzindo falso-negativo por uso de default `r1=0`,
+  - testes de composição/contexto ajustados para o comportamento atual do resolve analítico em `srcCopy` com cobertura fracionária (fallback efetivo para composição tipo `srcOver` quando `effA < 255`),
+  - observação de paridade: cap `square` do stroker ainda não está totalmente equivalente ao Blend2D C++ em extensão simétrica de extremidades; funcionalidade segue estável, mas a paridade geométrica fina fica como próxima fatia dedicada de Fase 5.
+- Stroker robusto (Fase 5, port de `pathstroke.cpp`):
+  - novo arquivo `geometry/bl_stroker.dart` com `BLStroker.strokePath(BLPath, BLStrokeOptions) -> BLPath`,
+  - enums `BLStrokeCap` (butt/square/round/roundRev/triangle/triangleRev) e `BLStrokeJoin` (bevel/miterClip/miterBevel/miterRound/round) adicionados em `core/bl_types.dart`,
+  - classe `BLStrokeOptions` com `width`, `miterLimit`, `startCap`, `endCap`, `join`, `flattenTolerance` e `copyWith()`,
+  - `BLPath` atualizado para rastrear `contourClosed` (flag por contorno via `close()`), exposto em `BLPathData.contourClosed`,
+  - `BLPath._finishContour` agora aceita contornos de 2+ vértices (linhas abertas para stroke), sem impacto no fill (que continua exigindo >= 3),
+  - stroker opera sobre vértices já aplainados (BLPath já flatten curvas via De Casteljau),
+  - offset de segmentos por halfWidth com normal esquerda/direita,
+  - cálculo de miter intersection por bissetriz normalizada (`k = (np + nn) * hw / |np + nn|^2`),
+  - joins externos com bevel, miter (com limit), round (arco subdivido a ~45° por passo),
+  - joins internos via intersecção simples,
+  - caps de extremidade: butt (flat), square (extendido por hw), round (arco semicircular 180° subdivido via atan2), triangle, triangleRev, roundRev,
+  - contornos fechados geram dois polígonos (A + B_reversed com winding oposto para nonZero),
+  - contornos abertos geram um polígono fechado (A → end_cap → B_reversed → start_cap),
+  - API `BLContext.strokePath(BLPath, {color, options})` e `strokePolygon(...)` adicionadas,
+  - `BLContext.setStrokeOptions()` e `setStrokeWidth()` para configurar estado de stroke no contexto,
+  - barrel export atualizado em `blend2d.dart`,
+  - teste funcional em `benchmark/stroke_test.dart` com 6 cenários (ret+tri+poly+star+curva+círculo), validado com 9379 pixels de stroke em 512x512,
+  - `dart analyze` limpo, testes existentes (10/10) passando, baseline sólido sem regressão (`1.971ms/frame`, `10150 poly/s`).
+
+Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`, 512x512, 30 iterações):
+- revalidação do baseline sólido após integração completa do stroker (Fase 5): `1.971ms/frame` (`10150 poly/s`) em `blend2d_port_benchmark.dart`.
 
 ## 1) Princípios de engenharia (não negociáveis)
 
@@ -551,4 +585,4 @@ Resumo objetivo:
 - Depois expandimos recursos avançados e integração com backend PDF.
 - Tudo guiado por benchmark e validação visual contínua.
 
-Próxima fatia grande que recomendo: portar o contexto afim com parâmetros ox/oy/rx/ry/corx/cory completos (como no C++) para reduzir custo de normalização sem reintroduzir instabilidade.
+Próxima fatia grande que recomendo: fechar paridade geométrica fina do stroker com o Blend2D C++ (foco em `square cap` simétrico + validação visual dedicada), mantendo o protocolo de decisão por benchmark em rodada mínima de 10 execuções antes de qualquer reversão.

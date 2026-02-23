@@ -4,6 +4,7 @@ import '../pipeline/bl_fetch_linear_gradient.dart';
 import '../pipeline/bl_fetch_pattern.dart';
 import '../pipeline/bl_fetch_radial_gradient.dart';
 import '../geometry/bl_path.dart';
+import '../geometry/bl_stroker.dart';
 import '../pipeline/bl_fetch_solid.dart';
 import '../raster/bl_analytic_rasterizer.dart';
 
@@ -32,6 +33,9 @@ class BLContext {
   BLRadialGradientFetcher? _radialGradientFetcher;
   BLPatternFetcher? _patternFetcher;
   _BLFillStyleType _fillStyleType = _BLFillStyleType.solid;
+
+  /// Opções de stroke (largura, caps, joins) para [strokePath].
+  BLStrokeOptions strokeOptions = const BLStrokeOptions();
 
   BLContext(
     this.image, {
@@ -172,6 +176,68 @@ class BLContext {
       color: color,
       rule: rule,
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stroke API (Fase 5)
+  // ---------------------------------------------------------------------------
+
+  /// Configura as opções de stroke (largura, caps, joins, miter limit).
+  void setStrokeOptions(BLStrokeOptions options) {
+    strokeOptions = options;
+  }
+
+  /// Configura apenas a largura do stroke.
+  void setStrokeWidth(double width) {
+    strokeOptions = strokeOptions.copyWith(width: width);
+  }
+
+  /// Renderiza o stroke de [path] usando [strokeOptions] atuais.
+  ///
+  /// O stroke é convertido em um outline preenchido com [BLFillRule.nonZero].
+  /// A cor / estilo de fill atuais são usados (ou [color] se fornecido).
+  Future<void> strokePath(
+    BLPath path, {
+    BLColor? color,
+    BLStrokeOptions? options,
+  }) async {
+    final opts = options ?? strokeOptions;
+    if (opts.width <= 0) return;
+
+    final outline = BLStroker.strokePath(path, opts);
+    await fillPath(
+      outline,
+      color: color,
+      rule: BLFillRule.nonZero,
+    );
+  }
+
+  /// Renderiza o stroke de um polígono (lista de vértices).
+  Future<void> strokePolygon(
+    List<double> vertices, {
+    List<int>? contourVertexCounts,
+    bool closedContours = true,
+    BLColor? color,
+    BLStrokeOptions? options,
+  }) async {
+    final opts = options ?? strokeOptions;
+    if (opts.width <= 0) return;
+
+    // Montar BLPath a partir dos vértices
+    final path = BLPath();
+    final counts = contourVertexCounts ?? [vertices.length ~/ 2];
+    int offset = 0;
+    for (final cnt in counts) {
+      if (cnt < 2) { offset += cnt; continue; }
+      path.moveTo(vertices[offset * 2], vertices[offset * 2 + 1]);
+      for (int i = 1; i < cnt; i++) {
+        path.lineTo(vertices[(offset + i) * 2], vertices[(offset + i) * 2 + 1]);
+      }
+      if (closedContours) path.close();
+      offset += cnt;
+    }
+
+    await strokePath(path, color: color, options: opts);
   }
 
   Future<void> dispose() => _rasterizer.dispose();
