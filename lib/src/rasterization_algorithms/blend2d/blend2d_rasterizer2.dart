@@ -123,40 +123,18 @@ class Blend2DRasterizer2 {
 
     for (final contour in contours) {
       if (contour.count < 3) continue;
-
-      // Mantém a lógica legada de normalização de winding por contorno.
-      double area2 = 0.0;
+      // Preserva a orientação original dos contornos.
+      // Isso é necessário para non-zero representar furos via contorno interno
+      // com winding oposto.
       for (int local = 0; local < contour.count; local++) {
         final i = contour.start + local;
         final j = contour.start + ((local + 1) % contour.count);
-        area2 += vertices[i * 2] * vertices[j * 2 + 1] -
-            vertices[j * 2] * vertices[i * 2 + 1];
-      }
-
-      final reverse = area2 > 0.0;
-      if (!reverse) {
-        for (int local = 0; local < contour.count; local++) {
-          final i = contour.start + local;
-          final j = contour.start + ((local + 1) % contour.count);
-          _rasterizeEdge(
-            vertices[i * 2],
-            vertices[i * 2 + 1],
-            vertices[j * 2],
-            vertices[j * 2 + 1],
-          );
-        }
-      } else {
-        for (int local = 0; local < contour.count; local++) {
-          final idx = contour.start + (contour.count - 1 - local);
-          final jdx = contour.start +
-              ((idx - contour.start - 1 + contour.count) % contour.count);
-          _rasterizeEdge(
-            vertices[idx * 2],
-            vertices[idx * 2 + 1],
-            vertices[jdx * 2],
-            vertices[jdx * 2 + 1],
-          );
-        }
+        _rasterizeEdge(
+          vertices[i * 2],
+          vertices[i * 2 + 1],
+          vertices[j * 2],
+          vertices[j * 2 + 1],
+        );
       }
     }
   }

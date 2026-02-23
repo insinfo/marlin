@@ -1,5 +1,10 @@
 library lnaf_se;
 
+// Resultado dos benchmarks no projeto:
+// - LUT de cobertura nao melhorou o throughput do LNAF-SE no workload real.
+// - LUT tambem nao trouxe ganho consistente de qualidade visual frente ao Marlin.
+// Diretriz atual: caminho padrao sem LUT, mantendo LUT apenas como opcao de teste.
+
 import 'dart:math' as math;
 import 'dart:typed_data';
 import '../common/polygon_contract.dart';
@@ -7,127 +12,38 @@ import 'lnaf_se_tables.dart';
 
 enum _FillRule { evenOdd, nonZero }
 
-/// Quality presets for LNAF_SE antialiasing.
-///
-/// - `fast`: lower AA bandwidth, maximum speed
-/// - `balanced`: default trade-off
-/// - `high`: wider AA band + LUT edge refinement
-/// - `ultra`: stronger refinement and softer edges
-/// - `extreme`: maximum quality before post-filter
-/// - `cinematic`: post-filtered AA band for the smoothest diagonals
-enum LnafSeQualityMode { fast, balanced, high, ultra, extreme, cinematic }
-
 class _LnafSeQualityConfig {
   final int bandBias;
   final int maxBand;
   final int lutMix;
   final int softnessQ8;
-  final int cinematicPasses;
-  final int polygonFallbackGrid;
-  final int polygonFallbackMix;
-  final int internalBandPx;
   final bool wideSweepFullSpan;
-  final int wideSweepBoost;
   const _LnafSeQualityConfig({
     required this.bandBias,
     required this.maxBand,
     required this.lutMix,
     required this.softnessQ8,
-    required this.cinematicPasses,
-    required this.polygonFallbackGrid,
-    required this.polygonFallbackMix,
-    required this.internalBandPx,
     required this.wideSweepFullSpan,
-    required this.wideSweepBoost,
   });
 }
 
-@pragma('vm:prefer-inline')
-_LnafSeQualityConfig _qualityConfigFor(LnafSeQualityMode mode) {
-  switch (mode) {
-    case LnafSeQualityMode.fast:
-      return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
-        lutMix: 0,
-        softnessQ8: 256,
-        cinematicPasses: 0,
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-    case LnafSeQualityMode.balanced:
-      return const _LnafSeQualityConfig(
-        bandBias: 2,
-        maxBand: 3,
-        lutMix: 0,
-        softnessQ8: 256,
-        cinematicPasses: 0,
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-    case LnafSeQualityMode.high:
-      return const _LnafSeQualityConfig(
-        // Keep the same analytic AA envelope as fast to avoid regressions.
-        bandBias: 1,
-        maxBand: 2,
-        lutMix: 0,
-        softnessQ8: 512,
-        cinematicPasses: 0,
-        // Keep high quality on analytic span AA path; polygon fallback causes
-        // horizontal cuts on complex/self-intersecting contours.
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-    case LnafSeQualityMode.ultra:
-      return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
-        lutMix: 0,
-        softnessQ8: 768,
-        cinematicPasses: 0,
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-    case LnafSeQualityMode.extreme:
-      return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
-        lutMix: 0,
-        softnessQ8: 1024,
-        cinematicPasses: 0,
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-    case LnafSeQualityMode.cinematic:
-      return const _LnafSeQualityConfig(
-        bandBias: 1,
-        maxBand: 2,
-        lutMix: 0,
-        softnessQ8: 1536,
-        cinematicPasses: 0,
-        polygonFallbackGrid: 0,
-        polygonFallbackMix: 0,
-        internalBandPx: 0,
-        wideSweepFullSpan: true,
-        wideSweepBoost: 0,
-      );
-  }
-}
+const int _kEnvBandBias =
+    int.fromEnvironment('LNAF_SE_BAND_BIAS', defaultValue: 1);
+const int _kEnvMaxBand =
+    int.fromEnvironment('LNAF_SE_MAX_BAND', defaultValue: 2);
+const int _kEnvLutMix = int.fromEnvironment('LNAF_SE_LUT_MIX', defaultValue: 0);
+const int _kEnvSoftnessQ8 =
+    int.fromEnvironment('LNAF_SE_SOFTNESS_Q8', defaultValue: 256);
+const bool _kEnvWideSweep =
+    bool.fromEnvironment('LNAF_SE_WIDE_SWEEP', defaultValue: true);
+
+const _LnafSeQualityConfig _kLnafSeConfig = _LnafSeQualityConfig(
+  bandBias: _kEnvBandBias,
+  maxBand: _kEnvMaxBand,
+  lutMix: _kEnvLutMix,
+  softnessQ8: _kEnvSoftnessQ8,
+  wideSweepFullSpan: _kEnvWideSweep,
+);
 
 class LnafSeLut {
   final int dirCount;
@@ -321,22 +237,22 @@ class LNAFSERasterizer implements PolygonContract {
   static const int kScale = 256;
   static const int kHalf = 128;
   static const int kInvQ = 20;
-  static const int kMinEdgeDy = 0; // keep all non-horizontal edges
-  static const int kFlatEdgeDy = 4; // 4/256 px
-  static const int kFlatSlopeShift = 5; // dx >= dy * 32 => near-horizontal
+  static const int kFlatEdgeDy =
+      int.fromEnvironment('LNAF_SE_FLAT_EDGE_DY', defaultValue: 0);
+  static const int kFlatSlopeShift =
+      int.fromEnvironment('LNAF_SE_FLAT_SLOPE_SHIFT', defaultValue: 5);
 
   final int width;
   final int height;
   final bool useSimdFill;
-  final LnafSeQualityMode qualityMode;
   final _LnafSeQualityConfig _qualityCfg;
   final LnafSeLut lut;
   final Uint32List _pixels32;
   Int32x4List? _pixelsV;
 
-  late Int32List _eYStart;
   late Int32List _eYEnd;
-  late Int32List _eX;
+  late Int32List _eXHi;
+  late Int32List _eDxHi;
   late Int32List _eDx;
   late Int32List _eA;
   late Int32List _eB;
@@ -359,19 +275,13 @@ class LNAFSERasterizer implements PolygonContract {
   late Int32List _ie;
   late Int32List _qsL;
   late Int32List _qsR;
-  Int32List _aaWorkA = Int32List(0);
-  Int32List _aaWorkB = Int32List(0);
-  Int32List _vertexWork = Int32List(0);
-  _FillRule _scanRule = _FillRule.nonZero;
-  bool _forcePolygonAaShape = false;
 
   LNAFSERasterizer(
       {required this.width,
       required this.height,
       this.useSimdFill = false,
-      this.qualityMode = LnafSeQualityMode.fast,
       LnafSeLut? lut})
-      : _qualityCfg = _qualityConfigFor(qualityMode),
+      : _qualityCfg = _kLnafSeConfig,
         lut = lut ?? LnafSeLut.build(),
         _pixels32 = Uint32List(width * height) {
     if (useSimdFill) {
@@ -409,8 +319,6 @@ class LNAFSERasterizer implements PolygonContract {
     if (vertices.length < 6) return;
     _buildEdges(vertices, contourVertexCounts);
     if (_edgeCount == 0) return;
-    _forcePolygonAaShape =
-        _qualityCfg.polygonFallbackGrid > 0 && _hasSelfIntersections();
     _rasterize(
       color,
       windingRule == 0 ? _FillRule.evenOdd : _FillRule.nonZero,
@@ -434,9 +342,11 @@ class LNAFSERasterizer implements PolygonContract {
 
   @pragma('vm:prefer-inline')
   static bool _skipEdgeBySlope(int dxAbs, int dyAbs) {
-    if (dyAbs <= kMinEdgeDy) return true;
-    // Suppress ultra-flat micro-edges that create horizontal streak artifacts.
-    if (dyAbs <= kFlatEdgeDy && dxAbs >= (dyAbs << kFlatSlopeShift)) {
+    if (dyAbs <= 0) return true;
+    // Suppress ultra-flat micro-edges that generate long horizontal streaks.
+    if (kFlatEdgeDy > 0 &&
+        dyAbs <= kFlatEdgeDy &&
+        dxAbs >= (dyAbs << kFlatSlopeShift)) {
       return true;
     }
     return false;
@@ -502,9 +412,9 @@ class LNAFSERasterizer implements PolygonContract {
       return;
     }
 
-    _eYStart = Int32List(edgeCount);
     _eYEnd = Int32List(edgeCount);
-    _eX = Int32List(edgeCount);
+    _eXHi = Int32List(edgeCount);
+    _eDxHi = Int32List(edgeCount);
     _eDx = Int32List(edgeCount);
     _eA = Int32List(edgeCount);
     _eB = Int32List(edgeCount);
@@ -571,7 +481,8 @@ class LNAFSERasterizer implements PolygonContract {
         final dx = (x1 - x0);
         final t = (yCenter - y0);
         final xAt = x0 + _divRound(dx * t, dy);
-        final xStep = _divRound(dx * kScale, dy);
+        final xStepHi = _divRound((dx * kScale) << 8, dy);
+        final xStep = xStepHi >> 8;
 
         final A = (y0 - y1);
         final B = (x1 - x0);
@@ -590,9 +501,9 @@ class LNAFSERasterizer implements PolygonContract {
         }
 
         final idx = e++;
-        _eYStart[idx] = yS;
         _eYEnd[idx] = yE;
-        _eX[idx] = xAt;
+        _eXHi[idx] = xAt << 8;
+        _eDxHi[idx] = xStepHi;
         _eDx[idx] = xStep;
         _eA[idx] = A;
         _eB[idx] = B;
@@ -612,65 +523,6 @@ class LNAFSERasterizer implements PolygonContract {
     });
     _edgeCount = e;
     _activeCount = 0;
-  }
-
-  bool _hasSelfIntersections() {
-    if (_edgeCount < 4) return false;
-    for (int i = 0; i < _edgeCount; i++) {
-      final ax = _eX0[i];
-      final ay = _eY0[i];
-      final bx = _eX1[i];
-      final by = _eY1[i];
-      for (int j = i + 1; j < _edgeCount; j++) {
-        final cx = _eX0[j];
-        final cy = _eY0[j];
-        final dx = _eX1[j];
-        final dy = _eY1[j];
-
-        // Shared endpoints are normal contour connectivity, not self-intersection.
-        if ((ax == cx && ay == cy) ||
-            (ax == dx && ay == dy) ||
-            (bx == cx && by == cy) ||
-            (bx == dx && by == dy)) {
-          continue;
-        }
-
-        if (_segmentsProperlyIntersect(ax, ay, bx, by, cx, cy, dx, dy)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  @pragma('vm:prefer-inline')
-  static int _orient(int ax, int ay, int bx, int by, int cx, int cy) {
-    final v = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-    if (v > 0) return 1;
-    if (v < 0) return -1;
-    return 0;
-  }
-
-  @pragma('vm:prefer-inline')
-  static bool _segmentsProperlyIntersect(
-    int ax,
-    int ay,
-    int bx,
-    int by,
-    int cx,
-    int cy,
-    int dx,
-    int dy,
-  ) {
-    final o1 = _orient(ax, ay, bx, by, cx, cy);
-    final o2 = _orient(ax, ay, bx, by, dx, dy);
-    final o3 = _orient(cx, cy, dx, dy, ax, ay);
-    final o4 = _orient(cx, cy, dx, dy, bx, by);
-
-    if (o1 == 0 || o2 == 0 || o3 == 0 || o4 == 0) {
-      return false;
-    }
-    return (o1 != o2) && (o3 != o4);
   }
 
   @pragma('vm:prefer-inline')
@@ -705,7 +557,6 @@ class LNAFSERasterizer implements PolygonContract {
   }
 
   void _rasterize(int argb, _FillRule rule) {
-    _scanRule = rule;
     final srcA0 = (argb >>> 24) & 255;
     final srcR = (argb >>> 16) & 255;
     final srcG = (argb >>> 8) & 255;
@@ -722,9 +573,10 @@ class LNAFSERasterizer implements PolygonContract {
       for (int i = 0; i < _activeCount; i++) {
         final e = _active[i];
         if (y >= _eYEnd[e]) continue;
-        // Use exact per-scanline intersection to avoid DDA drift artifacts.
-        _ix[n] = _edgeXAtY(e, yCenter);
+        final x = (_eXHi[e] + 128) >> 8;
+        _ix[n] = x;
         _ie[n] = e;
+        _eXHi[e] = _eXHi[e] + _eDxHi[e];
         _active[n] = e;
         n++;
       }
@@ -878,61 +730,13 @@ class LNAFSERasterizer implements PolygonContract {
     if (rightPix < 0 || leftPix >= width) return;
     final row = y * width;
     final useLutRefinement = _qualityCfg.lutMix > 0;
-    final useCinematicFilter = _qualityCfg.cinematicPasses > 0;
-
-    if (_forcePolygonAaShape) {
-      final pxS = leftPix < 0 ? 0 : leftPix;
-      final pxEEx = (rightPix + 1) > width ? width : (rightPix + 1);
-      _renderPolygonAaSegment(
-        row: row,
-        pxS: pxS,
-        pxEEx: pxEEx,
-        yCenter: yCenter,
-        srcA0: srcA0,
-        srcR: srcR,
-        srcG: srcG,
-        srcB: srcB,
-        spanCov: 255,
-        useCinematicFilter: useCinematicFilter,
-      );
-      return;
-    }
-
-    final xInside = (xa + xb) >> 1;
-    final insidePositiveL = _evalF(eL, xInside, yCenter) >= 0;
-    final insidePositiveR = _evalF(eR, xInside, yCenter) >= 0;
-
-    const int spanCov = 255;
-    final yTop = yCenter - kHalf;
-    final yBot = yCenter + kHalf;
-    int internalVertexCount = 0;
-    if (_qualityCfg.internalBandPx > 0 && _qualityCfg.polygonFallbackGrid > 0) {
-      internalVertexCount = _collectInternalVertexPixels(xa, xb, yTop, yBot);
-    }
-
-    if (internalVertexCount > 0 && _qualityCfg.polygonFallbackGrid > 0) {
-      final pxS = leftPix < 0 ? 0 : leftPix;
-      final pxEEx = (rightPix + 1) > width ? width : (rightPix + 1);
-      _renderPolygonAaSegment(
-        row: row,
-        pxS: pxS,
-        pxEEx: pxEEx,
-        yCenter: yCenter,
-        srcA0: srcA0,
-        srcR: srcR,
-        srcG: srcG,
-        srcB: srcB,
-        spanCov: spanCov,
-        useCinematicFilter: useCinematicFilter,
-      );
-      return;
-    }
 
     if (leftPix == rightPix) {
-      // Single-pixel span: both edges in same pixel.
-      // Analytic area: integrate width between left and right edges.
       final pix = leftPix;
       if (pix < 0 || pix >= width) return;
+      final xInside = (xa + xb) >> 1;
+      final insidePositiveL = _evalF(eL, xInside, yCenter) >= 0;
+      final insidePositiveR = _evalF(eR, xInside, yCenter) >= 0;
       final dxL = _eDx[eL];
       final dxR = _eDx[eR];
       final xLTop = xa - (dxL >> 1);
@@ -949,33 +753,26 @@ class LNAFSERasterizer implements PolygonContract {
         yCenter,
         eL,
         eR,
-        useLutRefinement,
+        false,
         insidePositiveL,
         insidePositiveR,
       );
-      final covAdj = spanCov < 255 ? ((cov * spanCov + 127) ~/ 255) : cov;
-      final effA = (covAdj * srcA0 + 127) ~/ 255;
+      final effA = (cov * srcA0 + 127) ~/ 255;
       if (effA <= 0) return;
       final idx = row + pix;
       _pixels32[idx] = _blendOver(_pixels32[idx], srcR, srcG, srcB, effA);
       return;
     }
 
-    // ── Analytic trapezoid coverage for boundary pixels ───────────────
-    // Edge sweeps from xTop to xBot within pixel height. Coverage =
-    // ∫₀¹ clamp(u(t), 0, 1) dt  where u(t) = (edgeX(t) - pxLeft) / 256.
-    // _integrateCovLeft/Right compute this integral analytically in Q8
-    // fixed-point, giving exact coverage for any edge angle.
-    //
-    // Band width = ceil(|dxStep| / 256) + qualityBias pixels, extending
-    // the transition zone and smoothing corner transitions.
+    final xInside = (xa + xb) >> 1;
+    final insidePositiveL = _evalF(eL, xInside, yCenter) >= 0;
+    final insidePositiveR = _evalF(eR, xInside, yCenter) >= 0;
+
+    final yTop = yCenter - kHalf;
+    final yBot = yCenter + kHalf;
 
     final dxL = _eDx[eL];
     final dxR = _eDx[eR];
-
-    // Edge x at row boundaries:
-    // - start with a cheap midpoint approximation
-    // - upgrade to exact edge evaluation when sweep is large (>1px/scanline)
     int xLTop = xa - (dxL >> 1);
     int xLBot = xa + (dxL >> 1);
     int xRTop = xb - (dxR >> 1);
@@ -1000,18 +797,20 @@ class LNAFSERasterizer implements PolygonContract {
     if (bandR > _qualityCfg.maxBand) bandR = _qualityCfg.maxBand;
 
     final spanWidth = rightPix - leftPix + 1;
-    final wideSweep =
-        (sweepL > _qualityCfg.maxBand || sweepR > _qualityCfg.maxBand);
+    final wideSweep = (sweepL > (_qualityCfg.maxBand + 2) ||
+        sweepR > (_qualityCfg.maxBand + 2));
 
-    if (wideSweep && _qualityCfg.wideSweepFullSpan) {
-      final minX = math.min(math.min(xLTop, xLBot), math.min(xRTop, xRBot));
-      final maxX = math.max(math.max(xLTop, xLBot), math.max(xRTop, xRBot));
-      int pxS = (minX >> 8) - 1;
-      int pxEEx = ((maxX + 255) >> 8) + 1;
+    if (wideSweep && _qualityCfg.wideSweepFullSpan && spanWidth <= 14) {
+      // Keep the wide-sweep AA local to the current span neighborhood.
+      // This avoids long horizontal leaks on near-flat edges.
+      int extra = math.max(sweepL, sweepR) + 1;
+      if (extra > 8) extra = 8;
+      int pxS = leftPix - extra;
+      int pxEEx = rightPix + 1 + extra;
       if (pxS < 0) pxS = 0;
       if (pxEEx > width) pxEEx = width;
       if (pxS >= pxEEx) return;
-      _renderAaSegment(
+      _renderAaSegmentFast(
         row: row,
         pxS: pxS,
         pxEEx: pxEEx,
@@ -1029,20 +828,28 @@ class LNAFSERasterizer implements PolygonContract {
         srcR: srcR,
         srcG: srcG,
         srcB: srcB,
-        spanCov: spanCov,
-        useCinematicFilter: false,
-        coverageBoost: _qualityCfg.wideSweepBoost,
-        centerSolidFromPx: leftPix + 1,
-        centerSolidToExPx: rightPix,
       );
+      final fs = (leftPix + 1).clamp(0, width);
+      final fe = rightPix.clamp(0, width);
+      if (fs < fe) {
+        _fillInteriorRange(row, fs, fe, srcA0, srcR, srcG, srcB);
+      }
       return;
     }
 
+    if (wideSweep) {
+      // For large spans, avoid full-span AA but widen edge bands to keep
+      // coverage smooth on steep edges.
+      if (sweepL > bandL) bandL = sweepL;
+      if (sweepR > bandR) bandR = sweepR;
+      if (bandL > 6) bandL = 6;
+      if (bandR > 6) bandR = 6;
+    }
+
     if (bandL + bandR >= spanWidth) {
-      // Thin span: both edges affect all pixels
       final pxS = leftPix < 0 ? 0 : leftPix;
       final pxE = rightPix >= width ? width - 1 : rightPix;
-      _renderAaSegment(
+      _renderAaSegmentFast(
         row: row,
         pxS: pxS,
         pxEEx: pxE + 1,
@@ -1060,20 +867,14 @@ class LNAFSERasterizer implements PolygonContract {
         srcR: srcR,
         srcG: srcG,
         srcB: srcB,
-        spanCov: spanCov,
-        useCinematicFilter: useCinematicFilter,
-        coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
       return;
     }
 
-    // Left AA band (exact coverage using both edges)
     {
       final pxS = leftPix < 0 ? 0 : leftPix;
       final pxE = (leftPix + bandL) > width ? width : (leftPix + bandL);
-      _renderAaSegment(
+      _renderAaSegmentFast(
         row: row,
         pxS: pxS,
         pxEEx: pxE,
@@ -1091,26 +892,19 @@ class LNAFSERasterizer implements PolygonContract {
         srcR: srcR,
         srcG: srcG,
         srcB: srcB,
-        spanCov: spanCov,
-        useCinematicFilter: useCinematicFilter,
-        coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
     }
 
-    // Solid interior
     final fs = (leftPix + bandL).clamp(0, width);
     final fe = (rightPix - bandR + 1).clamp(0, width);
     if (fs < fe) {
-      _fillInteriorRange(row, fs, fe, srcA0, srcR, srcG, srcB, spanCov);
+      _fillInteriorRange(row, fs, fe, srcA0, srcR, srcG, srcB);
     }
 
-    // Right AA band (exact coverage using both edges)
     {
       final pxS = (rightPix - bandR + 1) < 0 ? 0 : (rightPix - bandR + 1);
       final pxE = (rightPix + 1) > width ? width : (rightPix + 1);
-      _renderAaSegment(
+      _renderAaSegmentFast(
         row: row,
         pxS: pxS,
         pxEEx: pxE,
@@ -1128,11 +922,6 @@ class LNAFSERasterizer implements PolygonContract {
         srcR: srcR,
         srcG: srcG,
         srcB: srcB,
-        spanCov: spanCov,
-        useCinematicFilter: useCinematicFilter,
-        coverageBoost: 0,
-        centerSolidFromPx: -1,
-        centerSolidToExPx: -1,
       );
     }
   }
@@ -1217,65 +1006,6 @@ class LNAFSERasterizer implements PolygonContract {
   }
 
   @pragma('vm:prefer-inline')
-  void _ensureAaWorkCapacity(int needed) {
-    if (_aaWorkA.length >= needed) return;
-    int cap = _aaWorkA.isEmpty ? 16 : _aaWorkA.length;
-    while (cap < needed) cap <<= 1;
-    _aaWorkA = Int32List(cap);
-    _aaWorkB = Int32List(cap);
-  }
-
-  @pragma('vm:prefer-inline')
-  void _ensureVertexWorkCapacity(int needed) {
-    if (_vertexWork.length >= needed) return;
-    int cap = _vertexWork.isEmpty ? 8 : _vertexWork.length;
-    while (cap < needed) cap <<= 1;
-    _vertexWork = Int32List(cap);
-  }
-
-  int _collectInternalVertexPixels(int xMin, int xMax, int yTop, int yBot) {
-    if (_edgeCount <= 0) return 0;
-    int n = 0;
-
-    void addVertexX(int xFixed) {
-      if (xFixed <= xMin || xFixed >= xMax) return;
-      final xPix = xFixed >> 8;
-      for (int i = 0; i < n; i++) {
-        if (_vertexWork[i] == xPix) return;
-      }
-      if (n >= _vertexWork.length) {
-        _ensureVertexWorkCapacity(n + 1);
-      }
-      _vertexWork[n++] = xPix;
-    }
-
-    _ensureVertexWorkCapacity(8);
-    for (int e = 0; e < _edgeCount; e++) {
-      final y0 = _eY0[e];
-      if (y0 > yTop && y0 < yBot) {
-        addVertexX(_eX0[e]);
-      }
-      final y1 = _eY1[e];
-      if (y1 > yTop && y1 < yBot) {
-        addVertexX(_eX1[e]);
-      }
-    }
-
-    if (n > 1) {
-      for (int i = 1; i < n; i++) {
-        final key = _vertexWork[i];
-        int j = i - 1;
-        while (j >= 0 && _vertexWork[j] > key) {
-          _vertexWork[j + 1] = _vertexWork[j];
-          j--;
-        }
-        _vertexWork[j + 1] = key;
-      }
-    }
-    return n;
-  }
-
-  @pragma('vm:prefer-inline')
   int _coverageAtPixel(
     int xLTop,
     int xLBot,
@@ -1291,15 +1021,27 @@ class LNAFSERasterizer implements PolygonContract {
   ) {
     final leftMin = xLTop < xLBot ? xLTop : xLBot;
     final rightMax = xRTop > xRBot ? xRTop : xRBot;
+    final leftCenter = (xLTop + xLBot) >> 1;
+    final rightCenter = (xRTop + xRBot) >> 1;
 
-    // Invalid or inverted span at this row; reject to avoid horizontal streaks.
+    // Invalid/inverted span at this row; reject to avoid horizontal streaks.
     if (rightMax <= leftMin) return 0;
+    if (rightCenter <= leftCenter) return 0;
+
+    // Hard guard against far leaks caused by near-horizontal micro-edges.
+    // We only evaluate pixels near the center-row span neighborhood.
+    final pxRight = pxLeft + kScale;
+    if (pxRight <= leftCenter - kScale || pxLeft >= rightCenter + kScale) {
+      return 0;
+    }
 
     final covR = _integrateCovRight(xRTop - pxLeft, xRBot - pxLeft);
     final covL = _integrateCovRight(xLTop - pxLeft, xLBot - pxLeft);
     int cov = covR - covL;
     if (cov < 0) cov = 0;
     if (cov > 255) cov = 255;
+    if (!useLutRefinement) return cov;
+
     if (useLutRefinement) {
       cov = _refineCoverageWithLut(
         baseCoverage: cov,
@@ -1313,100 +1055,11 @@ class LNAFSERasterizer implements PolygonContract {
         softnessQ8: _qualityCfg.softnessQ8,
       );
     }
-    // Suppress very-low/high quantization residue that appears as horizontal
-    // streaks on real SVGs with many near-horizontal micro-segments.
-    if (cov <= 2) return 0;
-    if (cov >= 253) return 255;
     return cov;
   }
 
   @pragma('vm:prefer-inline')
-  bool _pointInsidePolygon(int x, int y) {
-    if (_scanRule == _FillRule.evenOdd) {
-      int parity = 0;
-      for (int e = 0; e < _edgeCount; e++) {
-        final y0 = _eY0[e];
-        final y1 = _eY1[e];
-        if (y < y0 || y >= y1) continue;
-        final dy = y1 - y0;
-        final dx = _eX1[e] - _eX0[e];
-        final xCross = _eX0[e] + _divRound(dx * (y - y0), dy);
-        if (x < xCross) parity ^= 1;
-      }
-      return parity != 0;
-    }
-
-    int winding = 0;
-    for (int e = 0; e < _edgeCount; e++) {
-      final y0 = _eY0[e];
-      final y1 = _eY1[e];
-      if (y < y0 || y >= y1) continue;
-      final dy = y1 - y0;
-      final dx = _eX1[e] - _eX0[e];
-      final xCross = _eX0[e] + _divRound(dx * (y - y0), dy);
-      if (x < xCross) winding += _eWind[e];
-    }
-    return winding != 0;
-  }
-
-  @pragma('vm:prefer-inline')
-  int _coverageSampledPolygonGrid(
-      int pxLeft, int yCenter, int gridX, int gridY) {
-    if (gridX <= 1 && gridY <= 1) {
-      return _pointInsidePolygon(pxLeft + kHalf, yCenter) ? 255 : 0;
-    }
-    if (gridX < 1) gridX = 1;
-    if (gridY < 1) gridY = 1;
-    final y0 = yCenter - kHalf;
-    final stepX = kScale ~/ gridX;
-    final stepY = kScale ~/ gridY;
-    final startX = stepX >> 1;
-    final startY = stepY >> 1;
-    int hits = 0;
-    for (int sy = 0; sy < gridY; sy++) {
-      final y = y0 + startY + sy * stepY;
-      for (int sx = 0; sx < gridX; sx++) {
-        final x = pxLeft + startX + sx * stepX;
-        if (_pointInsidePolygon(x, y)) hits++;
-      }
-    }
-    final total = gridX * gridY;
-    return (hits * 255 + (total >> 1)) ~/ total;
-  }
-
-  void _applyCinematicCoverageFilter(int len, int passes) {
-    if (len <= 1 || passes <= 0) return;
-    Int32List src = _aaWorkA;
-    Int32List dst = _aaWorkB;
-
-    for (int pass = 0; pass < passes; pass++) {
-      dst[0] = src[0];
-      for (int i = 1; i < len - 1; i++) {
-        final c = src[i];
-        if (c <= 0 || c >= 255) {
-          dst[i] = c;
-          continue;
-        }
-
-        int l = src[i - 1];
-        int r = src[i + 1];
-        if (l <= 0 || l >= 255) l = c;
-        if (r <= 0 || r >= 255) r = c;
-        dst[i] = (l + (c << 1) + r + 2) >> 2;
-      }
-      dst[len - 1] = src[len - 1];
-
-      final t = src;
-      src = dst;
-      dst = t;
-    }
-
-    if (!identical(src, _aaWorkA)) {
-      _aaWorkA.setRange(0, len, src);
-    }
-  }
-
-  void _renderAaSegment({
+  void _renderAaSegmentFast({
     required int row,
     required int pxS,
     required int pxEEx,
@@ -1424,20 +1077,12 @@ class LNAFSERasterizer implements PolygonContract {
     required int srcR,
     required int srcG,
     required int srcB,
-    required int spanCov,
-    required bool useCinematicFilter,
-    required int coverageBoost,
-    required int centerSolidFromPx,
-    required int centerSolidToExPx,
   }) {
-    final len = pxEEx - pxS;
-    if (len <= 0) return;
-
-    _ensureAaWorkCapacity(len);
-    int i = 0;
-    for (int px = pxS; px < pxEEx; px++, i++) {
+    if (pxS >= pxEEx) return;
+    final srcOpaque = (0xFF << 24) | (srcR << 16) | (srcG << 8) | srcB;
+    for (int px = pxS; px < pxEEx; px++) {
       final pxLeft = px << 8;
-      _aaWorkA[i] = _coverageAtPixel(
+      final cov = _coverageAtPixel(
         xLTop,
         xLBot,
         xRTop,
@@ -1450,155 +1095,12 @@ class LNAFSERasterizer implements PolygonContract {
         insidePositiveL,
         insidePositiveR,
       );
-    }
-
-    if (useCinematicFilter) {
-      _applyCinematicCoverageFilter(len, _qualityCfg.cinematicPasses);
-    }
-
-    i = 0;
-    for (int px = pxS; px < pxEEx; px++, i++) {
-      int a = _aaWorkA[i];
-      if (centerSolidFromPx < centerSolidToExPx &&
-          px >= centerSolidFromPx &&
-          px < centerSolidToExPx) {
-        a = 255;
-      }
-      if (coverageBoost > 0 && a > 0 && a < 255) {
-        a = a + (((255 - a) * coverageBoost + 127) >> 8);
-        if (a > 255) a = 255;
-      }
-      if (spanCov < 255) {
-        a = (a * spanCov + 127) ~/ 255;
-      }
-      final effA = (a * srcA0 + 127) ~/ 255;
-      if (effA > 0) {
-        _pixels32[row + px] =
-            _blendOver(_pixels32[row + px], srcR, srcG, srcB, effA);
-      }
-    }
-  }
-
-  void _renderPolygonAaSegment({
-    required int row,
-    required int pxS,
-    required int pxEEx,
-    required int yCenter,
-    required int srcA0,
-    required int srcR,
-    required int srcG,
-    required int srcB,
-    required int spanCov,
-    required bool useCinematicFilter,
-  }) {
-    final len = pxEEx - pxS;
-    if (len <= 0) return;
-
-    final grid = _qualityCfg.polygonFallbackGrid;
-    final mix = _qualityCfg.polygonFallbackMix;
-    if (grid <= 0 || mix <= 0) return;
-
-    final gridX = grid;
-    final gridY = grid;
-
-    _ensureAaWorkCapacity(len);
-    int i = 0;
-    for (int px = pxS; px < pxEEx; px++, i++) {
-      final pxLeft = px << 8;
-      int sampled = _coverageSampledPolygonGrid(pxLeft, yCenter, gridX, gridY);
-
-      // Remove isolated cusp pixels on near-horizontal joins (star arm "dent").
-      if (sampled > 0 && sampled < 255) {
-        final xCenter = pxLeft + kHalf;
-        final yProbeDn = yCenter + (kHalf >> 1);
-        final yProbeUp = yCenter - (kHalf >> 1);
-
-        bool downSolid = _pointInsidePolygon(xCenter, yProbeDn);
-        if (downSolid) {
-          final leftDown = px > 0
-              ? _pointInsidePolygon(xCenter - kScale, yProbeDn)
-              : downSolid;
-          final rightDown = px + 1 < width
-              ? _pointInsidePolygon(xCenter + kScale, yProbeDn)
-              : downSolid;
-          downSolid = leftDown && rightDown;
-        }
-
-        bool upSolid = _pointInsidePolygon(xCenter, yProbeUp);
-        if (upSolid) {
-          final leftUp = px > 0
-              ? _pointInsidePolygon(xCenter - kScale, yProbeUp)
-              : upSolid;
-          final rightUp = px + 1 < width
-              ? _pointInsidePolygon(xCenter + kScale, yProbeUp)
-              : upSolid;
-          upSolid = leftUp && rightUp;
-        }
-
-        if (downSolid || upSolid) {
-          sampled = 255;
-        }
-      }
-
-      _aaWorkA[i] = sampled;
-    }
-
-    // Remove local "dent" minima on horizontal joins by enforcing
-    // non-decreasing profile around cusp neighborhoods.
-    if (len >= 3) {
-      for (int i = 1; i < len - 1; i++) {
-        final c = _aaWorkA[i];
-        if (c <= 0 || c >= 255) continue;
-        final l = _aaWorkA[i - 1];
-        final r = _aaWorkA[i + 1];
-        if (c < l && c < r) {
-          final m = l < r ? l : r;
-          if (m - c >= 24) {
-            _aaWorkA[i] = m;
-          }
-        }
-      }
-    }
-
-    // Close tiny partial-coverage islands sandwiched by full coverage.
-    int run = 0;
-    while (run < len) {
-      final c = _aaWorkA[run];
-      if (c <= 0 || c >= 255) {
-        run++;
-        continue;
-      }
-      final s = run;
-      while (run < len) {
-        final v = _aaWorkA[run];
-        if (v <= 0 || v >= 255) break;
-        run++;
-      }
-      final e = run;
-      final islandLen = e - s;
-      final leftFull = s > 0 && _aaWorkA[s - 1] >= 250;
-      final rightFull = e < len && _aaWorkA[e] >= 250;
-      if (islandLen <= 3 && leftFull && rightFull) {
-        for (int i = s; i < e; i++) {
-          _aaWorkA[i] = 255;
-        }
-      }
-    }
-
-    if (useCinematicFilter) {
-      _applyCinematicCoverageFilter(len, _qualityCfg.cinematicPasses);
-    }
-
-    i = 0;
-    for (int px = pxS; px < pxEEx; px++, i++) {
-      int a = _aaWorkA[i];
-      if (spanCov < 255) {
-        a = (a * spanCov + 127) ~/ 255;
-      }
-      final effA = (a * srcA0 + 127) ~/ 255;
-      if (effA > 0) {
-        _pixels32[row + px] =
-            _blendOver(_pixels32[row + px], srcR, srcG, srcB, effA);
+      final effA = (cov * srcA0 + 127) ~/ 255;
+      if (effA >= 255) {
+        _pixels32[row + px] = srcOpaque;
+      } else if (effA > 0) {
+        final dst = _pixels32[row + px];
+        _pixels32[row + px] = _blendOver(dst, srcR, srcG, srcB, effA);
       }
     }
   }
@@ -1612,20 +1114,13 @@ class LNAFSERasterizer implements PolygonContract {
     int srcR,
     int srcG,
     int srcB,
-    int spanCov,
   ) {
     if (x0 >= x1) return;
-    if (spanCov >= 255) {
+    if (srcA0 >= 255) {
       _fillSolidSpan(
-          row, x0, x1, (srcA0 << 24) | (srcR << 16) | (srcG << 8) | srcB);
-      return;
-    }
-    final effA = (spanCov * srcA0 + 127) ~/ 255;
-    if (effA >= 255) {
-      _fillSolidSpan(
-          row, x0, x1, (srcA0 << 24) | (srcR << 16) | (srcG << 8) | srcB);
-    } else if (effA > 0) {
-      _blendSolidSpan(row, x0, x1, srcR, srcG, srcB, effA);
+          row, x0, x1, (0xFF << 24) | (srcR << 16) | (srcG << 8) | srcB);
+    } else if (srcA0 > 0) {
+      _blendSolidSpan(row, x0, x1, srcR, srcG, srcB, srcA0);
     }
   }
 
@@ -1721,9 +1216,7 @@ class LNAFSERasterizer implements PolygonContract {
     final end = row + x1;
     final c = argb & 0xFFFFFFFF;
     if (!useSimdFill) {
-      for (; i < end; i++) {
-        _pixels32[i] = c;
-      }
+      _pixels32.fillRange(i, end, c);
       return;
     }
     final v = _pixelsV!;
@@ -1843,4 +1336,3 @@ class LNAFSERasterizer implements PolygonContract {
     }
   }
 }
-

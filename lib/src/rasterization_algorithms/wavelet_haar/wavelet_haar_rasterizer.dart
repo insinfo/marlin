@@ -56,41 +56,84 @@ class WaveletHaarRasterizer {
     _tree.reset();
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    if (contours.isEmpty) return;
     final invW = 1.0 / width;
     final invH = 1.0 / height;
 
-    double area2 = 0.0;
     double minX = double.infinity;
     double maxX = double.negativeInfinity;
     double minY = double.infinity;
     double maxY = double.negativeInfinity;
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x0 = vertices[i * 2];
-      final y0 = vertices[i * 2 + 1];
-      final x1 = vertices[j * 2];
-      final y1 = vertices[j * 2 + 1];
-      area2 += x0 * y1 - y0 * x1;
-      if (x0 < minX) minX = x0;
-      if (x0 > maxX) maxX = x0;
-      if (y0 < minY) minY = y0;
-      if (y0 > maxY) maxY = y0;
+    for (final contour in contours) {
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final x = vertices[i * 2];
+        final y = vertices[i * 2 + 1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
     }
-    final ccw = area2 >= 0.0;
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      if (ccw) {
-        final x0 = vertices[i * 2] * invW;
-        final y0 = vertices[i * 2 + 1] * invH;
-        final x1 = vertices[j * 2] * invW;
-        final y1 = vertices[j * 2 + 1] * invH;
-        _tree.insertLine(x0, y0, x1, y1);
+    final area2ByContour = Float64List(contours.length);
+    for (int ci = 0; ci < contours.length; ci++) {
+      final contour = contours[ci];
+      double area2 = 0.0;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x0 = vertices[i * 2];
+        final y0 = vertices[i * 2 + 1];
+        final x1 = vertices[j * 2];
+        final y1 = vertices[j * 2 + 1];
+        area2 += x0 * y1 - y0 * x1;
+      }
+      area2ByContour[ci] = area2;
+    }
+
+    for (int ci = 0; ci < contours.length; ci++) {
+      final contour = contours[ci];
+      if (contour.count < 2) continue;
+
+      final currentSign = area2ByContour[ci] >= 0.0 ? 1 : -1;
+      int targetSign;
+
+      if (windingRule == 0) {
+        // Even-odd: mapeia para orientação por profundidade (outer=+1, hole=-1).
+        final sx = vertices[contour.start * 2];
+        final sy = vertices[contour.start * 2 + 1];
+        int depth = 0;
+        for (int oi = 0; oi < contours.length; oi++) {
+          if (oi == ci) continue;
+          final other = contours[oi];
+          if (_pointInContour(sx, sy, vertices, other.start, other.count)) {
+            depth++;
+          }
+        }
+        targetSign = (depth & 1) == 0 ? 1 : -1;
+      } else if (contours.length == 1 ||
+          contourVertexCounts == null ||
+          contourVertexCounts.isEmpty) {
+        // Caso comum (shape simples): força orientação positiva para manter
+        // preenchimento consistente mesmo se o input vier CW.
+        targetSign = 1;
       } else {
-        final x0 = vertices[j * 2] * invW;
-        final y0 = vertices[j * 2 + 1] * invH;
-        final x1 = vertices[i * 2] * invW;
-        final y1 = vertices[i * 2 + 1] * invH;
+        // Non-zero com múltiplos contornos explícitos: preserva orientação.
+        targetSign = currentSign;
+      }
+
+      final flip = currentSign != targetSign;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final from = flip ? j : i;
+        final to = flip ? i : j;
+        final x0 = vertices[from * 2] * invW;
+        final y0 = vertices[from * 2 + 1] * invH;
+        final x1 = vertices[to * 2] * invW;
+        final y1 = vertices[to * 2 + 1] * invH;
         _tree.insertLine(x0, y0, x1, y1);
       }
     }
@@ -209,6 +252,56 @@ class WaveletHaarRasterizer {
   }
 
   Uint32List get buffer => _buffer;
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
+}
+
+bool _pointInContour(
+  double px,
+  double py,
+  List<double> vertices,
+  int start,
+  int count,
+) {
+  bool inside = false;
+  for (int local = 0; local < count; local++) {
+    final i = start + local;
+    final j = start + ((local + 1) % count);
+    final x0 = vertices[i * 2];
+    final y0 = vertices[i * 2 + 1];
+    final x1 = vertices[j * 2];
+    final y1 = vertices[j * 2 + 1];
+
+    if (((y0 > py) != (y1 > py)) &&
+        (px < (x1 - x0) * (py - y0) / (y1 - y0) + x0)) {
+      inside = !inside;
+    }
+  }
+  return inside;
 }
 
 class _WaveletTree {

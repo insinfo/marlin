@@ -189,63 +189,69 @@ class SCDTRasterizer {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    if (contours.isEmpty) return;
+    final useEvenOdd = windingRule == 0;
 
     // Construir lista de arestas
     final edgeTable = <int, List<EdgeState>>{};
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      var x0 = vertices[i * 2];
-      var y0 = vertices[i * 2 + 1];
-      var x1 = vertices[j * 2];
-      var y1 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      final cStart = contour.start;
+      final cCount = contour.count;
+      if (cCount < 2) continue;
 
-      // Ignorar arestas horizontais
-      if ((y1 - y0).abs() < 0.001) continue;
+      for (int local = 0; local < cCount; local++) {
+        final i = cStart + local;
+        final j = cStart + ((local + 1) % cCount);
+        var x0 = vertices[i * 2];
+        var y0 = vertices[i * 2 + 1];
+        var x1 = vertices[j * 2];
+        var y1 = vertices[j * 2 + 1];
 
-      // Garantir que y0 < y1
-      int dir = 1;
-      if (y0 > y1) {
-        final tx = x0;
-        x0 = x1;
-        x1 = tx;
-        final ty = y0;
-        y0 = y1;
-        y1 = ty;
-        dir = -1;
+        // Ignorar arestas horizontais
+        if ((y1 - y0).abs() < 0.001) continue;
+
+        // Direção para regra non-zero (orientação original)
+        final dir = y1 > y0 ? 1 : -1;
+
+        // Garantir y0 < y1 para varredura
+        if (y0 > y1) {
+          final tx = x0;
+          x0 = x1;
+          x1 = tx;
+          final ty = y0;
+          y0 = y1;
+          y1 = ty;
+        }
+
+        // Converter para ponto fixo Q8.8
+        final xFixed0 = (x0 * 256).toInt();
+        // Usar centros de scanline (y + 0.5) para evitar artefatos horizontais
+        var yMin = (y0 - 0.5).ceil();
+        var yMax = (y1 - 0.5).floor();
+
+        if (yMin > yMax) continue;
+        if (yMin < 0) yMin = 0;
+        if (yMax >= height) yMax = height - 1;
+
+        // Slope em ponto fixo
+        final dy = y1 - y0;
+        final dx = x1 - x0;
+        final slopeFixed = ((dx / dy) * 256).toInt();
+
+        if (!edgeTable.containsKey(yMin)) {
+          edgeTable[yMin] = [];
+        }
+
+        final scanY = yMin + 0.5;
+        edgeTable[yMin]!.add(EdgeState(
+          xFixed: xFixed0 + ((scanY - y0) * slopeFixed).toInt(),
+          yMax: yMax,
+          direction: dir,
+          slopeFixed: slopeFixed,
+        ));
       }
-
-      // Converter para ponto fixo Q8.8
-      final xFixed0 = (x0 * 256).toInt();
-      // ignore: unused_local_variable (xFixed1 not used but kept for reference)
-      final _ = (x1 * 256).toInt();
-      // Usar centros de scanline (y + 0.5) para evitar artefatos horizontais
-      var yMin = (y0 - 0.5).ceil();
-      var yMax = (y1 - 0.5).floor();
-
-      if (yMin > yMax) continue;
-      if (yMin < 0) yMin = 0;
-      if (yMax >= height) yMax = height - 1;
-
-      // Slope em ponto fixo
-      final dy = y1 - y0;
-      final dx = x1 - x0;
-      final slopeFixed = ((dx / dy) * 256).toInt();
-
-      // X inicial na scanline yMin (calculado abaixo)
-
-      // Adicionar à tabela de arestas
-      if (!edgeTable.containsKey(yMin)) {
-        edgeTable[yMin] = [];
-      }
-
-      final scanY = yMin + 0.5;
-      edgeTable[yMin]!.add(EdgeState(
-        xFixed: xFixed0 + ((scanY - y0) * slopeFixed).toInt(),
-        yMax: yMax,
-        direction: dir,
-        slopeFixed: slopeFixed,
-      ));
     }
 
     // Lista de arestas ativas
@@ -277,74 +283,76 @@ class SCDTRasterizer {
       // Ordenar por X
       activeEdges.sort((a, b) => a.xFixed.compareTo(b.xFixed));
 
-      int windingNumber = 0;
-      int prevX = 0;
+      if (useEvenOdd) {
+        for (int e = 0; e + 1 < activeEdges.length; e += 2) {
+          final left = activeEdges[e];
+          final right = activeEdges[e + 1];
+          final xLeft = left.xFixed >> 8;
+          final xRight = right.xFixed >> 8;
 
-      for (int e = 0; e < activeEdges.length; e++) {
-        final edge = activeEdges[e];
-        final currentX = edge.xFixed >> 8; // Parte inteira
-        final frac = edge.xFixed & 0xFF; // Parte fracionária Q0.8
-        // Epsilon subpixel para estabilizar bordas (evita dupla contagem)
-        final fracAdj = (windingNumber != 0)
-            ? (frac - 1).clamp(0, 255)
-            : (frac + 1).clamp(0, 255);
-
-        if (windingNumber != 0 && currentX > prevX + 1) {
-          for (int x = prevX + 1; x < currentX && x < width; x++) {
-            final idx = y * stride + x * 3;
-            _subpixelBuffer[idx + 0] = colorR;
-            _subpixelBuffer[idx + 1] = colorG;
-            _subpixelBuffer[idx + 2] = colorB;
+          if (xRight > xLeft + 1) {
+            for (int x = xLeft + 1; x < xRight && x < width; x++) {
+              if (x < 0) continue;
+              final idx = y * stride + x * 3;
+              _subpixelBuffer[idx + 0] = colorR;
+              _subpixelBuffer[idx + 1] = colorG;
+              _subpixelBuffer[idx + 2] = colorB;
+            }
           }
+
+          _blendBorderPixel(
+            y,
+            xLeft,
+            ((left.xFixed & 0xFF) + 1).clamp(0, 255),
+            colorR,
+            colorG,
+            colorB,
+            false,
+          );
+          _blendBorderPixel(
+            y,
+            xRight,
+            ((right.xFixed & 0xFF) - 1).clamp(0, 255),
+            colorR,
+            colorG,
+            colorB,
+            true,
+          );
         }
+      } else {
+        int windingNumber = 0;
+        int prevX = 0;
 
-        // Pixel de borda: lookup ternário O(1)
-        if (currentX >= 0 && currentX < width) {
-          final ternIdx = fractionToTernaryIndex(fracAdj);
-          final bufBase = y * stride + currentX * 3;
+        for (int e = 0; e < activeEdges.length; e++) {
+          final edge = activeEdges[e];
+          final currentX = edge.xFixed >> 8; // Parte inteira
+          final frac = edge.xFixed & 0xFF; // Parte fracionária Q0.8
+          final fracAdj = (windingNumber != 0)
+              ? (frac - 1).clamp(0, 255)
+              : (frac + 1).clamp(0, 255);
 
-          if (windingNumber != 0) {
-            // Saindo da forma: cobertura inversa (o que sobra do pixel é fundo)
-            // Se cov é a cobertura do shape saindo, entao (255-cov) é a nova cobertura acumulada
-            final covR = 255 - _lut.getR(ternIdx);
-            final covG = 255 - _lut.getG(ternIdx);
-            final covB = 255 - _lut.getB(ternIdx);
-
-            _subpixelBuffer[bufBase + 0] = ((colorR * covR +
-                        _subpixelBuffer[bufBase + 0] * (255 - covR)) >>
-                    8)
-                .clamp(0, 255);
-            _subpixelBuffer[bufBase + 1] = ((colorG * covG +
-                        _subpixelBuffer[bufBase + 1] * (255 - covG)) >>
-                    8)
-                .clamp(0, 255);
-            _subpixelBuffer[bufBase + 2] = ((colorB * covB +
-                        _subpixelBuffer[bufBase + 2] * (255 - covB)) >>
-                    8)
-                .clamp(0, 255);
-          } else {
-            // Entrando na forma: cobertura direta
-            final covR = _lut.getR(ternIdx);
-            final covG = _lut.getG(ternIdx);
-            final covB = _lut.getB(ternIdx);
-
-            _subpixelBuffer[bufBase + 0] = ((colorR * covR +
-                        _subpixelBuffer[bufBase + 0] * (255 - covR)) >>
-                    8)
-                .clamp(0, 255);
-            _subpixelBuffer[bufBase + 1] = ((colorG * covG +
-                        _subpixelBuffer[bufBase + 1] * (255 - covG)) >>
-                    8)
-                .clamp(0, 255);
-            _subpixelBuffer[bufBase + 2] = ((colorB * covB +
-                        _subpixelBuffer[bufBase + 2] * (255 - covB)) >>
-                    8)
-                .clamp(0, 255);
+          if (windingNumber != 0 && currentX > prevX + 1) {
+            for (int x = prevX + 1; x < currentX && x < width; x++) {
+              final idx = y * stride + x * 3;
+              _subpixelBuffer[idx + 0] = colorR;
+              _subpixelBuffer[idx + 1] = colorG;
+              _subpixelBuffer[idx + 2] = colorB;
+            }
           }
-        }
 
-        windingNumber += edge.direction;
-        prevX = currentX;
+          _blendBorderPixel(
+            y,
+            currentX,
+            fracAdj,
+            colorR,
+            colorG,
+            colorB,
+            windingNumber != 0,
+          );
+
+          windingNumber += edge.direction;
+          prevX = currentX;
+        }
       }
 
       // Atualizar X para próxima scanline
@@ -352,6 +360,34 @@ class SCDTRasterizer {
         edge.xFixed += edge.slopeFixed;
       }
     }
+  }
+
+  @pragma('vm:prefer-inline')
+  void _blendBorderPixel(
+    int y,
+    int x,
+    int fracAdj,
+    int colorR,
+    int colorG,
+    int colorB,
+    bool inverse,
+  ) {
+    if (x < 0 || x >= width) return;
+    final ternIdx = fractionToTernaryIndex(fracAdj);
+    final bufBase = y * stride + x * 3;
+    final covR = inverse ? (255 - _lut.getR(ternIdx)) : _lut.getR(ternIdx);
+    final covG = inverse ? (255 - _lut.getG(ternIdx)) : _lut.getG(ternIdx);
+    final covB = inverse ? (255 - _lut.getB(ternIdx)) : _lut.getB(ternIdx);
+
+    _subpixelBuffer[bufBase + 0] =
+        ((colorR * covR + _subpixelBuffer[bufBase + 0] * (255 - covR)) >> 8)
+            .clamp(0, 255);
+    _subpixelBuffer[bufBase + 1] =
+        ((colorG * covG + _subpixelBuffer[bufBase + 1] * (255 - covG)) >> 8)
+            .clamp(0, 255);
+    _subpixelBuffer[bufBase + 2] =
+        ((colorB * covB + _subpixelBuffer[bufBase + 2] * (255 - covB)) >> 8)
+            .clamp(0, 255);
   }
 
   /// Resolve buffer de subpixels para buffer ARGB
@@ -370,4 +406,30 @@ class SCDTRasterizer {
   }
 
   Uint8List get subpixels => _subpixelBuffer;
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

@@ -7,6 +7,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:marlin/marlin.dart';
 
@@ -15,6 +16,58 @@ import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer.dart'
     as b2d1;
 import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer2.dart'
     as b2d2;
+
+class BenchmarkPolygonData {
+  final List<double> vertices;
+  final List<int>? contourVertexCounts;
+  final int windingRule;
+  final int color;
+
+  const BenchmarkPolygonData(
+    this.vertices, {
+    this.contourVertexCounts,
+    this.windingRule = 1,
+    this.color = 0xFFFF0000,
+  });
+
+  factory BenchmarkPolygonData.simple(
+    List<double> vertices, {
+    int color = 0xFFFF0000,
+  }) {
+    return BenchmarkPolygonData(
+      _ensureClockwiseContour(vertices),
+      color: color,
+    );
+  }
+}
+
+double _signedArea2(List<double> vertices) {
+  final n = vertices.length ~/ 2;
+  if (n < 3) return 0.0;
+  double a2 = 0.0;
+  for (int i = 0; i < n; i++) {
+    final j = (i + 1) % n;
+    final xi = vertices[i * 2];
+    final yi = vertices[i * 2 + 1];
+    final xj = vertices[j * 2];
+    final yj = vertices[j * 2 + 1];
+    a2 += (xi * yj) - (xj * yi);
+  }
+  return a2;
+}
+
+List<double> _ensureClockwiseContour(List<double> vertices) {
+  if (vertices.length < 6) return vertices;
+  if (_signedArea2(vertices) >= 0.0) return vertices;
+  final n = vertices.length ~/ 2;
+  final out = List<double>.filled(vertices.length, 0.0);
+  for (int i = 0; i < n; i++) {
+    final src = (n - 1 - i) * 2;
+    out[i * 2] = vertices[src];
+    out[i * 2 + 1] = vertices[src + 1];
+  }
+  return out;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POLÍGONOS DE TESTE
@@ -77,6 +130,223 @@ List<double> createComplexPolygon(double cx, double cy, double size) {
     cx + size * 0.2,
     cy - size * 0.8,
   ];
+}
+
+/// Letra "A" fiel ao path do assets/svg/a.svg (curvas quadráticas achatadas).
+List<List<double>> createLetterA(double cx, double cy, double size) {
+  // BBox aproximado do path "A" no SVG.
+  const minX = 167.0;
+  const minY = 234.3;
+  const boxW = 239.3;
+  const boxH = 253.7;
+
+  final s = size / boxH;
+  final tx = cx - (minX + boxW * 0.5) * s;
+  final ty = cy - (minY + boxH * 0.5) * s;
+
+  double mapX(double x) => x * s + tx;
+  double mapY(double y) => y * s + ty;
+
+  final outer = <double>[];
+  double px = 206.5;
+  double py = 488.0;
+
+  void addPoint(double x, double y) {
+    outer.add(mapX(x));
+    outer.add(mapY(y));
+  }
+
+  void lineRel(double dx, double dy) {
+    px += dx;
+    py += dy;
+    addPoint(px, py);
+  }
+
+  void quadRel(double cdx, double cdy, double dx, double dy,
+      {int segments = 16}) {
+    final x0 = px;
+    final y0 = py;
+    final cx0 = x0 + cdx;
+    final cy0 = y0 + cdy;
+    final x1 = x0 + dx;
+    final y1 = y0 + dy;
+    for (int i = 1; i <= segments; i++) {
+      final t = i / segments;
+      final mt = 1.0 - t;
+      final x = mt * mt * x0 + 2.0 * mt * t * cx0 + t * t * x1;
+      final y = mt * mt * y0 + 2.0 * mt * t * cy0 + t * t * y1;
+      addPoint(x, y);
+    }
+    px = x1;
+    py = y1;
+  }
+
+  // m206.5 488
+  addPoint(px, py);
+  // h-39.5
+  lineRel(-39.5, 0.0);
+  // l90.7-228.7
+  lineRel(90.7, -228.7);
+  // q4.8-12.6 11.8-18.8
+  quadRel(4.8, -12.6, 11.8, -18.8);
+  // q7.4-6.2 17.4-6.2
+  quadRel(7.4, -6.2, 17.4, -6.2);
+  // q10.1 0 17.1 6.2
+  quadRel(10.1, 0.0, 17.1, 6.2);
+  // q7.2 6.1 12 18.8
+  quadRel(7.2, 6.1, 12.0, 18.8);
+  // l90.3 228.7
+  lineRel(90.3, 228.7);
+  // h-39.5
+  lineRel(-39.5, 0.0);
+  // l-86.4 -226.4
+  lineRel(-86.4, -226.4);
+  // h12.6
+  lineRel(12.6, 0.0);
+  // z (fechamento implícito pelo rasterizador)
+
+  // Subpath da barra: m145.9-63.7 h-130.5 v-32.1 h130.5 z
+  // Após 'z', ponto corrente volta para (206.5,488), então:
+  final bar = <double>[
+    mapX(352.4),
+    mapY(424.3),
+    mapX(221.9),
+    mapY(424.3),
+    mapX(221.9),
+    mapY(392.2),
+    mapX(352.4),
+    mapY(392.2),
+  ];
+
+  return [outer, bar];
+}
+
+/// Linha fina arbitrária como retângulo orientado
+List<double> createThinLine(
+  double x0,
+  double y0,
+  double x1,
+  double y1,
+  double thickness,
+) {
+  final dx = x1 - x0;
+  final dy = y1 - y0;
+  final len = math.sqrt(dx * dx + dy * dy);
+  if (len <= 1e-9) {
+    final h = thickness * 0.5;
+    return [x0 - h, y0 - h, x0 + h, y0 - h, x0 + h, y0 + h, x0 - h, y0 + h];
+  }
+  final nx = -dy / len;
+  final ny = dx / len;
+  final h = thickness * 0.5;
+  return [
+    x0 + nx * h,
+    y0 + ny * h,
+    x0 - nx * h,
+    y0 - ny * h,
+    x1 - nx * h,
+    y1 - ny * h,
+    x1 + nx * h,
+    y1 + ny * h,
+  ];
+}
+
+/// Arco fino (banda entre dois raios)
+List<double> createArcBand(
+  double cx,
+  double cy,
+  double innerRadius,
+  double outerRadius,
+  double startAngle,
+  double endAngle,
+  int segments,
+) {
+  final verts = <double>[];
+  if (segments < 2) segments = 2;
+
+  for (int i = 0; i <= segments; i++) {
+    final t = i / segments;
+    final a = startAngle + (endAngle - startAngle) * t;
+    verts.add(cx + outerRadius * cos(a));
+    verts.add(cy + outerRadius * sin(a));
+  }
+
+  for (int i = segments; i >= 0; i--) {
+    final t = i / segments;
+    final a = startAngle + (endAngle - startAngle) * t;
+    verts.add(cx + innerRadius * cos(a));
+    verts.add(cy + innerRadius * sin(a));
+  }
+
+  return verts;
+}
+
+BenchmarkPolygonData createHollowRectPolygon(
+  double cx,
+  double cy,
+  double outerW,
+  double outerH,
+  double border,
+) {
+  final outerHw = outerW * 0.5;
+  final outerHh = outerH * 0.5;
+  final innerHw = math.max(0.5, outerHw - border);
+  final innerHh = math.max(0.5, outerHh - border);
+
+  final outer = <double>[
+    cx - outerHw,
+    cy - outerHh,
+    cx + outerHw,
+    cy - outerHh,
+    cx + outerHw,
+    cy + outerHh,
+    cx - outerHw,
+    cy + outerHh,
+  ];
+
+  final inner = <double>[
+    cx - innerHw,
+    cy - innerHh,
+    cx - innerHw,
+    cy + innerHh,
+    cx + innerHw,
+    cy + innerHh,
+    cx + innerHw,
+    cy - innerHh,
+  ];
+
+  return BenchmarkPolygonData(
+    <double>[...outer, ...inner],
+    contourVertexCounts: const <int>[4, 4],
+    windingRule: 1,
+  );
+}
+
+BenchmarkPolygonData createHollowCirclePolygon(
+  double cx,
+  double cy,
+  double outerR,
+  double innerR,
+  int segments,
+) {
+  final n = math.max(12, segments);
+  final outer = <double>[];
+  final inner = <double>[];
+  for (int i = 0; i < n; i++) {
+    final a = (i * math.pi * 2.0) / n;
+    outer.add(cx + math.cos(a) * outerR);
+    outer.add(cy + math.sin(a) * outerR);
+  }
+  for (int i = n - 1; i >= 0; i--) {
+    final a = (i * math.pi * 2.0) / n;
+    inner.add(cx + math.cos(a) * innerR);
+    inner.add(cy + math.sin(a) * innerR);
+  }
+  return BenchmarkPolygonData(
+    <double>[...outer, ...inner],
+    contourVertexCounts: <int>[n, n],
+    windingRule: 1,
+  );
 }
 
 /// Funções trigonométricas simples (só usadas na criação dos polígonos, fora do loop do benchmark)
@@ -219,14 +489,23 @@ Future<void> _writeSimdGapReportFile(String reportText) async {
   await file.writeAsString('$reportText\n');
 }
 
-typedef RasterizeFunc = FutureOr<void> Function(
-    List<double> vertices, int color);
+typedef RasterizeFunc = FutureOr<void> Function(BenchmarkPolygonData polygon);
+
+@pragma('vm:prefer-inline')
+FutureOr<void> _drawWithMeta(dynamic rasterizer, BenchmarkPolygonData polygon) {
+  return rasterizer.drawPolygon(
+    polygon.vertices,
+    polygon.color,
+    windingRule: polygon.windingRule,
+    contourVertexCounts: polygon.contourVertexCounts,
+  );
+}
 
 /// Benchmark padrão (chama rasterize() por polígono)
 Future<BenchmarkResult> runBenchmark(
   String name,
   RasterizeFunc rasterize,
-  List<List<double>> polygons,
+  List<BenchmarkPolygonData> polygons,
   int warmupIterations,
   int measureIterations, {
   void Function()? clear,
@@ -235,7 +514,7 @@ Future<BenchmarkResult> runBenchmark(
   for (int i = 0; i < warmupIterations; i++) {
     if (clear != null) clear();
     for (final poly in polygons) {
-      await rasterize(poly, 0xFFFF0000);
+      await rasterize(poly);
     }
   }
 
@@ -245,7 +524,7 @@ Future<BenchmarkResult> runBenchmark(
   for (int i = 0; i < measureIterations; i++) {
     if (clear != null) clear();
     for (final poly in polygons) {
-      await rasterize(poly, 0xFFFF0000);
+      await rasterize(poly);
     }
   }
 
@@ -258,13 +537,13 @@ Future<BenchmarkResult> runBenchmark(
 }
 
 typedef RasterizeBatchFunc = FutureOr<void> Function(
-    List<List<double>> polygons, int color);
+    List<BenchmarkPolygonData> polygons, int color);
 
 /// Benchmark em batch (acumula todos os polígonos e executa um flush/resolução 1x por iteração)
 Future<BenchmarkResult> runBenchmarkBatch(
   String name,
   RasterizeBatchFunc rasterizeBatch,
-  List<List<double>> polygons,
+  List<BenchmarkPolygonData> polygons,
   int warmupIterations,
   int measureIterations, {
   void Function()? clear,
@@ -331,18 +610,24 @@ Future<void> main() async {
   print('');
 
   // Criar polígonos de teste
-  final polygons = <List<double>>[
-    createTriangle(256, 256, 100),
-    createSquare(128, 128, 80),
-    createStar(384, 384, 100, 40),
-    createComplexPolygon(256, 400, 80),
+  final polygons = <BenchmarkPolygonData>[
+    BenchmarkPolygonData.simple(createTriangle(256, 256, 100)),
+    BenchmarkPolygonData.simple(createSquare(128, 128, 80)),
+    BenchmarkPolygonData.simple(createStar(384, 384, 100, 40)),
+    BenchmarkPolygonData.simple(createComplexPolygon(256, 400, 80)),
+    ...createLetterA(102, 378, 130).map(BenchmarkPolygonData.simple),
+    BenchmarkPolygonData.simple(
+        createArcBand(140, 258, 34, 38, -2.6, -0.15, 36)),
+    BenchmarkPolygonData.simple(createThinLine(24, 492, 488, 486, 1.8)),
+    createHollowRectPolygon(410, 228, 96, 52, 10),
+    createHollowCirclePolygon(330, 228, 24, 14, 48),
   ];
 
   // Adicionar mais polígonos para stress test
   for (int i = 0; i < 10; i++) {
     final x = 50.0 + (i % 5) * 100;
     final y = 50.0 + (i ~/ 5) * 100;
-    polygons.add(createTriangle(x, y, 30));
+    polygons.add(BenchmarkPolygonData.simple(createTriangle(x, y, 30)));
   }
 
   print('Polygons per iteration: ${polygons.length}');
@@ -356,18 +641,24 @@ Future<void> main() async {
     final acdr = ACDRRasterizer(
         width: width,
         height: height,
-        enableSubpixelY: false,
-        enableSinglePixelSpanFix: false,
-        enableVerticalSupersample: false);
+        enableSubpixelY: true,
+        enableSinglePixelSpanFix: true,
+        enableVerticalSupersample: true,
+        verticalSampleCount: 2);
 
     results.add(await runBenchmark(
       'ACDR',
-      (vertices, color) {
+      (polygon) {
+        final vertices = polygon.vertices;
         final verts = <Vec2>[];
         for (int i = 0; i < vertices.length; i += 2) {
           verts.add(Vec2(vertices[i] / width, vertices[i + 1] / height));
         }
-        acdr.rasterize(verts);
+        acdr.rasterize(
+          verts,
+          windingRule: polygon.windingRule == 0 ? 0 : 1,
+          contourVertexCounts: polygon.contourVertexCounts,
+        );
       },
       polygons,
       warmup,
@@ -392,9 +683,7 @@ Future<void> main() async {
     final marlin = MarlinRenderer(width, height);
     results.add(await runBenchmark(
       'Marlin',
-      (vertices, color) {
-        marlin.drawPolygon(vertices, color);
-      },
+      (polygon) => _drawWithMeta(marlin, polygon),
       polygons,
       warmup,
       iterations,
@@ -414,7 +703,7 @@ Future<void> main() async {
     final scanline = ScanlineRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'SCANLINE_EO',
-      (vertices, color) => scanline.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(scanline, polygon),
       polygons,
       warmup,
       iterations,
@@ -426,12 +715,13 @@ Future<void> main() async {
   }
 
   // ─── SSAA ──────────────────────────────────────────────────────────────
-  print('Testing SSAA (RGSS 8x8)...');
+  print('Testing SSAA (RGSS 5x5)...');
   try {
-    final ssaa = SSAARasterizer(width: width, height: height);
+    final ssaa =
+        SSAARasterizer(width: width, height: height, samplesPerAxis: 5);
     results.add(await runBenchmark(
-      'SSAA 8x8',
-      (vertices, color) => ssaa.drawPolygon(vertices, color),
+      'SSAA 5x5',
+      (polygon) => _drawWithMeta(ssaa, polygon),
       polygons,
       warmup,
       iterations,
@@ -445,11 +735,14 @@ Future<void> main() async {
   // ─── MSAA ──────────────────────────────────────────────────────────────
   print('Testing MSAA (4x4)...');
   try {
-    final msaa =
-        MSAARasterizer(width: width, height: height, samplesPerAxis: 4, enableTileCulling: false);
+    final msaa = MSAARasterizer(
+        width: width,
+        height: height,
+        samplesPerAxis: 4,
+        enableTileCulling: false);
     results.add(await runBenchmark(
       'MSAA 4x4',
-      (vertices, color) => msaa.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(msaa, polygon),
       polygons,
       warmup,
       iterations,
@@ -466,7 +759,7 @@ Future<void> main() async {
     final tess = TessellationRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'TESSELLATION',
-      (vertices, color) => tess.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(tess, polygon),
       polygons,
       warmup,
       iterations,
@@ -483,7 +776,7 @@ Future<void> main() async {
     final wavelet = WaveletHaarRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'WAVELET_HAAR',
-      (vertices, color) => wavelet.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(wavelet, polygon),
       polygons,
       warmup,
       iterations,
@@ -500,9 +793,15 @@ Future<void> main() async {
     final daa = DAARasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'DAA',
-      (vertices, color) {
+      (polygon) {
+        final vertices = polygon.vertices;
         if (vertices.length >= 6) {
-          daa.drawPolygon(vertices, color);
+          daa.drawPolygon(
+            vertices,
+            polygon.color,
+            windingRule: polygon.windingRule,
+            contourVertexCounts: polygon.contourVertexCounts,
+          );
         }
       },
       polygons,
@@ -521,7 +820,7 @@ Future<void> main() async {
     final ddfi = FluxRenderer(width, height);
     results.add(await runBenchmark(
       'DDFI',
-      (vertices, color) => ddfi.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(ddfi, polygon),
       polygons,
       warmup,
       iterations,
@@ -538,9 +837,15 @@ Future<void> main() async {
     final dbsr = DBSRRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'DBSR',
-      (vertices, color) {
+      (polygon) {
+        final vertices = polygon.vertices;
         if (vertices.length >= 6) {
-          dbsr.drawPolygon(vertices, color);
+          dbsr.drawPolygon(
+            vertices,
+            polygon.color,
+            windingRule: polygon.windingRule,
+            contourVertexCounts: polygon.contourVertexCounts,
+          );
         }
       },
       polygons,
@@ -559,7 +864,7 @@ Future<void> main() async {
     final epl = EPLRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'EPL_AA',
-      (vertices, color) => epl.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(epl, polygon),
       polygons,
       warmup,
       iterations,
@@ -576,7 +881,7 @@ Future<void> main() async {
     final qcs = QCSRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'QCS',
-      (vertices, color) => qcs.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(qcs, polygon),
       polygons,
       warmup,
       iterations,
@@ -593,7 +898,7 @@ Future<void> main() async {
     final rhbd = RHBDRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'RHBD',
-      (vertices, color) => rhbd.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(rhbd, polygon),
       polygons,
       warmup,
       iterations,
@@ -610,7 +915,7 @@ Future<void> main() async {
     final amcad = AMCADRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'AMCAD',
-      (vertices, color) => amcad.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(amcad, polygon),
       polygons,
       warmup,
       iterations,
@@ -627,7 +932,7 @@ Future<void> main() async {
     final hsgr = HSGRRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'HSGR',
-      (vertices, color) => hsgr.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(hsgr, polygon),
       polygons,
       warmup,
       iterations,
@@ -641,75 +946,16 @@ Future<void> main() async {
   // ─── LNAF_SE ────────────────────────────────────────────────────────────
   print('Testing LNAF_SE (Lattice-Normal Alpha Field)...');
   try {
-    Future<void> warmupLnafMode(LnafSeQualityMode quality) async {
-      final warm = LNAFSERasterizer(
-        width: width,
-        height: height,
-        qualityMode: quality,
-      );
-      warm.clear(0xFFFFFFFF);
-      for (final poly in polygons) {
-        warm.drawPolygon(poly, 0xFFFF0000);
-      }
-    }
-
-    Future<void> runLnafVariant({
-      required String label,
-      required String imageName,
-      required LnafSeQualityMode quality,
-      String? extraImageName,
-    }) async {
-      final lnaf = LNAFSERasterizer(
-        width: width,
-        height: height,
-        qualityMode: quality,
-      );
-      results.add(await runBenchmark(
-        label,
-        (vertices, color) => lnaf.drawPolygon(vertices, color),
-        polygons,
-        warmup,
-        iterations,
-        clear: () => lnaf.clear(0xFFFFFFFF),
-      ));
-      await saveImage(imageName, lnaf.buffer, width, height);
-      if (extraImageName != null && extraImageName.isNotEmpty) {
-        await saveImage(extraImageName, lnaf.buffer, width, height);
-      }
-    }
-
-    await warmupLnafMode(LnafSeQualityMode.fast);
-    await warmupLnafMode(LnafSeQualityMode.high);
-    await warmupLnafMode(LnafSeQualityMode.ultra);
-    await warmupLnafMode(LnafSeQualityMode.extreme);
-    await warmupLnafMode(LnafSeQualityMode.cinematic);
-
-    await runLnafVariant(
-      label: 'LNAF_SE (Fast)',
-      imageName: 'LNAF_SE_FAST',
-      quality: LnafSeQualityMode.fast,
-    );
-    await runLnafVariant(
-      label: 'LNAF_SE (High)',
-      imageName: 'LNAF_SE_HIGH',
-      quality: LnafSeQualityMode.high,
-    );
-    await runLnafVariant(
-      label: 'LNAF_SE (Ultra)',
-      imageName: 'LNAF_SE_ULTRA',
-      quality: LnafSeQualityMode.ultra,
-    );
-    await runLnafVariant(
-      label: 'LNAF_SE (Extreme)',
-      imageName: 'LNAF_SE_EXTREME',
-      quality: LnafSeQualityMode.extreme,
-    );
-    await runLnafVariant(
-      label: 'LNAF_SE',
-      imageName: 'LNAF_SE',
-      quality: LnafSeQualityMode.fast,
-      extraImageName: 'LNAF_SE_FAST_DEFAULT',
-    );
+    final lnaf = LNAFSERasterizer(width: width, height: height);
+    results.add(await runBenchmark(
+      'LNAF_SE',
+      (polygon) => _drawWithMeta(lnaf, polygon),
+      polygons,
+      warmup,
+      iterations,
+      clear: () => lnaf.clear(0xFFFFFFFF),
+    ));
+    await saveImage('LNAF_SE', lnaf.buffer, width, height);
   } catch (e) {
     print('  LNAF_SE failed: $e');
   }
@@ -720,7 +966,7 @@ Future<void> main() async {
     final sweepSdf = SweepSDFRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'SWEEP_SDF',
-      (vertices, color) => sweepSdf.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(sweepSdf, polygon),
       polygons,
       warmup,
       iterations,
@@ -737,7 +983,7 @@ Future<void> main() async {
     final scdt = SCDTRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'SCDT',
-      (vertices, color) => scdt.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(scdt, polygon),
       polygons,
       warmup,
       iterations,
@@ -754,7 +1000,7 @@ Future<void> main() async {
     final scp = SCPAEDRasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'SCP_AED',
-      (vertices, color) => scp.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(scp, polygon),
       polygons,
       warmup,
       iterations,
@@ -776,7 +1022,7 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v1 (Scalar)',
-      (vertices, color) => b2dScalar.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(b2dScalar, polygon),
       polygons,
       warmup,
       iterations,
@@ -792,7 +1038,7 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v1 (SIMD)',
-      (vertices, color) => b2dSimd.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(b2dSimd, polygon),
       polygons,
       warmup,
       iterations,
@@ -812,7 +1058,7 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v1 (Scalar+Iso)',
-      (vertices, color) => b2dScalarParallel.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(b2dScalarParallel, polygon),
       polygons,
       warmup,
       iterations,
@@ -833,7 +1079,7 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v1 (SIMD+Iso)',
-      (vertices, color) => b2dParallel.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(b2dParallel, polygon),
       polygons,
       warmup,
       iterations,
@@ -867,8 +1113,13 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v2 (Imm Scalar)',
-      (vertices, color) =>
-          v2ScalarImmediate!.drawPolygon(vertices, color, flushNow: true),
+      (polygon) => v2ScalarImmediate!.drawPolygon(
+        polygon.vertices,
+        polygon.color,
+        windingRule: polygon.windingRule,
+        contourVertexCounts: polygon.contourVertexCounts,
+        flushNow: true,
+      ),
       polygons,
       warmup,
       iterations,
@@ -884,8 +1135,13 @@ Future<void> main() async {
     );
     results.add(await runBenchmark(
       'B2D v2 (Imm SIMD)',
-      (vertices, color) =>
-          v2SimdImmediate!.drawPolygon(vertices, color, flushNow: true),
+      (polygon) => v2SimdImmediate!.drawPolygon(
+        polygon.vertices,
+        polygon.color,
+        windingRule: polygon.windingRule,
+        contourVertexCounts: polygon.contourVertexCounts,
+        flushNow: true,
+      ),
       polygons,
       warmup,
       iterations,
@@ -902,18 +1158,23 @@ Future<void> main() async {
       height,
       config: b2d2.RasterizerConfig2(useSimd: false, useIsolates: false),
     );
+    final b2BatchScalar = v2ScalarBatched;
     results.add(await runBenchmarkBatch(
       'B2D v2 (Batch Scalar)',
       (polys, color) async {
+        b2BatchScalar.fillRule = 1;
         for (final p in polys) {
-          v2ScalarBatched!.addPolygon(p);
+          b2BatchScalar.addPolygon(
+            p.vertices,
+            contourVertexCounts: p.contourVertexCounts,
+          );
         }
-        await v2ScalarBatched!.flush(color);
+        await b2BatchScalar.flush(color);
       },
       polygons,
       warmup,
       iterations,
-      clear: () => v2ScalarBatched!.clear(0xFFFFFFFF),
+      clear: () => b2BatchScalar.clear(0xFFFFFFFF),
     ));
     await saveImage(
         'BLEND2D_v2_Batch_Scalar', v2ScalarBatched.buffer, width, height);
@@ -923,18 +1184,23 @@ Future<void> main() async {
       height,
       config: b2d2.RasterizerConfig2(useSimd: true, useIsolates: false),
     );
+    final b2BatchSimd = v2SimdBatched;
     results.add(await runBenchmarkBatch(
       'B2D v2 (Batch SIMD)',
       (polys, color) async {
+        b2BatchSimd.fillRule = 1;
         for (final p in polys) {
-          v2SimdBatched!.addPolygon(p);
+          b2BatchSimd.addPolygon(
+            p.vertices,
+            contourVertexCounts: p.contourVertexCounts,
+          );
         }
-        await v2SimdBatched!.flush(color);
+        await b2BatchSimd.flush(color);
       },
       polygons,
       warmup,
       iterations,
-      clear: () => v2SimdBatched!.clear(0xFFFFFFFF),
+      clear: () => b2BatchSimd.clear(0xFFFFFFFF),
     ));
     await saveImage(
         'BLEND2D_v2_Batch_SIMD', v2SimdBatched.buffer, width, height);
@@ -952,18 +1218,23 @@ Future<void> main() async {
         minParallelDirtyHeight: 1, // força paralelismo no benchmark
       ),
     );
+    final b2BatchScalarIso = v2ScalarBatchedIso;
     results.add(await runBenchmarkBatch(
       'B2D v2 (Batch Scalar+Iso)',
       (polys, color) async {
+        b2BatchScalarIso.fillRule = 1;
         for (final p in polys) {
-          v2ScalarBatchedIso!.addPolygon(p);
+          b2BatchScalarIso.addPolygon(
+            p.vertices,
+            contourVertexCounts: p.contourVertexCounts,
+          );
         }
-        await v2ScalarBatchedIso!.flush(color);
+        await b2BatchScalarIso.flush(color);
       },
       polygons,
       warmup,
       iterations,
-      clear: () => v2ScalarBatchedIso!.clear(0xFFFFFFFF),
+      clear: () => b2BatchScalarIso.clear(0xFFFFFFFF),
     ));
     await saveImage('BLEND2D_v2_Batch_Scalar_Isolates',
         v2ScalarBatchedIso.buffer, width, height);
@@ -978,18 +1249,23 @@ Future<void> main() async {
         minParallelDirtyHeight: 1, // força paralelismo no benchmark
       ),
     );
+    final b2BatchSimdIso = v2SimdBatchedIso;
     results.add(await runBenchmarkBatch(
       'B2D v2 (Batch SIMD+Iso)',
       (polys, color) async {
+        b2BatchSimdIso.fillRule = 1;
         for (final p in polys) {
-          v2SimdBatchedIso!.addPolygon(p);
+          b2BatchSimdIso.addPolygon(
+            p.vertices,
+            contourVertexCounts: p.contourVertexCounts,
+          );
         }
-        await v2SimdBatchedIso!.flush(color);
+        await b2BatchSimdIso.flush(color);
       },
       polygons,
       warmup,
       iterations,
-      clear: () => v2SimdBatchedIso!.clear(0xFFFFFFFF),
+      clear: () => b2BatchSimdIso.clear(0xFFFFFFFF),
     ));
     await saveImage('BLEND2D_v2_Batch_SIMD_Isolates', v2SimdBatchedIso.buffer,
         width, height);
@@ -1024,7 +1300,7 @@ Future<void> main() async {
         SkiaRasterizer(width: width, height: height, useSimd: false);
     results.add(await runBenchmark(
       'SKIA (Scalar)',
-      (vertices, color) => skiaScalar.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(skiaScalar, polygon),
       polygons,
       warmup,
       iterations,
@@ -1036,7 +1312,7 @@ Future<void> main() async {
         SkiaRasterizer(width: width, height: height, useSimd: true);
     results.add(await runBenchmark(
       'SKIA (SIMD)',
-      (vertices, color) => skiaSimd.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(skiaSimd, polygon),
       polygons,
       warmup,
       iterations,
@@ -1053,7 +1329,7 @@ Future<void> main() async {
     final edgeFlag = EdgeFlagAARasterizer(width: width, height: height);
     results.add(await runBenchmark(
       'EDGE_FLAG_AA',
-      (vertices, color) => edgeFlag.drawPolygon(vertices, color),
+      (polygon) => _drawWithMeta(edgeFlag, polygon),
       polygons,
       warmup,
       iterations,

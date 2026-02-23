@@ -410,9 +410,10 @@ List<RasterizerAdapter> _buildAdapters() {
       final rasterizer = ACDRRasterizer(
           width: renderWidth,
           height: renderHeight,
-          enableSubpixelY: false,
-          enableSinglePixelSpanFix: false,
-          enableVerticalSupersample: false);
+          enableSubpixelY: true,
+          enableSinglePixelSpanFix: true,
+          enableVerticalSupersample: true,
+          verticalSampleCount: 2);
       final out = Uint32List(renderWidth * renderHeight)
         ..fillRange(0, renderWidth * renderHeight, 0xFFFFFFFF);
 
@@ -521,7 +522,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -546,7 +552,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.buffer);
@@ -586,7 +597,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.pixels);
@@ -636,106 +652,10 @@ List<RasterizerAdapter> _buildAdapters() {
 
       return _uint32ToRGBA(r.buffer);
     }),
-    FunctionAdapter('LNAF_SE (Fast)', (polygons) async {
-      final r = LNAFSERasterizer(
-        width: renderWidth,
-        height: renderHeight,
-        qualityMode: LnafSeQualityMode.fast,
-      );
-      r.clear(0xFFFFFFFF);
-
-      for (final poly in polygons) {
-        r.drawPolygon(
-          poly.vertices,
-          poly.color,
-          windingRule: poly.windingRule,
-          contourVertexCounts: poly.contourVertexCounts,
-        );
-      }
-
-      return _uint32ToRGBA(r.buffer);
-    }),
-    FunctionAdapter('LNAF_SE (High)', (polygons) async {
-      final r = LNAFSERasterizer(
-        width: renderWidth,
-        height: renderHeight,
-        qualityMode: LnafSeQualityMode.high,
-      );
-      r.clear(0xFFFFFFFF);
-
-      for (final poly in polygons) {
-        r.drawPolygon(
-          poly.vertices,
-          poly.color,
-          windingRule: poly.windingRule,
-          contourVertexCounts: poly.contourVertexCounts,
-        );
-      }
-
-      return _uint32ToRGBA(r.buffer);
-    }),
-    FunctionAdapter('LNAF_SE (Ultra)', (polygons) async {
-      final r = LNAFSERasterizer(
-        width: renderWidth,
-        height: renderHeight,
-        qualityMode: LnafSeQualityMode.ultra,
-      );
-      r.clear(0xFFFFFFFF);
-
-      for (final poly in polygons) {
-        r.drawPolygon(
-          poly.vertices,
-          poly.color,
-          windingRule: poly.windingRule,
-          contourVertexCounts: poly.contourVertexCounts,
-        );
-      }
-
-      return _uint32ToRGBA(r.buffer);
-    }),
-    FunctionAdapter('LNAF_SE (Extreme)', (polygons) async {
-      final r = LNAFSERasterizer(
-        width: renderWidth,
-        height: renderHeight,
-        qualityMode: LnafSeQualityMode.extreme,
-      );
-      r.clear(0xFFFFFFFF);
-
-      for (final poly in polygons) {
-        r.drawPolygon(
-          poly.vertices,
-          poly.color,
-          windingRule: poly.windingRule,
-          contourVertexCounts: poly.contourVertexCounts,
-        );
-      }
-
-      return _uint32ToRGBA(r.buffer);
-    }),
-    FunctionAdapter('LNAF_SE (Cinematic)', (polygons) async {
-      final r = LNAFSERasterizer(
-        width: renderWidth,
-        height: renderHeight,
-        qualityMode: LnafSeQualityMode.cinematic,
-      );
-      r.clear(0xFFFFFFFF);
-
-      for (final poly in polygons) {
-        r.drawPolygon(
-          poly.vertices,
-          poly.color,
-          windingRule: poly.windingRule,
-          contourVertexCounts: poly.contourVertexCounts,
-        );
-      }
-
-      return _uint32ToRGBA(r.buffer);
-    }),
     FunctionAdapter('LNAF_SE', (polygons) async {
       final r = LNAFSERasterizer(
         width: renderWidth,
         height: renderHeight,
-        qualityMode: LnafSeQualityMode.fast,
       );
       r.clear(0xFFFFFFFF);
 
@@ -755,7 +675,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.pixels);
@@ -765,7 +690,12 @@ List<RasterizerAdapter> _buildAdapters() {
       r.clear(0xFFFFFFFF);
 
       for (final poly in polygons) {
-        r.drawPolygon(poly.vertices, poly.color);
+        r.drawPolygon(
+          poly.vertices,
+          poly.color,
+          windingRule: poly.windingRule,
+          contourVertexCounts: poly.contourVertexCounts,
+        );
       }
 
       return _uint32ToRGBA(r.pixels);

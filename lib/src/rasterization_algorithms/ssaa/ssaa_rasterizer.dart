@@ -28,17 +28,6 @@ class SSAARasterizer {
   late final int _tilesY;
   late final Uint8List _tileOpaque;
 
-  List<double>? _lastVerticesRef;
-  int _lastVertexCount = 0;
-  Float64List? _cacheXi;
-  Float64List? _cacheYi;
-  Float64List? _cacheXj;
-  Float64List? _cacheYj;
-  Float64List? _cacheDx;
-  Float64List? _cacheDy;
-  Float64List? _cacheInvLen2;
-  Float64List? _cacheInvDy;
-
   SSAARasterizer({
     required this.width,
     required this.height,
@@ -107,19 +96,25 @@ class SSAARasterizer {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    if (contours.isEmpty) return;
+    final useEvenOdd = windingRule == 0;
 
     double minX = double.infinity;
     double maxX = double.negativeInfinity;
     double minY = double.infinity;
     double maxY = double.negativeInfinity;
 
-    for (int i = 0; i < n; i++) {
-      final x = vertices[i * 2];
-      final y = vertices[i * 2 + 1];
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
+    for (final contour in contours) {
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final x = vertices[i * 2];
+        final y = vertices[i * 2 + 1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
     }
 
     int xStart = minX.floor();
@@ -134,71 +129,49 @@ class SSAARasterizer {
 
     if (xEnd < xStart || yEnd < yStart) return;
 
-    final edgeCount = n;
-    Float64List xi;
-    Float64List yi;
-    Float64List xj;
-    Float64List yj;
-    Float64List dx;
-    Float64List dy;
-    Float64List invLen2;
-    Float64List invDy;
+    final xiL = <double>[];
+    final yiL = <double>[];
+    final yjL = <double>[];
+    final dxL = <double>[];
+    final dyL = <double>[];
+    final invLen2L = <double>[];
+    final invDyL = <double>[];
+    final dirL = <int>[];
 
-    if (identical(vertices, _lastVerticesRef) && _lastVertexCount == n) {
-      xi = _cacheXi!;
-      yi = _cacheYi!;
-      xj = _cacheXj!;
-      yj = _cacheYj!;
-      dx = _cacheDx!;
-      dy = _cacheDy!;
-      invLen2 = _cacheInvLen2!;
-      invDy = _cacheInvDy!;
-    } else {
-      xi = Float64List(edgeCount);
-      yi = Float64List(edgeCount);
-      xj = Float64List(edgeCount);
-      yj = Float64List(edgeCount);
-      dx = Float64List(edgeCount);
-      dy = Float64List(edgeCount);
-      invLen2 = Float64List(edgeCount);
-      invDy = Float64List(edgeCount);
-
-      for (int i = 0; i < edgeCount; i++) {
-        final i2 = i * 2;
-        final j = (i + 1) % edgeCount;
-        final j2 = j * 2;
-
-        final x0 = vertices[i2];
-        final y0 = vertices[i2 + 1];
-        final x1 = vertices[j2];
-        final y1 = vertices[j2 + 1];
-
-        xi[i] = x0;
-        yi[i] = y0;
-        xj[i] = x1;
-        yj[i] = y1;
+    for (final contour in contours) {
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x0 = vertices[i * 2];
+        final y0 = vertices[i * 2 + 1];
+        final x1 = vertices[j * 2];
+        final y1 = vertices[j * 2 + 1];
 
         final ex = x1 - x0;
         final ey = y1 - y0;
-        dx[i] = ex;
-        dy[i] = ey;
-
         final len2 = ex * ex + ey * ey;
-        invLen2[i] = len2 > 0 ? 1.0 / len2 : 0.0;
-        invDy[i] = ey != 0 ? 1.0 / ey : 0.0;
-      }
 
-      _lastVerticesRef = vertices;
-      _lastVertexCount = n;
-      _cacheXi = xi;
-      _cacheYi = yi;
-      _cacheXj = xj;
-      _cacheYj = yj;
-      _cacheDx = dx;
-      _cacheDy = dy;
-      _cacheInvLen2 = invLen2;
-      _cacheInvDy = invDy;
+        xiL.add(x0);
+        yiL.add(y0);
+        yjL.add(y1);
+        dxL.add(ex);
+        dyL.add(ey);
+        invLen2L.add(len2 > 0 ? 1.0 / len2 : 0.0);
+        invDyL.add(ey != 0 ? 1.0 / ey : 0.0);
+        dirL.add(y1 > y0 ? 1 : -1);
+      }
     }
+
+    final edgeCount = xiL.length;
+    if (edgeCount == 0) return;
+    final xi = Float64List.fromList(xiL);
+    final yi = Float64List.fromList(yiL);
+    final yj = Float64List.fromList(yjL);
+    final dx = Float64List.fromList(dxL);
+    final dy = Float64List.fromList(dyL);
+    final invLen2 = Float64List.fromList(invLen2L);
+    final invDy = Float64List.fromList(invDyL);
+    final direction = Int32List.fromList(dirL);
 
     final offsets = _sampleOffsets;
     final samplesLen = offsets.length;
@@ -207,6 +180,7 @@ class SSAARasterizer {
 
     bool pointInPolygon(double x, double y) {
       bool inside = false;
+      int winding = 0;
 
       for (int i = 0; i < edgeCount; i++) {
         final x0 = xi[i];
@@ -232,10 +206,16 @@ class SSAARasterizer {
 
         final intersects =
             ((y0 > y) != (y1 > y)) && (x < (ex * (y - y0) * invDy[i]) + x0);
-        if (intersects) inside = !inside;
+        if (intersects) {
+          if (useEvenOdd) {
+            inside = !inside;
+          } else {
+            winding += direction[i];
+          }
+        }
       }
 
-      return inside;
+      return useEvenOdd ? inside : (winding != 0);
     }
 
     final tileMinX = xStart ~/ tileSize;
@@ -345,4 +325,30 @@ class SSAARasterizer {
   Uint32List get buffer => _buffer;
 
   int get sampleCount => _sampleCount;
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

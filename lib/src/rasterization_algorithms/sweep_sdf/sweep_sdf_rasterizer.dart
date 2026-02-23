@@ -128,34 +128,63 @@ extension on SweepSDFRasterizer {
     int colorG,
     int colorB,
   ) {
-    final pixelCenterX = px + 0.5;
-    final dPixel = edge.nx * (pixelCenterX - edgeXAtScanline);
+    final slope = edge.slopeInverse; // dx/dy
+    final xTop = edgeXAtScanline - 0.5 * slope;
+    final xBottom = edgeXAtScanline + 0.5 * slope;
+    final u0 = xTop - px;
+    final u1 = xBottom - px;
 
-    final g = _tables.lookupG(dPixel);
-    final gPrime = _tables.lookupGPrime(dPixel);
-
-    final idx = (py * width + px) * 3;
-
-    final dR = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[0];
-    final dG = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[1];
-    final dB = dPixel + edge.nx * SweepSDFRasterizer.subpixelOffsetsX[2];
-
-    double cR = g + gPrime * (dR - dPixel);
-    double cG = g + gPrime * (dG - dPixel);
-    double cB = g + gPrime * (dB - dPixel);
-
+    var coverage = _integrateClamped01(u0, u1);
     if (invertCoverage) {
-      cR = 1.0 - cR;
-      cG = 1.0 - cG;
-      cB = 1.0 - cB;
+      coverage = 1.0 - coverage;
     }
+    _blendPixelCoverage(px, py, colorR, colorG, colorB, coverage);
+  }
 
+  @pragma('vm:prefer-inline')
+  void _blendPixelCoverage(
+    int px,
+    int py,
+    int colorR,
+    int colorG,
+    int colorB,
+    double coverage,
+  ) {
+    if (coverage <= 0.0) return;
+    final idx = (py * width + px) * 3;
+    if (coverage >= 1.0) {
+      _subpixelBuffer[idx + 0] = colorR;
+      _subpixelBuffer[idx + 1] = colorG;
+      _subpixelBuffer[idx + 2] = colorB;
+      return;
+    }
     _subpixelBuffer[idx + 0] =
-        _blendChannel(_subpixelBuffer[idx + 0], colorR, cR);
+        _blendChannel(_subpixelBuffer[idx + 0], colorR, coverage);
     _subpixelBuffer[idx + 1] =
-        _blendChannel(_subpixelBuffer[idx + 1], colorG, cG);
+        _blendChannel(_subpixelBuffer[idx + 1], colorG, coverage);
     _subpixelBuffer[idx + 2] =
-        _blendChannel(_subpixelBuffer[idx + 2], colorB, cB);
+        _blendChannel(_subpixelBuffer[idx + 2], colorB, coverage);
+  }
+
+  @pragma('vm:prefer-inline')
+  double _singlePixelSpanCoverage(
+    int px,
+    double xLeft,
+    double xRight,
+    SweepActiveEdge leftEdge,
+    SweepActiveEdge rightEdge,
+  ) {
+    final xLeftTop = xLeft - 0.5 * leftEdge.slopeInverse;
+    final xLeftBottom = xLeft + 0.5 * leftEdge.slopeInverse;
+    final xRightTop = xRight - 0.5 * rightEdge.slopeInverse;
+    final xRightBottom = xRight + 0.5 * rightEdge.slopeInverse;
+
+    final areaLeft = _integrateClamped01(xLeftTop - px, xLeftBottom - px);
+    final areaRight = _integrateClamped01(xRightTop - px, xRightBottom - px);
+    final coverage = areaRight - areaLeft;
+    if (coverage <= 0.0) return 0.0;
+    if (coverage >= 1.0) return 1.0;
+    return coverage;
   }
 }
 
@@ -165,9 +194,10 @@ extension on SweepSDFRasterizer {
 
 class SweepActiveEdge {
   double x; // Posição X atual (interseção com scanline)
-  final double yMax; // Y máximo da aresta
+  final int yMax; // Última scanline válida (centro em y+0.5)
   final double slopeInverse; // dx/dy
   final double nx, ny; // Normal unitária
+  final int direction; // +1/-1 para non-zero winding
 
   SweepActiveEdge({
     required this.x,
@@ -175,6 +205,7 @@ class SweepActiveEdge {
     required this.slopeInverse,
     required this.nx,
     required this.ny,
+    required this.direction,
   });
 }
 
@@ -192,14 +223,10 @@ class SweepSDFRasterizer {
   /// Buffer de pixels para exportação
   late final Uint32List _pixelBuffer;
 
-  /// Tabelas de cobertura
-  final CoverageTables _tables;
-
   /// Offsets subpixel (layout LCD RGB horizontal)
   static const List<double> subpixelOffsetsX = [-1.0 / 3.0, 0.0, 1.0 / 3.0];
 
-  SweepSDFRasterizer({required this.width, required this.height})
-      : _tables = CoverageTables() {
+  SweepSDFRasterizer({required this.width, required this.height}) {
     _subpixelBuffer = Uint8List(width * height * 3);
     _pixelBuffer = Uint32List(width * height);
   }
@@ -226,52 +253,69 @@ class SweepSDFRasterizer {
     if (vertices.length < 6) return;
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    if (contours.isEmpty) return;
 
     // Construir tabela de arestas
     final edgeTable = <int, List<SweepActiveEdge>>{};
 
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x0 = vertices[i * 2];
-      final y0 = vertices[i * 2 + 1];
-      final x1 = vertices[j * 2];
-      final y1 = vertices[j * 2 + 1];
+    for (final contour in contours) {
+      final cStart = contour.start;
+      final cCount = contour.count;
+      if (cCount < 2) continue;
 
-      // Ignorar arestas horizontais
-      if ((y1 - y0).abs() < 0.001) continue;
+      for (int local = 0; local < cCount; local++) {
+        final i = cStart + local;
+        final j = cStart + ((local + 1) % cCount);
+        final x0 = vertices[i * 2];
+        final y0 = vertices[i * 2 + 1];
+        final x1 = vertices[j * 2];
+        final y1 = vertices[j * 2 + 1];
 
-      // Garantir que y0 < y1
-      double px0 = x0, py0 = y0, px1 = x1, py1 = y1;
-      if (py0 > py1) {
-        px0 = x1;
-        py0 = y1;
-        px1 = x0;
-        py1 = y0;
+        // Ignorar arestas horizontais
+        if ((y1 - y0).abs() < 0.001) continue;
+
+        int direction = y1 > y0 ? 1 : -1;
+
+        // Garantir que y0 < y1 (apenas para varredura, preservando direction)
+        double px0 = x0, py0 = y0, px1 = x1, py1 = y1;
+        if (py0 > py1) {
+          px0 = x1;
+          py0 = y1;
+          px1 = x0;
+          py1 = y0;
+        }
+
+        // Calcular normal
+        final dx = px1 - px0;
+        final dy = py1 - py0;
+        final len = math.sqrt(dx * dx + dy * dy);
+        final nx = dy / len;
+        final ny = -dx / len;
+
+        // Slope inverso (dx/dy)
+        final slopeInv = dx / dy;
+
+        // Adicionar à tabela de arestas
+        int yStart = (py0 - 0.5).ceil();
+        int yEnd = (py1 - 0.5).floor();
+        if (yStart < 0) yStart = 0;
+        if (yEnd >= height) yEnd = height - 1;
+        if (yStart > yEnd) continue;
+        if (!edgeTable.containsKey(yStart)) {
+          edgeTable[yStart] = [];
+        }
+
+        final scanY = yStart + 0.5;
+        edgeTable[yStart]!.add(SweepActiveEdge(
+          x: px0 + slopeInv * (scanY - py0),
+          yMax: yEnd,
+          slopeInverse: slopeInv,
+          nx: nx,
+          ny: ny,
+          direction: direction,
+        ));
       }
-
-      // Calcular normal
-      final dx = px1 - px0;
-      final dy = py1 - py0;
-      final len = math.sqrt(dx * dx + dy * dy);
-      final nx = dy / len;
-      final ny = -dx / len;
-
-      // Slope inverso (dx/dy)
-      final slopeInv = dx / dy;
-
-      // Adicionar à tabela de arestas
-      final yStart = py0.ceil();
-      if (!edgeTable.containsKey(yStart)) {
-        edgeTable[yStart] = [];
-      }
-
-      edgeTable[yStart]!.add(SweepActiveEdge(
-        x: px0 + slopeInv * (yStart - py0),
-        yMax: py1,
-        slopeInverse: slopeInv,
-        nx: nx,
-        ny: ny,
-      ));
     }
 
     // Lista de arestas ativas (AET)
@@ -281,6 +325,7 @@ class SweepSDFRasterizer {
     final colorR = (color >> 16) & 0xFF;
     final colorG = (color >> 8) & 0xFF;
     final colorB = color & 0xFF;
+    final useEvenOdd = windingRule == 0;
 
     // Varredura
     for (int y = 0; y < height; y++) {
@@ -290,65 +335,57 @@ class SweepSDFRasterizer {
       }
 
       // Remover arestas terminadas
-      activeEdges.removeWhere((e) => e.yMax <= y);
+      activeEdges.removeWhere((e) => y > e.yMax);
 
       if (activeEdges.length < 2) continue;
 
       // Ordenar por X
       activeEdges.sort((a, b) => a.x.compareTo(b.x));
 
-      // Processar pares de arestas
-      for (int i = 0; i + 1 < activeEdges.length; i += 2) {
-        final leftEdge = activeEdges[i];
-        final rightEdge = activeEdges[i + 1];
-        final xLeft = leftEdge.x;
-        final xRight = rightEdge.x;
-
-        final xStart = xLeft.ceil().clamp(0, width);
-        final xEnd = xRight.floor().clamp(0, width);
-        const eps = 1e-9;
-        final hasLeftFraction = (xStart - xLeft) > eps;
-        final hasRightFraction = (xRight - xEnd) > eps;
-
-        // Pixel de borda esquerda
-        if (hasLeftFraction && xStart > 0 && xStart - 1 < width) {
-          _paintBorderPixel(
-            xStart - 1,
+      if (useEvenOdd) {
+        // Even-odd: pares ordenados.
+        for (int i = 0; i + 1 < activeEdges.length; i += 2) {
+          _rasterizeSpan(
             y,
-            leftEdge,
-            xLeft,
-            true,
+            activeEdges[i],
+            activeEdges[i + 1],
+            activeEdges[i].x,
+            activeEdges[i + 1].x,
             colorR,
             colorG,
             colorB,
           );
         }
+      } else {
+        // Non-zero: spans definidos por transições winding zero<->não-zero.
+        int winding = 0;
+        SweepActiveEdge? leftEdge;
+        double xLeft = 0.0;
+        for (int i = 0; i < activeEdges.length; i++) {
+          final edge = activeEdges[i];
+          final wasInside = winding != 0;
+          winding += edge.direction;
+          final isInside = winding != 0;
 
-        // Pixels interiores (cobertura total)
-        for (int x = xStart; x < xEnd; x++) {
-          if (x >= 0 && x < width) {
-            final idx = (y * width + x) * 3;
-            _subpixelBuffer[idx + 0] = colorR;
-            _subpixelBuffer[idx + 1] = colorG;
-            _subpixelBuffer[idx + 2] = colorB;
+          if (!wasInside && isInside) {
+            leftEdge = edge;
+            xLeft = edge.x;
+            continue;
           }
-        }
 
-        // Pixel de borda direita
-        if (hasRightFraction &&
-            xEnd >= 0 &&
-            xEnd < width &&
-            xEnd != xStart - 1) {
-          _paintBorderPixel(
-            xEnd,
-            y,
-            rightEdge,
-            xRight,
-            false,
-            colorR,
-            colorG,
-            colorB,
-          );
+          if (wasInside && !isInside && leftEdge != null) {
+            _rasterizeSpan(
+              y,
+              leftEdge,
+              edge,
+              xLeft,
+              edge.x,
+              colorR,
+              colorG,
+              colorB,
+            );
+            leftEdge = null;
+          }
         }
       }
 
@@ -356,6 +393,80 @@ class SweepSDFRasterizer {
       for (final edge in activeEdges) {
         edge.x += edge.slopeInverse;
       }
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void _rasterizeSpan(
+    int y,
+    SweepActiveEdge leftEdge,
+    SweepActiveEdge rightEdge,
+    double xLeft,
+    double xRight,
+    int colorR,
+    int colorG,
+    int colorB,
+  ) {
+    if (xRight <= xLeft) return;
+
+    // Degenerado em largura subpixel: integra ambas as arestas no mesmo pixel.
+    const eps = 1e-9;
+    final xLeftAdj = xLeft + eps;
+    final xRightAdj = xRight - eps;
+    if (xRightAdj <= xLeftAdj) return;
+
+    final leftPix = xLeftAdj.floor();
+    final rightPix = xRightAdj.floor();
+    if (leftPix == rightPix) {
+      if (leftPix >= 0 && leftPix < width) {
+        final cov = _singlePixelSpanCoverage(
+            leftPix, xLeftAdj, xRightAdj, leftEdge, rightEdge);
+        _blendPixelCoverage(leftPix, y, colorR, colorG, colorB, cov);
+      }
+      return;
+    }
+
+    final xStart = xLeft.ceil().clamp(0, width);
+    final xEnd = xRight.floor().clamp(0, width);
+    final hasLeftFraction = (xStart - xLeft) > eps;
+    final hasRightFraction = (xRight - xEnd) > eps;
+
+    // Pixel de borda esquerda
+    if (hasLeftFraction && xStart > 0 && xStart - 1 < width) {
+      _paintBorderPixel(
+        xStart - 1,
+        y,
+        leftEdge,
+        xLeft,
+        true,
+        colorR,
+        colorG,
+        colorB,
+      );
+    }
+
+    // Pixels interiores (cobertura total)
+    for (int x = xStart; x < xEnd; x++) {
+      if (x >= 0 && x < width) {
+        final idx = (y * width + x) * 3;
+        _subpixelBuffer[idx + 0] = colorR;
+        _subpixelBuffer[idx + 1] = colorG;
+        _subpixelBuffer[idx + 2] = colorB;
+      }
+    }
+
+    // Pixel de borda direita
+    if (hasRightFraction && xEnd >= 0 && xEnd < width && xEnd != xStart - 1) {
+      _paintBorderPixel(
+        xEnd,
+        y,
+        rightEdge,
+        xRight,
+        false,
+        colorR,
+        colorG,
+        colorB,
+      );
     }
   }
 
@@ -375,4 +486,63 @@ class SweepSDFRasterizer {
   }
 
   Uint8List get subpixels => _subpixelBuffer;
+}
+
+@pragma('vm:prefer-inline')
+double _integrateLinear(double u0, double du, double a, double b) {
+  return u0 * (b - a) + 0.5 * du * (b * b - a * a);
+}
+
+@pragma('vm:prefer-inline')
+double _integrateClamped01(double u0, double u1) {
+  if (u0 <= 0.0 && u1 <= 0.0) return 0.0;
+  if (u0 >= 1.0 && u1 >= 1.0) return 1.0;
+  if (u0 == u1) return _clamp01(u0);
+
+  final du = u1 - u0;
+  if (du > 0.0) {
+    final y0 = (0.0 - u0) / du;
+    final y1 = (1.0 - u0) / du;
+    final a = y0.clamp(0.0, 1.0);
+    final b = y1.clamp(0.0, 1.0);
+    var integral = 0.0;
+    if (b > a) integral += _integrateLinear(u0, du, a, b);
+    if (y1 < 1.0) integral += (1.0 - b);
+    return _clamp01(integral);
+  }
+
+  final y1 = (1.0 - u0) / du; // du < 0
+  final y0 = (0.0 - u0) / du;
+  final a = y1.clamp(0.0, 1.0);
+  final b = y0.clamp(0.0, 1.0);
+  var integral = 0.0;
+  if (y1 > 0.0) integral += a;
+  if (b > a) integral += _integrateLinear(u0, du, a, b);
+  return _clamp01(integral);
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
 }

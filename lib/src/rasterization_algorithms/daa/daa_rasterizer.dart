@@ -340,7 +340,7 @@ class DAARasterizer {
       for (int e = 0; e < edgeCount; e++) {
         if (py < edgeYMin[e] || py >= edgeYMax[e]) continue;
         final x = edgeX1[e] + (py - edgeY1[e]) * edgeInvSlope[e];
-        crossings.add(_DAAScanCross(x, edgeWinding[e]));
+        crossings.add(_DAAScanCross(x, edgeWinding[e], edgeInvSlope[e]));
       }
       if (crossings.isEmpty) continue;
       crossings.sort((a, b) => a.x.compareTo(b.x));
@@ -352,6 +352,8 @@ class DAARasterizer {
             y: y,
             left: crossings[i].x,
             right: crossings[i + 1].x,
+            leftSlopeDxDy: crossings[i].slopeDxDy,
+            rightSlopeDxDy: crossings[i + 1].slopeDxDy,
             color: color,
             minXi: minXi,
             maxXi: maxXi,
@@ -360,6 +362,7 @@ class DAARasterizer {
       } else {
         int winding = 0;
         double? left;
+        double leftSlopeDxDy = 0.0;
         for (final c in crossings) {
           final prevWinding = winding;
           winding += c.winding;
@@ -368,17 +371,21 @@ class DAARasterizer {
 
           if (!wasInside && isInside) {
             left = c.x;
+            leftSlopeDxDy = c.slopeDxDy;
           } else if (wasInside && !isInside && left != null) {
             _rasterizeSpan(
               rowOffset: rowOffset,
               y: y,
               left: left,
               right: c.x,
+              leftSlopeDxDy: leftSlopeDxDy,
+              rightSlopeDxDy: c.slopeDxDy,
               color: color,
               minXi: minXi,
               maxXi: maxXi,
             );
             left = null;
+            leftSlopeDxDy = 0.0;
           }
         }
       }
@@ -413,6 +420,8 @@ class DAARasterizer {
     required int y,
     required double left,
     required double right,
+    required double leftSlopeDxDy,
+    required double rightSlopeDxDy,
     required int color,
     required int minXi,
     required int maxXi,
@@ -420,38 +429,95 @@ class DAARasterizer {
     if (!(left.isFinite && right.isFinite)) return;
     if (right <= left) return;
 
-    final startX = (left.floor() - 1).clamp(minXi, maxXi);
-    final endX = (right.ceil() + 1).clamp(minXi, maxXi);
+    const eps = 1e-9;
+    final leftAdj = left + eps;
+    final rightAdj = right - eps;
+    if (rightAdj <= leftAdj) return;
 
-    for (int x = startX; x <= endX; x++) {
-      final cx = x + 0.5;
-      double signedDist;
+    final leftPix = leftAdj.floor().clamp(minXi, maxXi);
+    final rightPix = rightAdj.floor().clamp(minXi, maxXi);
+    if (rightPix < leftPix) return;
 
-      if (cx < left) {
-        signedDist = left - cx;
-      } else if (cx > right) {
-        signedDist = cx - right;
-      } else {
-        final distToLeft = cx - left;
-        final distToRight = right - cx;
-        signedDist = -math.min(distToLeft, distToRight);
-      }
-
-      final alpha = _coverageLUT.getAlpha((signedDist * _fixedOne).toInt());
-      if (alpha == 255) {
-        framebuffer[rowOffset + x] = color;
-      } else if (alpha > 0) {
-        _blendPixel(rowOffset + x, color, alpha);
-      }
+    if (leftPix == rightPix) {
+      final cov = _singlePixelCoverage(
+        leftPix,
+        leftAdj,
+        rightAdj,
+        leftSlopeDxDy,
+        rightSlopeDxDy,
+      );
+      _writeCoverage(rowOffset + leftPix, color, cov);
+      return;
     }
+
+    final leftCov = _leftCoverage(leftPix, leftAdj, leftSlopeDxDy);
+    final rightCov = _rightCoverage(rightPix, rightAdj, rightSlopeDxDy);
+    _writeCoverage(rowOffset + leftPix, color, leftCov);
+    _writeCoverage(rowOffset + rightPix, color, rightCov);
+
+    final fillStart = math.max(leftPix + 1, minXi);
+    final fillEnd = math.min(rightPix, maxXi + 1); // exclusive
+    if (fillEnd > fillStart) {
+      framebuffer.fillRange(rowOffset + fillStart, rowOffset + fillEnd, color);
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void _writeCoverage(int index, int color, double coverage) {
+    if (coverage <= 0.0) return;
+    if (coverage >= 1.0) {
+      framebuffer[index] = color;
+      return;
+    }
+    final alpha = (coverage * 255.0 + 0.5).toInt().clamp(0, 255);
+    if (alpha <= 0) return;
+    if (alpha >= 255) {
+      framebuffer[index] = color;
+      return;
+    }
+    _blendPixel(index, color, alpha);
+  }
+
+  @pragma('vm:prefer-inline')
+  double _leftCoverage(int px, double xIntersect, double slopeDxDy) {
+    final xTop = xIntersect - 0.5 * slopeDxDy;
+    final xBottom = xIntersect + 0.5 * slopeDxDy;
+    final area = _integrateClamped01(xTop - px, xBottom - px);
+    return (1.0 - area).clamp(0.0, 1.0);
+  }
+
+  @pragma('vm:prefer-inline')
+  double _rightCoverage(int px, double xIntersect, double slopeDxDy) {
+    final xTop = xIntersect - 0.5 * slopeDxDy;
+    final xBottom = xIntersect + 0.5 * slopeDxDy;
+    return _integrateClamped01(xTop - px, xBottom - px).clamp(0.0, 1.0);
+  }
+
+  @pragma('vm:prefer-inline')
+  double _singlePixelCoverage(
+    int px,
+    double xLeft,
+    double xRight,
+    double leftSlopeDxDy,
+    double rightSlopeDxDy,
+  ) {
+    final xLeftTop = xLeft - 0.5 * leftSlopeDxDy;
+    final xLeftBottom = xLeft + 0.5 * leftSlopeDxDy;
+    final xRightTop = xRight - 0.5 * rightSlopeDxDy;
+    final xRightBottom = xRight + 0.5 * rightSlopeDxDy;
+
+    final leftArea = _integrateClamped01(xLeftTop - px, xLeftBottom - px);
+    final rightArea = _integrateClamped01(xRightTop - px, xRightBottom - px);
+    return (rightArea - leftArea).clamp(0.0, 1.0);
   }
 }
 
 class _DAAScanCross {
   final double x;
   final int winding;
+  final double slopeDxDy;
 
-  const _DAAScanCross(this.x, this.winding);
+  const _DAAScanCross(this.x, this.winding, this.slopeDxDy);
 }
 
 class _DAAContourSpan {
@@ -459,4 +525,37 @@ class _DAAContourSpan {
   final int count;
 
   const _DAAContourSpan(this.start, this.count);
+}
+
+@pragma('vm:prefer-inline')
+double _integrateLinear(double u0, double du, double a, double b) {
+  return u0 * (b - a) + 0.5 * du * (b * b - a * a);
+}
+
+@pragma('vm:prefer-inline')
+double _integrateClamped01(double u0, double u1) {
+  if (u0 <= 0.0 && u1 <= 0.0) return 0.0;
+  if (u0 >= 1.0 && u1 >= 1.0) return 1.0;
+  if (u0 == u1) return u0.clamp(0.0, 1.0);
+
+  final du = u1 - u0;
+  if (du > 0.0) {
+    final y0 = (0.0 - u0) / du;
+    final y1 = (1.0 - u0) / du;
+    final a = y0.clamp(0.0, 1.0);
+    final b = y1.clamp(0.0, 1.0);
+    var integral = 0.0;
+    if (b > a) integral += _integrateLinear(u0, du, a, b);
+    if (y1 < 1.0) integral += (1.0 - b);
+    return integral.clamp(0.0, 1.0);
+  }
+
+  final y1 = (1.0 - u0) / du; // du < 0
+  final y0 = (0.0 - u0) / du;
+  final a = y1.clamp(0.0, 1.0);
+  final b = y0.clamp(0.0, 1.0);
+  var integral = 0.0;
+  if (y1 > 0.0) integral += a;
+  if (b > a) integral += _integrateLinear(u0, du, a, b);
+  return integral.clamp(0.0, 1.0);
 }

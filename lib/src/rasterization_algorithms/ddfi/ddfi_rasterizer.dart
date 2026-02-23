@@ -320,35 +320,89 @@ class FluxRenderer {
     if (vertices.length < 6) return; // Mínimo 3 vértices
 
     final n = vertices.length ~/ 2;
+    final contours = _resolveContours(n, contourVertexCounts);
+    if (contours.isEmpty) return;
 
     // Bounding box do polígono
     var minX = vertices[0];
     var maxX = vertices[0];
     var minY = vertices[1];
     var maxY = vertices[1];
-    for (int i = 1; i < n; i++) {
-      final x = vertices[i * 2];
-      final y = vertices[i * 2 + 1];
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
+    bool first = true;
+    for (final contour in contours) {
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final x = vertices[i * 2];
+        final y = vertices[i * 2 + 1];
+        if (first) {
+          minX = x;
+          maxX = x;
+          minY = y;
+          maxY = y;
+          first = false;
+        } else {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
     }
 
-    // Rasteriza as arestas do contorno
-    for (int i = 0; i < n; i++) {
-      final j = (i + 1) % n;
-      final x1 = vertices[i * 2];
-      final y1 = vertices[i * 2 + 1];
-      final x2 = vertices[j * 2];
-      final y2 = vertices[j * 2 + 1];
+    final area2ByContour = Float64List(contours.length);
+    for (int ci = 0; ci < contours.length; ci++) {
+      final contour = contours[ci];
+      double area2 = 0.0;
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final x0 = vertices[i * 2];
+        final y0 = vertices[i * 2 + 1];
+        final x1 = vertices[j * 2];
+        final y1 = vertices[j * 2 + 1];
+        area2 += x0 * y1 - y0 * x1;
+      }
+      area2ByContour[ci] = area2;
+    }
 
-      final fx1 = (x1 * _one).toInt();
-      final fy1 = (y1 * _one).toInt();
-      final fx2 = (x2 * _one).toInt();
-      final fy2 = (y2 * _one).toInt();
+    for (int ci = 0; ci < contours.length; ci++) {
+      final contour = contours[ci];
+      if (contour.count < 2) continue;
 
-      _rasterizeEdge(fx1, fy1, fx2, fy2);
+      final currentSign = area2ByContour[ci] >= 0.0 ? 1 : -1;
+      int targetSign = currentSign;
+      if (windingRule == 0) {
+        final sx = vertices[contour.start * 2];
+        final sy = vertices[contour.start * 2 + 1];
+        int depth = 0;
+        for (int oi = 0; oi < contours.length; oi++) {
+          if (oi == ci) continue;
+          final other = contours[oi];
+          if (_pointInContour(sx, sy, vertices, other.start, other.count)) {
+            depth++;
+          }
+        }
+        targetSign = (depth & 1) == 0 ? 1 : -1;
+      }
+      final flip = currentSign != targetSign;
+
+      for (int local = 0; local < contour.count; local++) {
+        final i = contour.start + local;
+        final j = contour.start + ((local + 1) % contour.count);
+        final from = flip ? j : i;
+        final to = flip ? i : j;
+        final x1 = vertices[from * 2];
+        final y1 = vertices[from * 2 + 1];
+        final x2 = vertices[to * 2];
+        final y2 = vertices[to * 2 + 1];
+
+        final fx1 = (x1 * _one).toInt();
+        final fy1 = (y1 * _one).toInt();
+        final fx2 = (x2 * _one).toInt();
+        final fy2 = (y2 * _one).toInt();
+
+        _rasterizeEdge(fx1, fy1, fx2, fy2);
+      }
     }
 
     final minXi = minX.floor().clamp(0, width - 1);
@@ -383,4 +437,53 @@ class FluxRenderer {
 
     _resolveArea(minX, maxX, minY, maxY, color);
   }
+}
+
+class _ContourSpan {
+  final int start;
+  final int count;
+  const _ContourSpan(this.start, this.count);
+}
+
+List<_ContourSpan> _resolveContours(int totalPoints, List<int>? counts) {
+  if (counts == null || counts.isEmpty) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  int consumed = 0;
+  final out = <_ContourSpan>[];
+  for (final raw in counts) {
+    if (raw <= 0) continue;
+    if (consumed + raw > totalPoints) {
+      return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+    }
+    out.add(_ContourSpan(consumed, raw));
+    consumed += raw;
+  }
+  if (out.isEmpty || consumed != totalPoints) {
+    return <_ContourSpan>[_ContourSpan(0, totalPoints)];
+  }
+  return out;
+}
+
+bool _pointInContour(
+  double px,
+  double py,
+  List<double> vertices,
+  int start,
+  int count,
+) {
+  bool inside = false;
+  for (int local = 0; local < count; local++) {
+    final i = start + local;
+    final j = start + ((local + 1) % count);
+    final x0 = vertices[i * 2];
+    final y0 = vertices[i * 2 + 1];
+    final x1 = vertices[j * 2];
+    final y1 = vertices[j * 2 + 1];
+    if (((y0 > py) != (y1 > py)) &&
+        (px < (x1 - x0) * (py - y0) / (y1 - y0) + x0)) {
+      inside = !inside;
+    }
+  }
+  return inside;
 }
