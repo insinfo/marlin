@@ -6,6 +6,8 @@ export 'core/bl_types.dart';
 export 'geometry/bl_path.dart';
 export 'pipeline/bl_compop_kernel.dart';
 export 'pipeline/bl_fetch_linear_gradient.dart';
+export 'pipeline/bl_fetch_pattern.dart';
+export 'pipeline/bl_fetch_radial_gradient.dart';
 export 'pipeline/bl_fetch_solid.dart';
 export 'raster/bl_analytic_rasterizer.dart';
 export 'raster/bl_edge_builder.dart';

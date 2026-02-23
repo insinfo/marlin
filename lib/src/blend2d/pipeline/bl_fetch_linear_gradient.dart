@@ -29,9 +29,26 @@ class BLLinearGradientFetcher {
     final px = x + 0.5;
     final py = y + 0.5;
     final t = ((px - _x0) * _dx + (py - _y0) * _dy) * _invLen2;
-    final tc = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    final tc = _applyExtend(t, gradient.extendMode);
     final idx = (tc * (_kLutSize - 1)).round();
     return _lut[idx];
+  }
+
+  @pragma('vm:prefer-inline')
+  static double _applyExtend(double t, BLGradientExtendMode mode) {
+    switch (mode) {
+      case BLGradientExtendMode.pad:
+        return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+
+      case BLGradientExtendMode.repeat:
+        final r = t - t.floorToDouble();
+        return r < 0.0 ? r + 1.0 : r;
+
+      case BLGradientExtendMode.reflect:
+        final period = t - (t * 0.5).floorToDouble() * 2.0;
+        final wrapped = period < 0.0 ? period + 2.0 : period;
+        return wrapped <= 1.0 ? wrapped : 2.0 - wrapped;
+    }
   }
 
   static double _computeInvLen2(BLLinearGradient gradient) {

@@ -1,7 +1,7 @@
-/// Benchmark dedicado de gradiente linear no port Blend2D em Dart.
+/// Benchmark dedicado de gradiente radial no port Blend2D em Dart.
 ///
 /// Uso:
-///   dart run benchmark/blend2d_linear_gradient_benchmark.dart
+///   dart run benchmark/blend2d_radial_gradient_benchmark.dart
 
 import 'dart:async';
 import 'dart:io';
@@ -12,12 +12,12 @@ import 'package:marlin/marlin.dart';
 
 import '../lib/src/blend2d/blend2d.dart';
 
-class _GradientScenePolygon {
+class _RadialScenePolygon {
   final List<double> vertices;
   final BLFillRule fillRule;
-  final BLLinearGradient gradient;
+  final BLRadialGradient gradient;
 
-  const _GradientScenePolygon({
+  const _RadialScenePolygon({
     required this.vertices,
     required this.fillRule,
     required this.gradient,
@@ -120,18 +120,22 @@ List<double> _createThinLine(double x0, double y0, double x1, double y1, double 
   ];
 }
 
-BLLinearGradient _makeGradient(
-  double x0,
-  double y0,
-  double x1,
-  double y1,
+BLRadialGradient _makeRadial(
+  double cx,
+  double cy,
+  double fx,
+  double fy,
+  double r0,
+  double r1,
   int c0,
   int c1, {
   BLGradientExtendMode extendMode = BLGradientExtendMode.pad,
 }) {
-  return BLLinearGradient(
-    p0: BLPoint(x0, y0),
-    p1: BLPoint(x1, y1),
+  return BLRadialGradient(
+    c0: BLPoint(cx, cy),
+    c1: BLPoint(fx, fy),
+    r0: r0,
+    r1: r1,
     stops: <BLGradientStop>[
       BLGradientStop(0.0, c0),
       BLGradientStop(1.0, c1),
@@ -140,71 +144,77 @@ BLLinearGradient _makeGradient(
   );
 }
 
-List<_GradientScenePolygon> _createGradientScene() {
-  return <_GradientScenePolygon>[
-    _GradientScenePolygon(
+List<_RadialScenePolygon> _createRadialScene() {
+  return <_RadialScenePolygon>[
+    _RadialScenePolygon(
       vertices: _createTriangle(88, 92, 56),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(32, 32, 144, 160, 0xFFE53935, 0xFFFFB300),
+      gradient: _makeRadial(88, 92, 80, 82, 8, 82, 0xFFE53935, 0xFFFFB300),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createSquare(212, 88, 98),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(162, 36, 262, 140, 0xFF3949AB, 0xFF26C6DA),
+      gradient: _makeRadial(212, 88, 188, 70, 6, 90, 0xFF3949AB, 0xFF26C6DA),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createHexagon(350, 96, 52),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
-        330,
-        70,
-        370,
-        130,
+      gradient: _makeRadial(
+        350,
+        96,
+        334,
+        82,
+        10,
+        44,
         0xFF00897B,
         0xFF9CCC65,
         extendMode: BLGradientExtendMode.repeat,
       ),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createStar(438, 98, 56, 24),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
+      gradient: _makeRadial(
+        438,
+        98,
         420,
-        72,
-        456,
-        116,
+        84,
+        4,
+        52,
         0xFF8E24AA,
         0xFFEC407A,
         extendMode: BLGradientExtendMode.reflect,
       ),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createArcBand(120, 276, 28, 64, -2.6, -0.1, 36),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(48, 236, 188, 316, 0xFFFF7043, 0xFFFFEE58),
+      gradient: _makeRadial(116, 274, 102, 262, 4, 66, 0xFFFF7043, 0xFFFFEE58),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createSquare(278, 268, 132),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(212, 202, 344, 334, 0xFF5E35B1, 0xFF42A5F5),
+      gradient: _makeRadial(278, 268, 248, 238, 8, 108, 0xFF5E35B1, 0xFF42A5F5),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createStar(430, 274, 72, 30),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
-        404,
-        242,
-        452,
-        304,
+      gradient: _makeRadial(
+        430,
+        274,
+        406,
+        252,
+        8,
+        58,
         0xFF43A047,
         0xFFAED581,
         extendMode: BLGradientExtendMode.reflect,
       ),
     ),
-    _GradientScenePolygon(
+    _RadialScenePolygon(
       vertices: _createThinLine(20, 486, 492, 470, 5.0),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(20, 486, 492, 470, 0xFF1E88E5, 0xFF00ACC1),
+      gradient: _makeRadial(250, 478, 212, 480, 2, 280, 0xFF1E88E5, 0xFF00ACC1),
     ),
   ];
 }
@@ -232,11 +242,11 @@ Future<void> _saveImage(
 
 Future<void> _renderScene(
   BLContext ctx,
-  List<_GradientScenePolygon> polygons,
+  List<_RadialScenePolygon> polygons,
 ) async {
   ctx.clear(0xFFF2F2F2);
   for (final p in polygons) {
-    ctx.setLinearGradient(p.gradient);
+    ctx.setRadialGradient(p.gradient);
     await ctx.fillPolygon(
       p.vertices,
       rule: p.fillRule,
@@ -250,15 +260,15 @@ Future<void> main() async {
   const warmup = 5;
   const iterations = 30;
 
-  final polygons = _createGradientScene();
+  final polygons = _createRadialScene();
   final image = BLImage(width, height);
   final ctx = BLContext(image);
 
   try {
-    print('Blend2D Dart Port Linear Gradient Benchmark');
+    print('Blend2D Dart Port Radial Gradient Benchmark');
     print('Resolution: ${width}x$height');
     print('Iterations: $iterations');
-    print('Gradient polygons per iteration: ${polygons.length}');
+    print('Radial polygons per iteration: ${polygons.length}');
 
     for (int i = 0; i < warmup; i++) {
       await _renderScene(ctx, polygons);
@@ -275,12 +285,12 @@ Future<void> main() async {
         ((iterations * polygons.length) / (sw.elapsedMicroseconds / 1000000.0))
             .round();
 
-    await _saveImage('BLEND2D_PORT_LINEAR_GRADIENT', image.pixels, width, height);
+    await _saveImage('BLEND2D_PORT_RADIAL_GRADIENT', image.pixels, width, height);
 
     print('');
     print('Average: ${avgMs.toStringAsFixed(3)} ms/frame');
     print('Throughput: $polyPerSec poly/s');
-    print('Output: output/rasterization_benchmark/BLEND2D_PORT_LINEAR_GRADIENT.png');
+    print('Output: output/rasterization_benchmark/BLEND2D_PORT_RADIAL_GRADIENT.png');
   } finally {
     await ctx.dispose();
   }

@@ -1,0 +1,224 @@
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import '../core/bl_types.dart';
+
+class _BLRadialParams {
+  final double x0;
+  final double y0;
+  final double dcx;
+  final double dcy;
+  final double a;
+  final double invA;
+  final bool isLinear;
+  final double r0Sq;
+  final double r0Dr;
+
+  const _BLRadialParams({
+    required this.x0,
+    required this.y0,
+    required this.dcx,
+    required this.dcy,
+    required this.a,
+    required this.invA,
+    required this.isLinear,
+    required this.r0Sq,
+    required this.r0Dr,
+  });
+}
+
+class BLRadialGradientFetcher {
+  static const int _kLutSize = 256;
+  static const double _kEpsilon = 1e-20;
+  static const double _kFocalDistLimit = 0.5;
+
+  final BLRadialGradient gradient;
+  final Uint32List _lut;
+
+  final double _x0;
+  final double _y0;
+  final double _dcx;
+  final double _dcy;
+
+  final double _a;
+  final double _invA;
+  final bool _isLinear;
+  final double _r0Sq;
+  final double _r0Dr;
+
+  factory BLRadialGradientFetcher(BLRadialGradient gradient) {
+    final params = _prepare(gradient);
+    return BLRadialGradientFetcher._(gradient, params);
+  }
+
+  BLRadialGradientFetcher._(this.gradient, _BLRadialParams params)
+      : _x0 = params.x0,
+        _y0 = params.y0,
+        _dcx = params.dcx,
+        _dcy = params.dcy,
+        _a = params.a,
+        _invA = params.invA,
+        _isLinear = params.isLinear,
+        _r0Sq = params.r0Sq,
+        _r0Dr = params.r0Dr,
+        _lut = _buildLut(gradient.stops);
+
+  @pragma('vm:prefer-inline')
+  int fetch(int x, int y) {
+    final px = x + 0.5;
+    final py = y + 0.5;
+
+    final vx = px - _x0;
+    final vy = py - _y0;
+
+    final b = vx * _dcx + vy * _dcy + _r0Dr;
+    final c = vx * vx + vy * vy - _r0Sq;
+
+    final t = _solveT(_isLinear, _a, _invA, b, c);
+    final tc = _applyExtend(t, gradient.extendMode);
+    final idx = (tc * (_kLutSize - 1)).round();
+    return _lut[idx];
+  }
+
+  @pragma('vm:prefer-inline')
+  static double _solveT(bool isLinear, double a, double invA, double b, double c) {
+    if (isLinear) {
+      if (b.abs() < _kEpsilon) return 0.0;
+      return c / (2.0 * b);
+    }
+
+    final disc = b * b - a * c;
+    if (disc <= 0.0) return b * invA;
+
+    final root = math.sqrt(disc);
+    final numer = a >= 0.0 ? (b + root) : (b - root);
+    return numer * invA;
+  }
+
+  @pragma('vm:prefer-inline')
+  static double _applyExtend(double t, BLGradientExtendMode mode) {
+    switch (mode) {
+      case BLGradientExtendMode.pad:
+        return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+
+      case BLGradientExtendMode.repeat:
+        final r = t - t.floorToDouble();
+        return r < 0.0 ? r + 1.0 : r;
+
+      case BLGradientExtendMode.reflect:
+        final period = t - (t * 0.5).floorToDouble() * 2.0;
+        final wrapped = period < 0.0 ? period + 2.0 : period;
+        return wrapped <= 1.0 ? wrapped : 2.0 - wrapped;
+    }
+  }
+
+  static _BLRadialParams _prepare(BLRadialGradient gradient) {
+    final x0 = gradient.c0.x;
+    final y0 = gradient.c0.y;
+    final r0 = gradient.r0;
+    final r1 = gradient.r1;
+
+    double dcx = gradient.c1.x - x0;
+    double dcy = gradient.c1.y - y0;
+    final dr = r1 - r0;
+
+    final sqDist = dcx * dcx + dcy * dcy;
+    final dist = math.sqrt(sqDist);
+    final distFromBorder = (dist - dr).abs();
+
+    if (dist > _kEpsilon && distFromBorder < _kFocalDistLimit) {
+      final scale0 = (dr - _kFocalDistLimit) / dist;
+      final scale1 = (dr + _kFocalDistLimit) / dist;
+
+      final dcx0 = dcx * scale0;
+      final dcy0 = dcy * scale0;
+      final dcx1 = dcx * scale1;
+      final dcy1 = dcy * scale1;
+
+      final d0 = ((dcx0 * dcx0 + dcy0 * dcy0) - sqDist).abs();
+      final d1 = ((dcx1 * dcx1 + dcy1 * dcy1) - sqDist).abs();
+
+      if (d0 < d1) {
+        dcx = dcx0;
+        dcy = dcy0;
+      } else {
+        dcx = dcx1;
+        dcy = dcy1;
+      }
+    }
+
+    final a = dcx * dcx + dcy * dcy - dr * dr;
+    final isLinear = a.abs() < _kEpsilon;
+    final invA = isLinear ? 0.0 : 1.0 / a;
+
+    return _BLRadialParams(
+      x0: x0,
+      y0: y0,
+      dcx: dcx,
+      dcy: dcy,
+      a: a,
+      invA: invA,
+      isLinear: isLinear,
+      r0Sq: r0 * r0,
+      r0Dr: r0 * dr,
+    );
+  }
+
+  static Uint32List _buildLut(List<BLGradientStop> inputStops) {
+    final lut = Uint32List(_kLutSize);
+    if (inputStops.isEmpty) {
+      lut.fillRange(0, _kLutSize, 0xFF000000);
+      return lut;
+    }
+
+    final stops = List<BLGradientStop>.from(inputStops)
+      ..sort((a, b) => a.offset.compareTo(b.offset));
+
+    final first = stops.first;
+    final last = stops.last;
+
+    for (int i = 0; i < _kLutSize; i++) {
+      final t = i / (_kLutSize - 1);
+      if (t <= first.offset) {
+        lut[i] = first.color;
+        continue;
+      }
+      if (t >= last.offset) {
+        lut[i] = last.color;
+        continue;
+      }
+
+      int seg = 0;
+      while (seg + 1 < stops.length && t > stops[seg + 1].offset) {
+        seg++;
+      }
+
+      final a = stops[seg];
+      final b = stops[seg + 1];
+      final denom = math.max(1e-12, b.offset - a.offset);
+      final u = (t - a.offset) / denom;
+      lut[i] = _lerpColor(a.color, b.color, u);
+    }
+
+    return lut;
+  }
+
+  static int _lerpColor(int c0, int c1, double t) {
+    final a0 = (c0 >>> 24) & 0xFF;
+    final r0 = (c0 >>> 16) & 0xFF;
+    final g0 = (c0 >>> 8) & 0xFF;
+    final b0 = c0 & 0xFF;
+
+    final a1 = (c1 >>> 24) & 0xFF;
+    final r1 = (c1 >>> 16) & 0xFF;
+    final g1 = (c1 >>> 8) & 0xFF;
+    final b1 = c1 & 0xFF;
+
+    final a = (a0 + (a1 - a0) * t).round().clamp(0, 255);
+    final r = (r0 + (r1 - r0) * t).round().clamp(0, 255);
+    final g = (g0 + (g1 - g0) * t).round().clamp(0, 255);
+    final b = (b0 + (b1 - b0) * t).round().clamp(0, 255);
+
+    return (a << 24) | (r << 16) | (g << 8) | b;
+  }
+}

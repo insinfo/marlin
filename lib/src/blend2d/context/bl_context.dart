@@ -1,6 +1,8 @@
 import '../core/bl_image.dart';
 import '../core/bl_types.dart';
 import '../pipeline/bl_fetch_linear_gradient.dart';
+import '../pipeline/bl_fetch_pattern.dart';
+import '../pipeline/bl_fetch_radial_gradient.dart';
 import '../geometry/bl_path.dart';
 import '../pipeline/bl_fetch_solid.dart';
 import '../raster/bl_analytic_rasterizer.dart';
@@ -8,6 +10,8 @@ import '../raster/bl_analytic_rasterizer.dart';
 enum _BLFillStyleType {
   solid,
   linearGradient,
+  radialGradient,
+  pattern,
 }
 
 /// Contexto de desenho do port Blend2D em Dart.
@@ -25,6 +29,8 @@ class BLContext {
   BLFillRule fillRule = BLFillRule.nonZero;
   BLSolidFetcher _solidFetcher = BLSolidFetcher(0xFF000000);
   BLLinearGradientFetcher? _linearGradientFetcher;
+  BLRadialGradientFetcher? _radialGradientFetcher;
+  BLPatternFetcher? _patternFetcher;
   _BLFillStyleType _fillStyleType = _BLFillStyleType.solid;
 
   BLContext(
@@ -53,11 +59,29 @@ class BLContext {
     _solidFetcher = BLSolidFetcher(argb);
     _fillStyleType = _BLFillStyleType.solid;
     _linearGradientFetcher = null;
+    _radialGradientFetcher = null;
+    _patternFetcher = null;
   }
 
   void setLinearGradient(BLLinearGradient gradient) {
     _linearGradientFetcher = BLLinearGradientFetcher(gradient);
+    _radialGradientFetcher = null;
+    _patternFetcher = null;
     _fillStyleType = _BLFillStyleType.linearGradient;
+  }
+
+  void setRadialGradient(BLRadialGradient gradient) {
+    _radialGradientFetcher = BLRadialGradientFetcher(gradient);
+    _linearGradientFetcher = null;
+    _patternFetcher = null;
+    _fillStyleType = _BLFillStyleType.radialGradient;
+  }
+
+  void setPattern(BLPattern pattern) {
+    _patternFetcher = BLPatternFetcher(pattern);
+    _linearGradientFetcher = null;
+    _radialGradientFetcher = null;
+    _fillStyleType = _BLFillStyleType.pattern;
   }
 
   void setFillRule(BLFillRule rule) {
@@ -77,6 +101,8 @@ class BLContext {
     final bool useExplicitColor = color != null;
     final drawRule = rule ?? fillRule;
     final gradientFetcher = _linearGradientFetcher;
+    final radialFetcher = _radialGradientFetcher;
+    final patternFetcher = _patternFetcher;
 
     if (!useExplicitColor &&
         _fillStyleType == _BLFillStyleType.linearGradient &&
@@ -84,6 +110,34 @@ class BLContext {
       await _rasterizer.drawPolygonFetched(
         vertices,
         gradientFetcher.fetch,
+        fillRule: drawRule,
+        compOp: compOp,
+        contourVertexCounts: contourVertexCounts,
+      );
+      _syncFromRasterizer();
+      return;
+    }
+
+    if (!useExplicitColor &&
+        _fillStyleType == _BLFillStyleType.radialGradient &&
+        radialFetcher != null) {
+      await _rasterizer.drawPolygonFetched(
+        vertices,
+        radialFetcher.fetch,
+        fillRule: drawRule,
+        compOp: compOp,
+        contourVertexCounts: contourVertexCounts,
+      );
+      _syncFromRasterizer();
+      return;
+    }
+
+    if (!useExplicitColor &&
+        _fillStyleType == _BLFillStyleType.pattern &&
+        patternFetcher != null) {
+      await _rasterizer.drawPolygonFetched(
+        vertices,
+        patternFetcher.fetch,
         fillRule: drawRule,
         compOp: compOp,
         contourVertexCounts: contourVertexCounts,

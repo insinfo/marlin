@@ -1,7 +1,7 @@
-/// Benchmark dedicado de gradiente linear no port Blend2D em Dart.
+/// Benchmark dedicado de pattern affine+bilinear no port Blend2D em Dart.
 ///
 /// Uso:
-///   dart run benchmark/blend2d_linear_gradient_benchmark.dart
+///   dart run benchmark/blend2d_pattern_affine_bilinear_benchmark.dart
 
 import 'dart:async';
 import 'dart:io';
@@ -12,15 +12,15 @@ import 'package:marlin/marlin.dart';
 
 import '../lib/src/blend2d/blend2d.dart';
 
-class _GradientScenePolygon {
+class _PatternScenePolygon {
   final List<double> vertices;
   final BLFillRule fillRule;
-  final BLLinearGradient gradient;
+  final BLPattern pattern;
 
-  const _GradientScenePolygon({
+  const _PatternScenePolygon({
     required this.vertices,
     required this.fillRule,
-    required this.gradient,
+    required this.pattern,
   });
 }
 
@@ -120,91 +120,172 @@ List<double> _createThinLine(double x0, double y0, double x1, double y1, double 
   ];
 }
 
-BLLinearGradient _makeGradient(
-  double x0,
-  double y0,
-  double x1,
-  double y1,
-  int c0,
-  int c1, {
-  BLGradientExtendMode extendMode = BLGradientExtendMode.pad,
-}) {
-  return BLLinearGradient(
-    p0: BLPoint(x0, y0),
-    p1: BLPoint(x1, y1),
-    stops: <BLGradientStop>[
-      BLGradientStop(0.0, c0),
-      BLGradientStop(1.0, c1),
-    ],
-    extendMode: extendMode,
+BLImage _buildPatternImage() {
+  const w = 48;
+  const h = 48;
+  final img = BLImage(w, h);
+  final px = img.pixels;
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      final checker = ((x ~/ 6) + (y ~/ 6)).isEven;
+      final dx = x - w * 0.5;
+      final dy = y - h * 0.5;
+      final ring = ((dx * dx + dy * dy) ~/ 40) % 2 == 0;
+
+      final c0 = checker ? 0xFF0097A7 : 0xFFF4511E;
+      final c1 = ring ? 0xFFFFEE58 : 0xFF7CB342;
+      final blend = ((y * 255) ~/ (h - 1));
+
+      final r0 = (c0 >>> 16) & 0xFF;
+      final g0 = (c0 >>> 8) & 0xFF;
+      final b0 = c0 & 0xFF;
+      final r1 = (c1 >>> 16) & 0xFF;
+      final g1 = (c1 >>> 8) & 0xFF;
+      final b1 = c1 & 0xFF;
+
+      final r = ((r0 * (255 - blend) + r1 * blend) ~/ 255).clamp(0, 255);
+      final g = ((g0 * (255 - blend) + g1 * blend) ~/ 255).clamp(0, 255);
+      final b = ((b0 * (255 - blend) + b1 * blend) ~/ 255).clamp(0, 255);
+
+      px[y * w + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+  }
+
+  return img;
+}
+
+BLMatrix2D _affine(double scale, double angleDeg, double tx, double ty) {
+  final a = angleDeg * math.pi / 180.0;
+  final c = math.cos(a) * scale;
+  final s = math.sin(a) * scale;
+  return BLMatrix2D(c, -s, s, c, tx, ty);
+}
+
+BLPattern _makePattern(
+  BLImage src,
+  double ox,
+  double oy,
+  BLGradientExtendMode ex,
+  BLGradientExtendMode ey,
+  BLPatternFilter filter,
+  BLMatrix2D transform,
+) {
+  return BLPattern(
+    image: src,
+    offset: BLPoint(ox, oy),
+    extendModeX: ex,
+    extendModeY: ey,
+    filter: filter,
+    transform: transform,
   );
 }
 
-List<_GradientScenePolygon> _createGradientScene() {
-  return <_GradientScenePolygon>[
-    _GradientScenePolygon(
+List<_PatternScenePolygon> _createPatternScene(BLImage tile) {
+  return <_PatternScenePolygon>[
+    _PatternScenePolygon(
       vertices: _createTriangle(88, 92, 56),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(32, 32, 144, 160, 0xFFE53935, 0xFFFFB300),
+      pattern: _makePattern(
+        tile,
+        0,
+        0,
+        BLGradientExtendMode.repeat,
+        BLGradientExtendMode.repeat,
+        BLPatternFilter.bilinear,
+        _affine(0.22, 18.0, 6.0, 8.0),
+      ),
     ),
-    _GradientScenePolygon(
+    _PatternScenePolygon(
       vertices: _createSquare(212, 88, 98),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(162, 36, 262, 140, 0xFF3949AB, 0xFF26C6DA),
+      pattern: _makePattern(
+        tile,
+        0,
+        0,
+        BLGradientExtendMode.reflect,
+        BLGradientExtendMode.reflect,
+        BLPatternFilter.bilinear,
+        _affine(0.18, -24.0, 10.0, 12.0),
+      ),
     ),
-    _GradientScenePolygon(
+    _PatternScenePolygon(
       vertices: _createHexagon(350, 96, 52),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
-        330,
-        70,
-        370,
-        130,
-        0xFF00897B,
-        0xFF9CCC65,
-        extendMode: BLGradientExtendMode.repeat,
+      pattern: _makePattern(
+        tile,
+        0,
+        0,
+        BLGradientExtendMode.repeat,
+        BLGradientExtendMode.reflect,
+        BLPatternFilter.bilinear,
+        _affine(0.20, 32.0, 8.0, 2.0),
       ),
     ),
-    _GradientScenePolygon(
+    _PatternScenePolygon(
       vertices: _createStar(438, 98, 56, 24),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
+      pattern: _makePattern(
+        tile,
         420,
-        72,
-        456,
-        116,
-        0xFF8E24AA,
-        0xFFEC407A,
-        extendMode: BLGradientExtendMode.reflect,
+        70,
+        BLGradientExtendMode.pad,
+        BLGradientExtendMode.pad,
+        BLPatternFilter.bilinear,
+        _affine(0.25, 0.0, 0.0, 0.0),
       ),
     ),
-    _GradientScenePolygon(
+    _PatternScenePolygon(
       vertices: _createArcBand(120, 276, 28, 64, -2.6, -0.1, 36),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(48, 236, 188, 316, 0xFFFF7043, 0xFFFFEE58),
-    ),
-    _GradientScenePolygon(
-      vertices: _createSquare(278, 268, 132),
-      fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(212, 202, 344, 334, 0xFF5E35B1, 0xFF42A5F5),
-    ),
-    _GradientScenePolygon(
-      vertices: _createStar(430, 274, 72, 30),
-      fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(
-        404,
-        242,
-        452,
-        304,
-        0xFF43A047,
-        0xFFAED581,
-        extendMode: BLGradientExtendMode.reflect,
+      pattern: _makePattern(
+        tile,
+        0,
+        0,
+        BLGradientExtendMode.repeat,
+        BLGradientExtendMode.repeat,
+        BLPatternFilter.bilinear,
+        _affine(0.19, -16.0, 12.0, 16.0),
       ),
     ),
-    _GradientScenePolygon(
+    _PatternScenePolygon(
+      vertices: _createSquare(278, 268, 132),
+      fillRule: BLFillRule.nonZero,
+      pattern: _makePattern(
+        tile,
+        0,
+        0,
+        BLGradientExtendMode.reflect,
+        BLGradientExtendMode.repeat,
+        BLPatternFilter.bilinear,
+        _affine(0.16, 40.0, 8.0, 8.0),
+      ),
+    ),
+    _PatternScenePolygon(
+      vertices: _createStar(430, 274, 72, 30),
+      fillRule: BLFillRule.nonZero,
+      pattern: _makePattern(
+        tile,
+        410,
+        248,
+        BLGradientExtendMode.pad,
+        BLGradientExtendMode.reflect,
+        BLPatternFilter.bilinear,
+        _affine(0.22, -28.0, 0.0, 0.0),
+      ),
+    ),
+    _PatternScenePolygon(
       vertices: _createThinLine(20, 486, 492, 470, 5.0),
       fillRule: BLFillRule.nonZero,
-      gradient: _makeGradient(20, 486, 492, 470, 0xFF1E88E5, 0xFF00ACC1),
+      pattern: _makePattern(
+        tile,
+        0,
+        472,
+        BLGradientExtendMode.repeat,
+        BLGradientExtendMode.pad,
+        BLPatternFilter.bilinear,
+        _affine(0.20, 0.0, 0.0, 0.0),
+      ),
     ),
   ];
 }
@@ -232,11 +313,11 @@ Future<void> _saveImage(
 
 Future<void> _renderScene(
   BLContext ctx,
-  List<_GradientScenePolygon> polygons,
+  List<_PatternScenePolygon> polygons,
 ) async {
   ctx.clear(0xFFF2F2F2);
   for (final p in polygons) {
-    ctx.setLinearGradient(p.gradient);
+    ctx.setPattern(p.pattern);
     await ctx.fillPolygon(
       p.vertices,
       rule: p.fillRule,
@@ -250,15 +331,16 @@ Future<void> main() async {
   const warmup = 5;
   const iterations = 30;
 
-  final polygons = _createGradientScene();
+  final tile = _buildPatternImage();
+  final polygons = _createPatternScene(tile);
   final image = BLImage(width, height);
   final ctx = BLContext(image);
 
   try {
-    print('Blend2D Dart Port Linear Gradient Benchmark');
+    print('Blend2D Dart Port Pattern Affine+Bilinear Benchmark');
     print('Resolution: ${width}x$height');
     print('Iterations: $iterations');
-    print('Gradient polygons per iteration: ${polygons.length}');
+    print('Pattern polygons per iteration: ${polygons.length}');
 
     for (int i = 0; i < warmup; i++) {
       await _renderScene(ctx, polygons);
@@ -275,12 +357,12 @@ Future<void> main() async {
         ((iterations * polygons.length) / (sw.elapsedMicroseconds / 1000000.0))
             .round();
 
-    await _saveImage('BLEND2D_PORT_LINEAR_GRADIENT', image.pixels, width, height);
+    await _saveImage('BLEND2D_PORT_PATTERN_AFFINE_BILINEAR', image.pixels, width, height);
 
     print('');
     print('Average: ${avgMs.toStringAsFixed(3)} ms/frame');
     print('Throughput: $polyPerSec poly/s');
-    print('Output: output/rasterization_benchmark/BLEND2D_PORT_LINEAR_GRADIENT.png');
+    print('Output: output/rasterization_benchmark/BLEND2D_PORT_PATTERN_AFFINE_BILINEAR.png');
   } finally {
     await ctx.dispose();
   }

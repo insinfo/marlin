@@ -12,6 +12,8 @@ Objetivo:
   - Design estável para evoluir depois para FFI/shared memory, sem retrabalho estrutural
   - API gráfica completa para futuro renderizador PDF otimizado em puro Dart
 
+antes de qualquer reversão é bom executar pelo menos umas 10 vezes para garantir e consolidar média/faixa para decidirmos com mais confiança qualquer reversão
+
 ## Status de Execução (atualizado)
 
 Concluído agora:
@@ -107,11 +109,22 @@ Atualização incremental (port C++ -> Dart):
   - resultado final passa a preservar alpha de saída (em vez de fixar `0xFF` incondicionalmente) quando renderizando sobre destinos translúcidos.
 - Fetchers/estilos (avanço de Fase 4 no port):
   - adicionada fundação de gradiente linear com tipos `BLGradientStop`/`BLLinearGradient` em `core/bl_types.dart`,
+  - adicionada fundação de gradiente radial com tipo `BLRadialGradient` em `core/bl_types.dart`,
+  - adicionada fundação de pattern com tipo `BLPattern` em `core/bl_types.dart`,
   - novo fetcher `pipeline/bl_fetch_linear_gradient.dart` com LUT de 256 amostras e interpolação de stops,
+  - novo fetcher `pipeline/bl_fetch_radial_gradient.dart` com LUT de 256 amostras e resolução escalar por raiz quadrática (baseado na família de equações descrita em `pipeline/pipedefs.cpp`),
+  - novo fetcher `pipeline/bl_fetch_pattern.dart` com amostragem nearest e suporte de extend por eixo (`pad/repeat/reflect`), alinhado ao modelo de contexto horizontal `Pad/Repeat/RoR` do Blend2D (`fetchgeneric_p.h`),
+  - fetch radial atualizado com estabilização numérica de focal-point próximo à borda (estratégia inspirada em `init_radial_gradient` de `pipedefs.cpp`) e simplificação da equação no hot-loop,
+  - correção de fidelidade visual no fetch radial: seleção da raiz da quadrática condicionada ao sinal de `a` (evita clamp indevido em `t=0` em cenários com `a<0`),
+  - suporte inicial a `extendMode` em gradiente linear (`pad/repeat/reflect`) no fetcher, alinhando comportamento base de extensão com o modelo do Blend2D,
+  - suporte inicial a `extendMode` (`pad/repeat/reflect`) também no fetch radial,
+  - suporte inicial a pattern em `BLContext` via `setPattern(...)` e despacho para caminho fetched separado,
   - `BLContext` recebeu API `setLinearGradient(...)` e estado de estilo preparado para integração completa no resolve,
+  - `BLContext` recebeu API `setRadialGradient(...)` e despacho para caminho fetched separado,
   - integração direta do gradiente no hot-path do raster foi testada nesta etapa, porém recuada no bootstrap por regressão de throughput,
   - caminho separado de resolve para fonte por pixel foi implementado em `bl_analytic_rasterizer.dart` (`drawPolygonFetched` + resolve fetched `nonZero/evenOdd`),
   - `BLContext.fillPolygon()` agora despacha gradiente linear para esse caminho separado, preservando o hot-path sólido principal sem branch extra no loop crítico.
+  - fetch de pattern afim recebeu nova fatia de port inspirada em `FetchPatternAffineCtx` (`fetchgeneric_p.h`): avanço incremental por pixel em ponto fixo 24.8 (`fx/fy`), reduzindo recomputo de transformação no hot-loop em modos `nearest/bilinear` com transform afim.
 - Raster analítico (upgrade de qualidade/robustez no bootstrap):
   - `bl_analytic_rasterizer.dart` migrou de AA simplificado por subamostragem vertical para acumulação analítica `cover/area` por célula com máscara ativa por scanline,
   - resolução de cobertura agora segue o modelo de prefix-sum de células (mesma família de abordagem do pipeline Batch Scalar), incluindo suporte correto a `evenOdd/nonZero`,
@@ -144,6 +157,41 @@ Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`,
 - após integração do gradiente linear via caminho separado de resolve (sem tocar o loop sólido principal): medições recentes em `2.314ms/frame` (`8644 poly/s`) e `2.140ms/frame` (`9348 poly/s`) no benchmark sintético atual.
 - benchmark dedicado de gradiente linear (`blend2d_linear_gradient_benchmark.dart`, 512x512, 30 iterações, 8 polígonos): `2.473ms/frame` (`3235 poly/s`) na execução local recente.
 - revalidação do baseline sólido após criação do benchmark dedicado: `1.976ms/frame` (`10119 poly/s`) em `blend2d_port_benchmark.dart`.
+- após suporte de `extendMode` (`pad/repeat/reflect`) no gradiente linear e atualização da cena dedicada para cobrir `repeat/reflect`: `2.556ms/frame` (`3130 poly/s`) em `blend2d_linear_gradient_benchmark.dart`.
+- revalidação do baseline sólido após essa etapa de extend-mode: `2.022ms/frame` (`9892 poly/s`) em `blend2d_port_benchmark.dart`.
+- benchmark dedicado de gradiente radial (`blend2d_radial_gradient_benchmark.dart`, 512x512, 30 iterações, 8 polígonos): `3.499ms/frame` (`2286 poly/s`) na execução local recente.
+- revalidação do baseline sólido após integração do gradiente radial em caminho separado: `2.125ms/frame` (`9411 poly/s`) em `blend2d_port_benchmark.dart`.
+- após otimização/estabilização do fetch radial (focal-point + simplificação da solução quadrática): `2.503ms/frame` (`3196 poly/s`) em `blend2d_radial_gradient_benchmark.dart`.
+- revalidação do baseline sólido após essa otimização radial: `2.102ms/frame` (`9514 poly/s`) em `blend2d_port_benchmark.dart`.
+- após correção de render no radial (escolha de raiz por sinal de `a`) e regeneração das imagens de conferência: `3.224ms/frame` (`2481 poly/s`) em `blend2d_radial_gradient_benchmark.dart`.
+- benchmark dedicado linear reexecutado na mesma rodada de conferência visual: `2.837ms/frame` (`2820 poly/s`) em `blend2d_linear_gradient_benchmark.dart`.
+- revalidação do baseline sólido após essa correção de fidelidade radial: `2.062ms/frame` (`9702 poly/s`) em `blend2d_port_benchmark.dart`.
+- benchmark dedicado de pattern nearest (`blend2d_pattern_benchmark.dart`, 512x512, 30 iterações, 8 polígonos): `1.598ms/frame` (`5006 poly/s`) na execução local recente.
+- revalidação do baseline sólido após integração de pattern em caminho separado: `2.044ms/frame` (`9786 poly/s`) em `blend2d_port_benchmark.dart`.
+- benchmark dedicado de pattern affine + bilinear (`blend2d_pattern_affine_bilinear_benchmark.dart`, 512x512, 30 iterações, 8 polígonos): `4.921ms/frame` (`1626 poly/s`) na primeira execução da fatia grande.
+- após fast-path nearest inteiro (identity + offsets integrais) no fetch de pattern: `1.669ms/frame` (`4792 poly/s`) em `blend2d_pattern_benchmark.dart`.
+- revalidação do baseline sólido após o fast-path nearest: `1.765ms/frame` (`11332 poly/s`) em `blend2d_port_benchmark.dart`.
+- revalidação recente do benchmark affine + bilinear na mesma etapa: `5.001ms/frame` (`1600 poly/s`) em `blend2d_pattern_affine_bilinear_benchmark.dart`.
+- após otimização incremental no fetch de pattern affine/bilinear (reuso de coordenadas afins entre pixels consecutivos + clamp inteiro mais leve de frações): `2.736ms/frame` (`2924 poly/s`) em `blend2d_pattern_affine_bilinear_benchmark.dart`.
+- revalidação do pattern nearest na mesma rodada de otimização: `1.720ms/frame` (`4651 poly/s`) em `blend2d_pattern_benchmark.dart`.
+- revalidação do baseline sólido na mesma rodada de otimização: `1.870ms/frame` (`10697 poly/s`) em `blend2d_port_benchmark.dart`.
+- rodada de estabilidade (10 execuções) do pattern affine + bilinear antes de decisão de reversão: média `2.857ms/frame` (faixa `2.772..3.150ms`) e `2804 poly/s` (faixa `2539..2886`).
+- rodada de estabilidade (10 execuções) do pattern nearest na mesma etapa: média `1.983ms/frame` (faixa `1.608..3.043ms`) e `4262 poly/s` (faixa `2629..4974`).
+- rodada de estabilidade (10 execuções) do baseline sólido em shell isolado: média `2.453ms/frame` (faixa `2.238..2.671ms`) e `8178 poly/s` (faixa `7487..8937`).
+- nova fatia grande (affine fixed-point 24.8 no fetch de pattern, inspirada em `FetchPatternAffineCtx`) validada com análise limpa e conferência visual da saída `BLEND2D_PORT_PATTERN_AFFINE_BILINEAR.png`.
+- rodada de estabilidade (10 execuções) do affine+bilinear após essa fatia: média `2.680ms/frame` (faixa `2.552..2.928ms`) e `2992 poly/s` (faixa `2732..3134`) em `blend2d_pattern_affine_bilinear_benchmark.dart`.
+- rodada de estabilidade sequencial (10 execuções) do pattern nearest após essa fatia: média `1.790ms/frame` (faixa `1.691..2.213ms`) e `4493 poly/s` (faixa `3614..4731`) em `blend2d_pattern_benchmark.dart`.
+- rodada de estabilidade sequencial (10 execuções) do baseline sólido após essa fatia: média `2.036ms/frame` (faixa `1.844..2.596ms`) e `9924 poly/s` (faixa `7705..10848`) em `blend2d_port_benchmark.dart`.
+- experimento C++-guided adicional: kernel bilinear em duas etapas (lerp `Fx/Fy`), visando reduzir multiplicações por pixel.
+- validação 10x do lerp kernel no affine+bilinear indicou regressão, com média `2.928ms/frame` (faixa `2.724..3.511`) e `2745 poly/s` (faixa `2279..2937`); alteração revertida.
+- experimento adicional de fast-path `reflect/reflect` (nearest+bicúbico/bilinear) também apresentou regressão nas rodadas 10x do affine+bilinear (run1 média `3.338ms/frame`, run2 média `3.233ms/frame`); alteração revertida para manter caminho estável.
+- experimento adicional de especialização bilinear por combinações mistas de `extendMode` (`repeat/pad/reflect` em pares X/Y), guiado pela ideia de dispatch por contexto do `fetchgeneric_p.h`.
+- validação 10x dessa especialização mista no affine+bilinear também indicou regressão, com média `2.926ms/frame` (faixa `2.676..3.454`) e `2747 poly/s` (faixa `2316..2990`); alteração revertida.
+- nova tentativa C++-guided: port parcial do avanço incremental estilo `advance_x` para caso afim `repeat/repeat` (coordenada normalizada em fixed-point e correção por faixa, reduzindo `%` no caminho sequencial).
+- validação inicial 10x dessa tentativa mostrou resultado inconsistente e sem ganho sustentado no conjunto atual (referência da rodada: affine+bilinear média `2.708ms/frame`, faixa `2.605..2.887`, `2958 poly/s`), com variabilidade elevada em reamostragens subsequentes.
+- decisão: rollback da tentativa `advance_x repeat/repeat` e retorno ao caminho estável anterior.
+- revalidação sequencial pós-rollback: `2.625ms/frame` (`3047 poly/s`) em `blend2d_pattern_affine_bilinear_benchmark.dart`, `1.834ms/frame` (`4361 poly/s`) em `blend2d_pattern_benchmark.dart` e `1.945ms/frame` (`10283 poly/s`) em `blend2d_port_benchmark.dart`.
+- estado mantido ao final da rodada: fatia `affine fixed-point 24.8` preservada; experimentos `lerp kernel`, `reflect/reflect` dedicado, especialização mista de `extendMode` e tentativa `advance_x repeat/repeat` descartados por throughput inferior ou instabilidade no protocolo de validação.
 
 ## 1) Princípios de engenharia (não negociáveis)
 
@@ -502,3 +550,5 @@ Resumo objetivo:
 - Em paralelo, fechamos a trilha de texto em puro Dart (fontes, shaping, raster e cache).
 - Depois expandimos recursos avançados e integração com backend PDF.
 - Tudo guiado por benchmark e validação visual contínua.
+
+Próxima fatia grande que recomendo: portar o contexto afim com parâmetros ox/oy/rx/ry/corx/cory completos (como no C++) para reduzir custo de normalização sem reintroduzir instabilidade.
