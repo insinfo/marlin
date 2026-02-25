@@ -165,7 +165,114 @@ _LigatureResult? _applyLigatureSubst(
 }
 
 // ---------------------------------------------------------------------------
-// GPOS Lookup Type 2: Pair Adjustment (format 1 only for bootstrap)
+// GSUB Lookup Type 2: Multiple Substitution
+// ---------------------------------------------------------------------------
+
+/// Applies GSUB MultipleSubst at [subtableOffset] to [glyphId].
+/// Returns a list of replacement glyphs, or null if no match.
+List<int>? _applyMultipleSubst(ByteData view, int subtableOffset, int glyphId) {
+  if (subtableOffset + 6 > view.lengthInBytes) return null;
+  final format = view.getUint16(subtableOffset, Endian.big);
+  if (format != 1) return null;
+
+  final coverageOffset = view.getUint16(subtableOffset + 2, Endian.big);
+  final covIdx = _coverageLookup(view, subtableOffset, coverageOffset, glyphId);
+  if (covIdx < 0) return null;
+
+  final sequenceCount = view.getUint16(subtableOffset + 4, Endian.big);
+  if (covIdx >= sequenceCount) return null;
+
+  final sequenceOffset = subtableOffset +
+      view.getUint16(subtableOffset + 6 + covIdx * 2, Endian.big);
+  if (sequenceOffset + 2 > view.lengthInBytes) return null;
+
+  final glyphCount = view.getUint16(sequenceOffset, Endian.big);
+  if (sequenceOffset + 2 + glyphCount * 2 > view.lengthInBytes) return null;
+
+  final replacements = <int>[];
+  for (int i = 0; i < glyphCount; i++) {
+    replacements.add(view.getUint16(sequenceOffset + 2 + i * 2, Endian.big));
+  }
+  return replacements;
+}
+
+// ---------------------------------------------------------------------------
+// GSUB Lookup Type 3: Alternate Substitution
+// ---------------------------------------------------------------------------
+
+/// Applies GSUB AlternateSubst at [subtableOffset] to [glyphId].
+/// For bootstrap, we always pick the first alternate (index 0).
+/// Returns the alternate glyph ID, or -1 if no match.
+int _applyAlternateSubst(ByteData view, int subtableOffset, int glyphId) {
+  if (subtableOffset + 6 > view.lengthInBytes) return -1;
+  final format = view.getUint16(subtableOffset, Endian.big);
+  if (format != 1) return -1;
+
+  final coverageOffset = view.getUint16(subtableOffset + 2, Endian.big);
+  final covIdx = _coverageLookup(view, subtableOffset, coverageOffset, glyphId);
+  if (covIdx < 0) return -1;
+
+  final alternateSetCount = view.getUint16(subtableOffset + 4, Endian.big);
+  if (covIdx >= alternateSetCount) return -1;
+
+  final alternateSetOffset = subtableOffset +
+      view.getUint16(subtableOffset + 6 + covIdx * 2, Endian.big);
+  if (alternateSetOffset + 2 > view.lengthInBytes) return -1;
+
+  final glyphCount = view.getUint16(alternateSetOffset, Endian.big);
+  if (glyphCount == 0) return -1;
+  if (alternateSetOffset + 2 + 2 > view.lengthInBytes) return -1;
+
+  // Pick the first alternate automatically in this bootstrap
+  return view.getUint16(alternateSetOffset + 2, Endian.big);
+}
+
+// ---------------------------------------------------------------------------
+// ClassDef table parser (for GPOS Format 2)
+// ---------------------------------------------------------------------------
+
+/// Looks up the class of [glyphId] in a ClassDef table at [absOffset].
+/// Returns the class value (0 if not found or not covered).
+int _classDefLookup(ByteData view, int absOffset, int glyphId) {
+  if (absOffset + 4 > view.lengthInBytes) return 0;
+  final format = view.getUint16(absOffset, Endian.big);
+
+  if (format == 1) {
+    // Format 1: first glyph + array of class values
+    if (absOffset + 6 > view.lengthInBytes) return 0;
+    final firstGlyph = view.getUint16(absOffset + 2, Endian.big);
+    final count = view.getUint16(absOffset + 4, Endian.big);
+    final index = glyphId - firstGlyph;
+    if (index < 0 || index >= count) return 0;
+    if (absOffset + 6 + (index + 1) * 2 > view.lengthInBytes) return 0;
+    return view.getUint16(absOffset + 6 + index * 2, Endian.big);
+  } else if (format == 2) {
+    // Format 2: array of ranges (binary search)
+    if (absOffset + 4 > view.lengthInBytes) return 0;
+    final count = view.getUint16(absOffset + 2, Endian.big);
+    if (absOffset + 4 + count * 6 > view.lengthInBytes) return 0;
+
+    int lo = 0, hi = count - 1;
+    while (lo <= hi) {
+      final mid = (lo + hi) >>> 1;
+      final rangeOff = absOffset + 4 + mid * 6;
+      final first = view.getUint16(rangeOff, Endian.big);
+      final last = view.getUint16(rangeOff + 2, Endian.big);
+      if (glyphId < first) {
+        hi = mid - 1;
+      } else if (glyphId > last) {
+        lo = mid + 1;
+      } else {
+        return view.getUint16(rangeOff + 4, Endian.big);
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GPOS Lookup Type 2: Pair Adjustment (formats 1 + 2)
 // ---------------------------------------------------------------------------
 
 /// Result of a pair adjustment: x/y placement and advance adjustments.
@@ -218,7 +325,47 @@ class GPosAdjustment {
   return (xPlace, yPlace, xAdv, yAdv);
 }
 
-/// Applies GPOS PairAdjustment Format 1 at [subtableOffset].
+// ---------------------------------------------------------------------------
+// GPOS Lookup Type 1: Single Adjustment
+// ---------------------------------------------------------------------------
+
+/// Applies GPOS SingleAdjustment at [subtableOffset] to [glyphId].
+/// Returns adjustment or null if no match.
+GPosAdjustment? _applySingleAdjustment(
+  ByteData view,
+  int subtableOffset,
+  int glyphId,
+) {
+  if (subtableOffset + 6 > view.lengthInBytes) return null;
+  final format = view.getUint16(subtableOffset, Endian.big);
+  final coverageOffset = view.getUint16(subtableOffset + 2, Endian.big);
+  final valueFormat = view.getUint16(subtableOffset + 4, Endian.big);
+
+  final covIdx = _coverageLookup(view, subtableOffset, coverageOffset, glyphId);
+  if (covIdx < 0) return null;
+
+  final vrSize = _valueRecordSize(valueFormat);
+
+  if (format == 1) {
+    if (subtableOffset + 6 + vrSize > view.lengthInBytes) return null;
+    final (xp, yp, xa, ya) =
+        _readValueRecord(view, subtableOffset + 6, valueFormat);
+    return GPosAdjustment(
+        xPlacement1: xp, yPlacement1: yp, xAdvance1: xa, yAdvance1: ya);
+  } else if (format == 2) {
+    final valueCount = view.getUint16(subtableOffset + 6, Endian.big);
+    if (covIdx >= valueCount) return null;
+    final recOff = subtableOffset + 8 + covIdx * vrSize;
+    if (recOff + vrSize > view.lengthInBytes) return null;
+    final (xp, yp, xa, ya) = _readValueRecord(view, recOff, valueFormat);
+    return GPosAdjustment(
+        xPlacement1: xp, yPlacement1: yp, xAdvance1: xa, yAdvance1: ya);
+  }
+
+  return null;
+}
+
+/// Applies GPOS PairAdjustment (Format 1 or 2) at [subtableOffset].
 /// Returns adjustment or null if no match.
 GPosAdjustment? _applyPairAdjustment(
   ByteData view,
@@ -274,8 +421,55 @@ GPosAdjustment? _applyPairAdjustment(
       if (secondGlyph > glyphId2) break; // sorted
     }
   } else if (format == 2) {
-    // Format 2: ClassDef-based — not in this bootstrap, use legacy kern
-    return null;
+    // Format 2: ClassDef-based pair adjustment
+    if (subtableOffset + 16 > view.lengthInBytes) return null;
+
+    final classDef1Off =
+        subtableOffset + view.getUint16(subtableOffset + 8, Endian.big);
+    final classDef2Off =
+        subtableOffset + view.getUint16(subtableOffset + 10, Endian.big);
+    final class1Count = view.getUint16(subtableOffset + 12, Endian.big);
+    final class2Count = view.getUint16(subtableOffset + 14, Endian.big);
+
+    final class1 = _classDefLookup(view, classDef1Off, glyphId1);
+    final class2 = _classDefLookup(view, classDef2Off, glyphId2);
+
+    if (class1 >= class1Count || class2 >= class2Count) return null;
+
+    // Each class record = vr1Size + vr2Size bytes
+    // Records laid out as: class_records[class1 * class2Count + class2]
+    final classRecSize = vr1Size + vr2Size;
+    final recIndex = class1 * class2Count + class2;
+    final recOff = subtableOffset + 16 + recIndex * classRecSize;
+
+    if (recOff + classRecSize > view.lengthInBytes) return null;
+
+    final (xp1, yp1, xa1, ya1) = _readValueRecord(view, recOff, valueFormat1);
+    final (xp2, yp2, xa2, ya2) =
+        _readValueRecord(view, recOff + vr1Size, valueFormat2);
+
+    // Skip zero adjustments
+    if (xa1 == 0 &&
+        xa2 == 0 &&
+        xp1 == 0 &&
+        xp2 == 0 &&
+        ya1 == 0 &&
+        ya2 == 0 &&
+        yp1 == 0 &&
+        yp2 == 0) {
+      return null;
+    }
+
+    return GPosAdjustment(
+      xPlacement1: xp1,
+      yPlacement1: yp1,
+      xAdvance1: xa1,
+      yAdvance1: ya1,
+      xPlacement2: xp2,
+      yPlacement2: yp2,
+      xAdvance2: xa2,
+      yAdvance2: ya2,
+    );
   }
   return null;
 }
@@ -475,6 +669,26 @@ class BLLayoutEngine {
             }
             break;
 
+          case 2: // MultipleSubst
+            int i = 0;
+            while (i < result.length) {
+              final replacements = _applyMultipleSubst(_view, stOff, result[i]);
+              if (replacements != null && replacements.isNotEmpty) {
+                result.replaceRange(i, i + 1, replacements);
+                i += replacements.length;
+              } else {
+                i++;
+              }
+            }
+            break;
+
+          case 3: // AlternateSubst
+            for (int i = 0; i < result.length; i++) {
+              final newGlyph = _applyAlternateSubst(_view, stOff, result[i]);
+              if (newGlyph >= 0) result[i] = newGlyph;
+            }
+            break;
+
           case 4: // LigatureSubst
             int i = 0;
             while (i < result.length) {
@@ -517,16 +731,27 @@ class BLLayoutEngine {
       if (li >= _gposLookups.length) continue;
       final lookup = _gposLookups[li];
 
-      if (lookup.lookupType != 2) continue; // Only pair adjustment for now
+      if (lookup.lookupType != 1 && lookup.lookupType != 2) continue;
 
       for (final stOff in lookup.subtableOffsets) {
-        for (int i = 0; i < glyphIds.length - 1; i++) {
-          final adj =
-              _applyPairAdjustment(_view, stOff, glyphIds[i], glyphIds[i + 1]);
-          if (adj != null) {
-            adjustments[i] += adj.xAdvance1;
-            if (i + 1 < adjustments.length) {
-              adjustments[i + 1] += adj.xAdvance2;
+        if (lookup.lookupType == 1) {
+          // SingleAdjustment
+          for (int i = 0; i < glyphIds.length; i++) {
+            final adj = _applySingleAdjustment(_view, stOff, glyphIds[i]);
+            if (adj != null) {
+              adjustments[i] += adj.xAdvance1;
+            }
+          }
+        } else if (lookup.lookupType == 2) {
+          // PairAdjustment
+          for (int i = 0; i < glyphIds.length - 1; i++) {
+            final adj = _applyPairAdjustment(
+                _view, stOff, glyphIds[i], glyphIds[i + 1]);
+            if (adj != null) {
+              adjustments[i] += adj.xAdvance1;
+              if (i + 1 < adjustments.length) {
+                adjustments[i + 1] += adj.xAdvance2;
+              }
             }
           }
         }

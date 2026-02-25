@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 class BLPathData {
   final List<double> vertices;
   final List<int>? contourVertexCounts;
@@ -98,6 +100,153 @@ class BLPath {
     );
   }
 
+  // =========================================================================
+  // Convenience geometry methods
+  // =========================================================================
+
+  /// Adds a circular arc from angle [startAngle] sweeping [sweepAngle] radians.
+  /// The arc is centered at (cx, cy) with radius [r].
+  void addArc(
+    double cx,
+    double cy,
+    double r,
+    double startAngle,
+    double sweepAngle, {
+    bool moveToStart = true,
+  }) {
+    addEllipticArc(cx, cy, r, r, startAngle, sweepAngle,
+        moveToStart: moveToStart);
+  }
+
+  /// Adds an elliptic arc with radii rx, ry.
+  void addEllipticArc(
+    double cx,
+    double cy,
+    double rx,
+    double ry,
+    double startAngle,
+    double sweepAngle, {
+    bool moveToStart = true,
+  }) {
+    if (sweepAngle.abs() < 1e-10) return;
+
+    // Subdivide into 90° (pi/2) segments max
+    const double halfPi = 1.5707963267948966;
+    final int segments = (sweepAngle.abs() / halfPi).ceil().clamp(1, 16);
+    final double segSweep = sweepAngle / segments;
+
+    // Cubic Bézier approximation factor for arc segment
+    final double alpha = (4.0 / 3.0) * _tan(segSweep * 0.25);
+
+    double angle = startAngle;
+    for (int i = 0; i < segments; i++) {
+      final double cos0 = _cos(angle);
+      final double sin0 = _sin(angle);
+      final double cos1 = _cos(angle + segSweep);
+      final double sin1 = _sin(angle + segSweep);
+
+      final double x0 = cx + rx * cos0;
+      final double y0 = cy + ry * sin0;
+      final double x1 = cx + rx * cos1;
+      final double y1 = cy + ry * sin1;
+
+      // Control points
+      final double c1x = x0 - alpha * rx * sin0;
+      final double c1y = y0 + alpha * ry * cos0;
+      final double c2x = x1 + alpha * rx * sin1;
+      final double c2y = y1 - alpha * ry * cos1;
+
+      if (i == 0 && moveToStart) {
+        moveTo(x0, y0);
+      }
+      cubicTo(c1x, c1y, c2x, c2y, x1, y1);
+      angle += segSweep;
+    }
+  }
+
+  /// Adds a rectangle as a closed contour.
+  void addRect(double x, double y, double w, double h) {
+    moveTo(x, y);
+    lineTo(x + w, y);
+    lineTo(x + w, y + h);
+    lineTo(x, y + h);
+    close();
+  }
+
+  /// Adds a rounded rectangle with corner radius [r].
+  void addRoundRect(double x, double y, double w, double h, double r) {
+    if (r <= 0) {
+      addRect(x, y, w, h);
+      return;
+    }
+    // Clamp radius to half the smaller dimension
+    final maxR = (w < h ? w : h) * 0.5;
+    final cr = r > maxR ? maxR : r;
+    const double k = 0.5522847498; // cubic Bézier approximation factor
+    final kc = cr * k;
+
+    // Start at top-left after corner
+    moveTo(x + cr, y);
+    // Top edge
+    lineTo(x + w - cr, y);
+    // Top-right corner
+    cubicTo(x + w - cr + kc, y, x + w, y + cr - kc, x + w, y + cr);
+    // Right edge
+    lineTo(x + w, y + h - cr);
+    // Bottom-right corner
+    cubicTo(x + w, y + h - cr + kc, x + w - cr + kc, y + h, x + w - cr, y + h);
+    // Bottom edge
+    lineTo(x + cr, y + h);
+    // Bottom-left corner
+    cubicTo(x + cr - kc, y + h, x, y + h - cr + kc, x, y + h - cr);
+    // Left edge
+    lineTo(x, y + cr);
+    // Top-left corner
+    cubicTo(x, y + cr - kc, x + cr - kc, y, x + cr, y);
+    close();
+  }
+
+  /// Adds another path's geometry to this path.
+  void addPath(BLPath other) {
+    final data = other.toPathData();
+    final verts = data.vertices;
+    final counts = data.contourVertexCounts;
+    final closed = data.contourClosed;
+
+    if (counts == null) {
+      // Single contour
+      if (verts.length >= 4) {
+        moveTo(verts[0], verts[1]);
+        for (int i = 2; i < verts.length; i += 2) {
+          lineTo(verts[i], verts[i + 1]);
+        }
+      }
+      return;
+    }
+
+    int offset = 0;
+    for (int c = 0; c < counts.length; c++) {
+      final n = counts[c];
+      if (n < 2) {
+        offset += n;
+        continue;
+      }
+      moveTo(verts[offset * 2], verts[offset * 2 + 1]);
+      for (int i = 1; i < n; i++) {
+        lineTo(verts[(offset + i) * 2], verts[(offset + i) * 2 + 1]);
+      }
+      if (closed != null && c < closed.length && closed[c]) {
+        close();
+      }
+      offset += n;
+    }
+  }
+
+  // Math helpers
+  static double _cos(double x) => math.cos(x);
+  static double _sin(double x) => math.sin(x);
+  static double _tan(double x) => math.tan(x);
+
   void clear() {
     _vertices.clear();
     _contourCounts.clear();
@@ -187,7 +336,8 @@ class BLPath {
     double tolSq,
     int depth,
   ) {
-    if (depth >= _maxCurveDepth || _quadFlatnessSq(x0, y0, cx, cy, x1, y1) <= tolSq) {
+    if (depth >= _maxCurveDepth ||
+        _quadFlatnessSq(x0, y0, cx, cy, x1, y1) <= tolSq) {
       lineTo(x1, y1);
       return;
     }

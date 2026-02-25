@@ -1,0 +1,1 @@
+# Experimento de implementação de uma biblioteca gráfica de alto desempenho em puro Dart

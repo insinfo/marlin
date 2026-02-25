@@ -1,4 +1,4 @@
-# Roteiro Detalhado: Blend2D like para Dart (extremamente otimizado) biblioteca grafica de auto desempenho inspirada no blend2d
+# Roteiro Detalhado: Blend2D like para Dart (extremamente otimizado) biblioteca grafica de alto desempenho inspirada no blend2d
 
 Projeto alvo:
 - Referência C++: `referencias/blend2d-master/blend2d`
@@ -345,6 +345,59 @@ Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`,
     - Hit-rate tracking e cache statistics.
     - `evictFont()` para eviction per-font.
   - Barril export atualizado com `bl_opentype_layout.dart` e `bl_glyph_cache.dart`.
+- Sessão acelerada 4 (GPOS F2 + Path geometry + glyph rasterizer + measureText + roundRect):
+  - rodada formal 10x pós-sessão: média `1.905ms/frame` (faixa `1.806..2.139ms`) e `10532 poly/s` — zero regressão.
+  - `dart test`: 127 testes passando (0 falhas), `dart analyze`: 0 issues.
+  - **GPOS PairAdjustment Format 2** (ClassDef-based):
+    - `_classDefLookup()` parser para ClassDefTable format 1 (array) e format 2 (ranges, binary search).
+    - Integrado em `_applyPairAdjustment()` para resolver class pairs e ler value records da class matrix.
+    - Suporta a maioria das fontes modernas que usam ClassDef para kerning.
+  - **BLPath convenience geometry**:
+    - `addArc()` — arco circular via subdivisão em segmentos Bézier cúbicos.
+    - `addEllipticArc()` — arco elíptico com rx/ry independentes.
+    - `addRect()` — retângulo como contorno fechado.
+    - `addRoundRect()` — retângulo arredondado com cantos cúbicos (Bézier k=0.5522847498).
+    - `addPath()` — append de outro BLPath (multi-contorno).
+  - **BLContext convenience APIs**:
+    - `fillRoundRect()` / `strokeRoundRect()` usando `BLPath.addRoundRect()`.
+  - **measureText()** (`BLTextLayout`):
+    - `BLTextMetrics` com width, height, glyphCount.
+    - Calcula largura total via last glyph position + advance.
+    - Altura baseada em `(ascender - descender) * scale`.
+  - **Glyph Rasterizer** (`text/bl_glyph_rasterizer.dart`):
+    - `BLGlyphRasterizer` usando pipeline analítico existente.
+    - Renderiza glyph outline em bitmap A8: clear→drawPolygon→extract alpha.
+    - `rasterizeAndCache()` — rasteriza e armazena no `BLGlyphCache`.
+    - `BLAnalyticRasterizer.pixelBuffer` getter exposto para acesso ao buffer.
+  - **BLTextLayout integrado com GSUB/GPOS**:
+    - `shapeSimple()` agora aplica GSUB→GPOS automaticamente.
+    - GSUB features configuráveis, fallback para legacy kern quando sem GPOS.
+    - `BLFont.scaleValue()` para converter font units → pixels.
+  - Barril export atualizado com `bl_glyph_rasterizer.dart`.
+  - Licença MIT adicionada em `LICENSE`.
+- Sessão acelerada 5 (OpenType Extra Lookups + Conic Gradients):
+  - `dart test`: 127 testes passando (0 falhas).
+  - **OpenType GSUB/GPOS Extensions** (`bl_opentype_layout.dart`):
+    - `GSUB Type 2 (Multiple Substitution)`: Resolvido mapeamento de 1 glifo para N glifos (útil para expandir ligaduras invertidas).
+    - `GSUB Type 3 (Alternate Substitution)`: Escolha da primeira alternativa para substituição (bootstrap).
+    - `GPOS Type 1 (Single Adjustment)`: Posicionamentos precisos individuais e ajustes de advance via formats 1 & 2.
+    - Loop central refatorado em `applyGSUB` e `applyGPOS` para processamento inline escalável.
+  - **Gradientes** (`bl_types.dart`, `bl_fetch_conic_gradient.dart`, `bl_context.dart`):
+    - Implementação de `BLConicGradient` e `BLConicGradientFetcher`.
+    - Lógica de lookup em LUT (Look-Up Table) de 256 cores baseada no ângulo polar (`atan2`).
+    - Integração no `BLContext` com `setConicGradient` e branch em `fillPolygon`.
+  - Com isso, temos toda a especificação base de fill styles preenchida (Solid, Linear, Radial, Conic, Pattern).
+- Sessão acelerada 6 (Bidi Segmentation + Multi-line Layout & Metrics):
+  - `dart test`: 127 testes passando.
+  - **Script/Bidi Segmentation (Fase 9 bootstrap)** (`text/bl_bidi.dart`):
+    - `BLBidiAnalyzer` implementado para segmentar a string em run levels baseados no Unicode block approach (resolvendo Hebraico/Árabe como RTL).
+    - `BLTextDirection` enum (LTR vs RTL) e `BLTextRun`.
+  - **Multi-line & RTL Text Layout** (`text/bl_text_layout.dart`):
+    - `shapeText` reescrito para fragmentar texto por quebras de linha (`\n`) e rodar Bidi em cada linha.
+    - Lógica de posicionamento RTL preenche run da direita pra esquerda visualmente (subtraindo advances do cursor).
+  - **Text Metrics Expansion** (`BLTextMetrics`):
+    - Bounding Box preciso (`boundingBoxX`, `boundingBoxY`) incluso em adição ao `width`/`height` semânticos.
+    - Captura o escopo de múltiplos *lines* e ascenders/descenders dinâmicos por run.
 
 ## 1) Princípios de engenharia (não negociáveis)
 

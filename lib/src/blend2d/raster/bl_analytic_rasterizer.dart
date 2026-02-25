@@ -62,6 +62,9 @@ class BLAnalyticRasterizer {
     }
   }
 
+  /// Read-only access to the internal ARGB32 pixel buffer.
+  Uint32List get pixelBuffer => _buffer;
+
   void clear([int argb = 0xFFFFFFFF]) {
     _buffer.fillRange(0, _buffer.length, argb);
     _covers.fillRange(0, _covers.length, 0);

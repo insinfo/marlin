@@ -5,6 +5,7 @@ import '../core/bl_types.dart';
 import '../pipeline/bl_fetch_linear_gradient.dart';
 import '../pipeline/bl_fetch_pattern.dart';
 import '../pipeline/bl_fetch_radial_gradient.dart';
+import '../pipeline/bl_fetch_conic_gradient.dart';
 import '../geometry/bl_dasher.dart';
 import '../geometry/bl_path.dart';
 import '../geometry/bl_stroker.dart';
@@ -19,6 +20,7 @@ enum _BLFillStyleType {
   solid,
   linearGradient,
   radialGradient,
+  conicGradient,
   pattern,
 }
 
@@ -31,6 +33,7 @@ class _BLContextState {
   final BLSolidFetcher solidFetcher;
   final BLLinearGradientFetcher? linearGradientFetcher;
   final BLRadialGradientFetcher? radialGradientFetcher;
+  final BLConicGradientFetcher? conicGradientFetcher;
   final BLPatternFetcher? patternFetcher;
   final _BLFillStyleType fillStyleType;
   final BLStrokeOptions strokeOptions;
@@ -44,6 +47,7 @@ class _BLContextState {
     required this.solidFetcher,
     required this.linearGradientFetcher,
     required this.radialGradientFetcher,
+    required this.conicGradientFetcher,
     required this.patternFetcher,
     required this.fillStyleType,
     required this.strokeOptions,
@@ -72,6 +76,7 @@ class BLContext {
   BLSolidFetcher _solidFetcher = BLSolidFetcher(0xFF000000);
   BLLinearGradientFetcher? _linearGradientFetcher;
   BLRadialGradientFetcher? _radialGradientFetcher;
+  BLConicGradientFetcher? _conicGradientFetcher;
   BLPatternFetcher? _patternFetcher;
   _BLFillStyleType _fillStyleType = _BLFillStyleType.solid;
 
@@ -132,6 +137,7 @@ class BLContext {
       solidFetcher: _solidFetcher,
       linearGradientFetcher: _linearGradientFetcher,
       radialGradientFetcher: _radialGradientFetcher,
+      conicGradientFetcher: _conicGradientFetcher,
       patternFetcher: _patternFetcher,
       fillStyleType: _fillStyleType,
       strokeOptions: strokeOptions,
@@ -152,6 +158,7 @@ class BLContext {
     _solidFetcher = state.solidFetcher;
     _linearGradientFetcher = state.linearGradientFetcher;
     _radialGradientFetcher = state.radialGradientFetcher;
+    _conicGradientFetcher = state.conicGradientFetcher;
     _patternFetcher = state.patternFetcher;
     _fillStyleType = state.fillStyleType;
     strokeOptions = state.strokeOptions;
@@ -173,12 +180,14 @@ class BLContext {
     _fillStyleType = _BLFillStyleType.solid;
     _linearGradientFetcher = null;
     _radialGradientFetcher = null;
+    _conicGradientFetcher = null;
     _patternFetcher = null;
   }
 
   void setLinearGradient(BLLinearGradient gradient) {
     _linearGradientFetcher = BLLinearGradientFetcher(gradient);
     _radialGradientFetcher = null;
+    _conicGradientFetcher = null;
     _patternFetcher = null;
     _fillStyleType = _BLFillStyleType.linearGradient;
   }
@@ -186,14 +195,24 @@ class BLContext {
   void setRadialGradient(BLRadialGradient gradient) {
     _radialGradientFetcher = BLRadialGradientFetcher(gradient);
     _linearGradientFetcher = null;
+    _conicGradientFetcher = null;
     _patternFetcher = null;
     _fillStyleType = _BLFillStyleType.radialGradient;
+  }
+
+  void setConicGradient(BLConicGradient gradient) {
+    _conicGradientFetcher = BLConicGradientFetcher(gradient);
+    _linearGradientFetcher = null;
+    _radialGradientFetcher = null;
+    _patternFetcher = null;
+    _fillStyleType = _BLFillStyleType.conicGradient;
   }
 
   void setPattern(BLPattern pattern) {
     _patternFetcher = BLPatternFetcher(pattern);
     _linearGradientFetcher = null;
     _radialGradientFetcher = null;
+    _conicGradientFetcher = null;
     _fillStyleType = _BLFillStyleType.pattern;
   }
 
@@ -393,6 +412,21 @@ class BLContext {
       return;
     }
 
+    final conicFetcher = _conicGradientFetcher;
+    if (!useExplicitColor &&
+        _fillStyleType == _BLFillStyleType.conicGradient &&
+        conicFetcher != null) {
+      await _rasterizer.drawPolygonFetched(
+        drawVerts,
+        conicFetcher.fetch,
+        fillRule: drawRule,
+        compOp: compOp,
+        contourVertexCounts: contourVertexCounts,
+      );
+      _syncFromRasterizer();
+      return;
+    }
+
     if (!useExplicitColor &&
         _fillStyleType == _BLFillStyleType.pattern &&
         patternFetcher != null) {
@@ -513,6 +547,32 @@ class BLContext {
     path.cubicTo(cx + kx, cy + ry, cx + rx, cy + ky, cx + rx, cy);
     path.close();
     return path;
+  }
+
+  /// Preenche um retângulo arredondado.
+  Future<void> fillRoundRect(
+    double x,
+    double y,
+    double w,
+    double h,
+    double r, {
+    BLColor? color,
+  }) async {
+    final path = BLPath()..addRoundRect(x, y, w, h, r);
+    await fillPath(path, color: color);
+  }
+
+  /// Strokes um retângulo arredondado.
+  Future<void> strokeRoundRect(
+    double x,
+    double y,
+    double w,
+    double h,
+    double r, {
+    BLColor? color,
+  }) async {
+    final path = BLPath()..addRoundRect(x, y, w, h, r);
+    await strokePath(path, color: color);
   }
 
   // =========================================================================

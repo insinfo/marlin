@@ -137,6 +137,20 @@ class BLRadialGradient {
   });
 }
 
+class BLConicGradient {
+  final BLPoint center;
+  final double angle; // Offset inicial em radianos
+  final List<BLGradientStop> stops;
+  final BLGradientExtendMode extendMode;
+
+  const BLConicGradient({
+    required this.center,
+    this.angle = 0.0,
+    required this.stops,
+    this.extendMode = BLGradientExtendMode.pad,
+  });
+}
+
 class BLPattern {
   final BLImage image;
   final BLPoint offset;
