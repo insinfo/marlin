@@ -1,8 +1,9 @@
-library blend2d_port;
+library blend2d;
 
 export 'context/bl_context.dart';
 export 'core/bl_image.dart';
 export 'core/bl_types.dart';
+export 'geometry/bl_dasher.dart';
 export 'geometry/bl_path.dart';
 export 'geometry/bl_stroker.dart';
 export 'pipeline/bl_compop_kernel.dart';
@@ -10,12 +11,16 @@ export 'pipeline/bl_fetch_linear_gradient.dart';
 export 'pipeline/bl_fetch_pattern.dart';
 export 'pipeline/bl_fetch_radial_gradient.dart';
 export 'pipeline/bl_fetch_solid.dart';
+export 'pixelops/bl_pixelops.dart';
 export 'raster/bl_analytic_rasterizer.dart';
 export 'raster/bl_edge_builder.dart';
 export 'raster/bl_edge_storage.dart';
 export 'raster/bl_raster_defs.dart';
+export 'text/bl_cff.dart';
 export 'text/bl_font.dart';
 export 'text/bl_font_loader.dart';
+export 'text/bl_glyph_cache.dart';
 export 'text/bl_glyph_run.dart';
+export 'text/bl_opentype_layout.dart';
 export 'text/bl_text_layout.dart';
 export 'threading/bl_isolate_pool.dart';

@@ -1,5 +1,3 @@
-library blend2d_core_types;
-
 import 'bl_image.dart';
 
 typedef BLColor = int; // 0xAARRGGBB
@@ -19,8 +17,38 @@ extension BLFillRuleX on BLFillRule {
 }
 
 enum BLCompOp {
-  srcOver,
-  srcCopy,
+  // Porter-Duff (aligned with BL_COMP_OP_* from context.h)
+  srcOver, // 0 — default
+  srcCopy, // 1
+  srcIn, // 2
+  srcOut, // 3
+  srcAtop, // 4
+  dstOver, // 5
+  dstCopy, // 6
+  dstIn, // 7
+  dstOut, // 8
+  dstAtop, // 9
+  xor_, // 10 — 'xor' is reserved in Dart
+  clear, // 11
+
+  // Advanced blend modes (separable)
+  plus, // 12
+  minus, // 13
+  modulate, // 14
+  multiply, // 15
+  screen, // 16
+  overlay, // 17
+  darken, // 18
+  lighten, // 19
+  colorDodge, // 20
+  colorBurn, // 21
+  linearBurn, // 22
+  linearLight, // 23
+  pinLight, // 24
+  hardLight, // 25
+  softLight, // 26
+  difference, // 27
+  exclusion, // 28
 }
 
 class BLPoint {

@@ -2,6 +2,8 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../geometry/bl_path.dart';
+import 'bl_cff.dart';
+import 'bl_opentype_layout.dart';
 
 /// Face de fonte carregada em memoria.
 class BLFontFace {
@@ -26,10 +28,17 @@ class BLFontFace {
   final int glyfOffset;
   final int glyfLength;
   final bool hasTrueTypeOutlines;
+  final bool hasCFFOutlines;
+  final int cffOffset;
+  final int cffLength;
   final int numHMetrics;
   final int hmtxOffset;
   final int hmtxLength;
   final bool isSymbolFont;
+  final int gsubOffset;
+  final int gsubLength;
+  final int gposOffset;
+  final int gposLength;
   final Map<int, int> _kernPairUnits;
 
   final ByteData _view;
@@ -77,15 +86,39 @@ class BLFontFace {
     required this.glyfOffset,
     required this.glyfLength,
     required this.hasTrueTypeOutlines,
+    required this.hasCFFOutlines,
+    required this.cffOffset,
+    required this.cffLength,
     required this.numHMetrics,
     required this.hmtxOffset,
     required this.hmtxLength,
     required this.isSymbolFont,
+    required this.gsubOffset,
+    required this.gsubLength,
+    required this.gposOffset,
+    required this.gposLength,
     required Map<int, int> kernPairUnits,
     required _BLCmapMapper cmapMapper,
   })  : _kernPairUnits = kernPairUnits,
         _cmapMapper = cmapMapper,
         _view = ByteData.sublistView(data);
+
+  /// Lazy-initialized layout engine for GSUB/GPOS.
+  BLLayoutEngine? _layoutEngine;
+
+  /// Returns the GSUB/GPOS layout engine, creating it on first access.
+  BLLayoutEngine? get layoutEngine {
+    if (_layoutEngine != null) return _layoutEngine;
+    if (gsubLength == 0 && gposLength == 0) return null;
+    _layoutEngine = BLLayoutEngine(
+      _view,
+      gsubOffset: gsubOffset,
+      gsubLength: gsubLength,
+      gposOffset: gposOffset,
+      gposLength: gposLength,
+    );
+    return _layoutEngine;
+  }
 
   int mapCodePoint(int codePoint) {
     int gid = _cmapMapper.map(codePoint);
@@ -167,7 +200,7 @@ class BLFontFace {
     int glyphId, {
     int maxCompoundDepth = 16,
   }) {
-    if (!hasTrueTypeOutlines || glyphCount <= 0) return null;
+    if (glyphCount <= 0) return null;
 
     int gid = glyphId;
     if (gid < 0) gid = 0;
@@ -176,19 +209,31 @@ class BLFontFace {
     final cached = _glyphOutlineUnitsCache[gid];
     if (cached != null) return cached;
 
-    final path = BLPath();
-    final decodingStack = <int>{};
-    final ok = _appendGlyphOutlineUnits(
-      path,
-      gid,
-      _BLGlyphTransform.identity(),
-      0,
-      maxCompoundDepth < 1 ? 1 : maxCompoundDepth,
-      decodingStack,
-    );
-    if (!ok) return null;
+    BLPathData? out;
 
-    final out = path.toPathData();
+    if (hasTrueTypeOutlines) {
+      final path = BLPath();
+      final decodingStack = <int>{};
+      final ok = _appendGlyphOutlineUnits(
+        path,
+        gid,
+        _BLGlyphTransform.identity(),
+        0,
+        maxCompoundDepth < 1 ? 1 : maxCompoundDepth,
+        decodingStack,
+      );
+      if (ok) out = path.toPathData();
+    } else if (hasCFFOutlines) {
+      out = BLCFFDecoder.decodeGlyph(
+        _view,
+        cffOffset,
+        cffLength,
+        gid,
+      );
+    }
+
+    if (out == null) return null;
+
     if (_glyphOutlineUnitsCache.length >= 2048 &&
         !_glyphOutlineUnitsCache.containsKey(gid)) {
       _glyphOutlineUnitsCache.remove(_glyphOutlineUnitsCache.keys.first);
@@ -535,9 +580,8 @@ class BLFontFace {
       final next = points[(idx + 1) % n];
 
       if (curr.onCurve) {
-        final isRedundantClose = processed == n - 1 &&
-            curr.x == startX &&
-            curr.y == startY;
+        final isRedundantClose =
+            processed == n - 1 && curr.x == startX && curr.y == startY;
         if (!isRedundantClose) {
           path.lineTo(curr.x, curr.y);
         }
@@ -579,6 +623,9 @@ class BLFontFace {
     final os2 = tableMap[_tag('OS/2')];
     final loca = tableMap[_tag('loca')];
     final glyf = tableMap[_tag('glyf')];
+    final cffTable = tableMap[_tag('CFF ')];
+    final gsubTable = tableMap[_tag('GSUB')];
+    final gposTable = tableMap[_tag('GPOS')];
 
     int unitsPerEm = 1000;
     int indexToLocFormat = 0;
@@ -670,6 +717,15 @@ class BLFontFace {
       hasTrueTypeOutlines = true;
     }
 
+    bool hasCFFOutlines = false;
+    int cffOffsetVal = 0;
+    int cffLengthVal = 0;
+    if (!hasTrueTypeOutlines && cffTable != null && cffTable.length > 4) {
+      hasCFFOutlines = true;
+      cffOffsetVal = cffTable.offset;
+      cffLengthVal = cffTable.length;
+    }
+
     bool isSymbolFont = false;
     _BLCmapMapper cmapMapper = _BLCmapNone.instance;
     if (cmap != null && cmap.length >= 4) {
@@ -691,7 +747,8 @@ class BLFontFace {
       _parseLegacyKern(view, kern.offset, kern.length, kernPairUnits);
     }
 
-    final names = name != null ? _parseNameTable(view, name.offset, name.length) : null;
+    final names =
+        name != null ? _parseNameTable(view, name.offset, name.length) : null;
     final resolvedFamily = (familyName != null && familyName.trim().isNotEmpty)
         ? familyName
         : ((names?.family.isNotEmpty ?? false) ? names!.family : 'Unknown');
@@ -721,10 +778,17 @@ class BLFontFace {
       glyfOffset: glyfOffset,
       glyfLength: glyfLength,
       hasTrueTypeOutlines: hasTrueTypeOutlines,
+      hasCFFOutlines: hasCFFOutlines,
+      cffOffset: cffOffsetVal,
+      cffLength: cffLengthVal,
       numHMetrics: numHMetrics,
       hmtxOffset: hmtxOffset,
       hmtxLength: hmtxLength,
       isSymbolFont: isSymbolFont,
+      gsubOffset: gsubTable?.offset ?? 0,
+      gsubLength: gsubTable?.length ?? 0,
+      gposOffset: gposTable?.offset ?? 0,
+      gposLength: gposTable?.length ?? 0,
       kernPairUnits: kernPairUnits,
       cmapMapper: cmapMapper,
     );
@@ -885,7 +949,8 @@ class BLFontFace {
         final firstCode = _u32(view, base + 12);
         final entryCount = _u32(view, base + 16);
         if (entryCount <= 0) return _BLCmapNone.instance;
-        if (firstCode > 0x10FFFF || entryCount > 0x10FFFF) return _BLCmapNone.instance;
+        if (firstCode > 0x10FFFF || entryCount > 0x10FFFF)
+          return _BLCmapNone.instance;
         if (firstCode + entryCount > 0x110000) return _BLCmapNone.instance;
         if (20 + entryCount * 2 > length) return _BLCmapNone.instance;
         return _BLCmapFormat10(view, firstCode, entryCount, base + 20);
@@ -974,8 +1039,10 @@ class BLFontFace {
 
       if (subLength <= 0 || p + subLength > tableEnd) break;
 
-      final isHorizontal = headerSize == 4 ? ((coverage & 0x01) != 0) : ((coverage & 0x80) == 0);
-      final isCrossStream = headerSize == 4 ? ((coverage & 0x04) != 0) : ((coverage & 0x40) != 0);
+      final isHorizontal =
+          headerSize == 4 ? ((coverage & 0x01) != 0) : ((coverage & 0x80) == 0);
+      final isCrossStream =
+          headerSize == 4 ? ((coverage & 0x04) != 0) : ((coverage & 0x40) != 0);
 
       if (isHorizontal && !isCrossStream && format == 0) {
         _parseKernFormat0(view, dataStart, p + subLength, outPairs);
@@ -1031,7 +1098,8 @@ class BLFontFace {
     if (stringOffset >= nameLength) return null;
     final stringRegionStart = nameOffset + stringOffset;
     final stringRegionSize = nameLength - stringOffset;
-    if (stringRegionStart < nameOffset || stringRegionStart > tableEnd) return null;
+    if (stringRegionStart < nameOffset || stringRegionStart > tableEnd)
+      return null;
 
     final selected = <int, _BLNameCandidate>{};
 
@@ -1047,7 +1115,8 @@ class BLFontFace {
       if (!_isInterestingNameId(nameId)) continue;
       if (stringLength == 0) {
         stringOff = 0;
-      } else if (stringOff >= stringRegionSize || (stringRegionSize - stringOff) < stringLength) {
+      } else if (stringOff >= stringRegionSize ||
+          (stringRegionSize - stringOff) < stringLength) {
         continue;
       }
 
@@ -1091,7 +1160,9 @@ class BLFontFace {
     final full = _pickBestName(selected, const [4]);
     final postScript = _pickBestName(selected, const [6]);
 
-    if (family.isNotEmpty && subfamily.isNotEmpty && family.endsWith(subfamily)) {
+    if (family.isNotEmpty &&
+        subfamily.isNotEmpty &&
+        family.endsWith(subfamily)) {
       subfamily = '';
     }
 
@@ -1181,7 +1252,8 @@ class BLFontFace {
     int length,
     int platformId,
   ) {
-    if (length < 0 || offset < 0 || offset + length > view.lengthInBytes) return null;
+    if (length < 0 || offset < 0 || offset + length > view.lengthInBytes)
+      return null;
 
     final isUtf16Be = platformId == 0 || platformId == 3;
     if (isUtf16Be) {
@@ -1277,10 +1349,17 @@ class BLFont {
     return face.kerning(size, leftGlyphId, rightGlyphId);
   }
 
+  /// Converts a value in font units to the current font size.
+  double scaleValue(int fontUnits) {
+    final upm = face.unitsPerEm > 0 ? face.unitsPerEm : 1000;
+    return fontUnits * size / upm;
+  }
+
   BLPathData? glyphOutline(int glyphId) {
     int gid = glyphId;
     if (gid < 0) gid = 0;
-    if (face.glyphCount > 0 && gid >= face.glyphCount) gid = face.glyphCount - 1;
+    if (face.glyphCount > 0 && gid >= face.glyphCount)
+      gid = face.glyphCount - 1;
 
     final cached = _glyphOutlineCache[gid];
     if (cached != null) return cached;

@@ -62,11 +62,9 @@ void main() {
       );
 
       // Center should be the hole (background)
-      expect(_isDrawn(image, 30, 30), false,
-          reason: 'Center should be hole');
+      expect(_isDrawn(image, 30, 30), false, reason: 'Center should be hole');
       // Border should be drawn
-      expect(_isDrawn(image, 10, 10), true,
-          reason: 'Border should be drawn');
+      expect(_isDrawn(image, 10, 10), true, reason: 'Border should be drawn');
 
       await ctx.dispose();
     });
@@ -121,15 +119,17 @@ void main() {
         color: 0x80FF0000, // semi-transparent red
       );
 
-      // No raster atual, srcCopy faz fallback para srcOver quando coverage/alpha
-      // efetivos não são totalmente opacos; sobre fundo branco isso resulta em
-      // alpha final opaco no interior.
+      // srcCopy replaces the destination with the source pixel.
+      // With full coverage the result is exactly 0x80FF0000.
+      // With AA fringe pixels the rasterizer may blend via compose().
+      // The interior pixel should have the source's alpha (0x80 = 128).
       final pixel = image.pixels[16 * 32 + 16];
       final alpha = (pixel >> 24) & 0xFF;
       final r = (pixel >> 16) & 0xFF;
       final g = (pixel >> 8) & 0xFF;
       final b = pixel & 0xFF;
-      expect(alpha, 0xFF);
+      // srcCopy writes source alpha directly — no longer 0xFF
+      expect(alpha, closeTo(0x80, 2));
       expect(r, greaterThan(g));
       expect(r, greaterThan(b));
 

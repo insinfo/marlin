@@ -45,7 +45,8 @@ class BLAnalyticRasterizer {
         _covers = Int32List(width * height),
         _areas = Int32List(width * height),
         _wordsPerRow = (width + _kMaskWordBits - 1) ~/ _kMaskWordBits,
-        _activeMask = Uint32List(((width + _kMaskWordBits - 1) ~/ _kMaskWordBits) * height),
+        _activeMask = Uint32List(
+            ((width + _kMaskWordBits - 1) ~/ _kMaskWordBits) * height),
         _rowMinX = Int32List(height),
         _rowMaxX = Int32List(height) {
     _rowMinX.fillRange(0, _rowMinX.length, width);
@@ -81,7 +82,8 @@ class BLAnalyticRasterizer {
     final pointCount = vertices.length ~/ 2;
     if (pointCount < 3) return;
 
-    final contours = BLEdgeBuilder.resolveContours(pointCount, contourVertexCounts);
+    final contours =
+        BLEdgeBuilder.resolveContours(pointCount, contourVertexCounts);
     if (contours.isEmpty) return;
 
     _resetDirty();
@@ -112,7 +114,8 @@ class BLAnalyticRasterizer {
     final pointCount = vertices.length ~/ 2;
     if (pointCount < 3) return;
 
-    final contours = BLEdgeBuilder.resolveContours(pointCount, contourVertexCounts);
+    final contours =
+        BLEdgeBuilder.resolveContours(pointCount, contourVertexCounts);
     if (contours.isEmpty) return;
 
     _resetDirty();
@@ -348,7 +351,8 @@ class BLAnalyticRasterizer {
                 } else {
                   for (int p = x; p < spanEnd; p++) {
                     final idx = rowOffset + p;
-                    _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                    _buffer[idx] =
+                        BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
                   }
                 }
               }
@@ -382,7 +386,8 @@ class BLAnalyticRasterizer {
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -444,7 +449,8 @@ class BLAnalyticRasterizer {
                 } else {
                   for (int p = x; p < spanEnd; p++) {
                     final idx = rowOffset + p;
-                    _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                    _buffer[idx] =
+                        BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
                   }
                 }
               }
@@ -478,7 +484,8 @@ class BLAnalyticRasterizer {
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -530,14 +537,16 @@ class BLAnalyticRasterizer {
               final srcA = (srcPx >>> 24) & 0xFF;
               if (srcA == 0) continue;
 
-              final effA = srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
+              final effA =
+                  srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
               if (effA <= 0) continue;
 
               final effSrc = (effA << 24) | (srcPx & 0x00FFFFFF);
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -563,13 +572,15 @@ class BLAnalyticRasterizer {
           final srcPx = fetcher(x, y);
           final srcA = (srcPx >>> 24) & 0xFF;
           if (srcA != 0) {
-            final effA = srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
+            final effA =
+                srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
             if (effA > 0) {
               final effSrc = (effA << 24) | (srcPx & 0x00FFFFFF);
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -621,14 +632,16 @@ class BLAnalyticRasterizer {
               final srcA = (srcPx >>> 24) & 0xFF;
               if (srcA == 0) continue;
 
-              final effA = srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
+              final effA =
+                  srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
               if (effA <= 0) continue;
 
               final effSrc = (effA << 24) | (srcPx & 0x00FFFFFF);
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -654,13 +667,15 @@ class BLAnalyticRasterizer {
           final srcPx = fetcher(x, y);
           final srcA = (srcPx >>> 24) & 0xFF;
           if (srcA != 0) {
-            final effA = srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
+            final effA =
+                srcA == 255 ? covAlpha : ((covAlpha * srcA + 127) ~/ 255);
             if (effA > 0) {
               final effSrc = (effA << 24) | (srcPx & 0x00FFFFFF);
               if (compOp == BLCompOp.srcCopy && effA == 255) {
                 _buffer[idx] = effSrc;
               } else {
-                _buffer[idx] = BLCompOpKernel.srcOver(_buffer[idx], effSrc);
+                _buffer[idx] =
+                    BLCompOpKernel.compose(compOp, _buffer[idx], effSrc);
               }
             }
           }
@@ -683,7 +698,8 @@ class BLAnalyticRasterizer {
     final endWord = endX >> 5;
     final startBit = startX & 31;
 
-    int word = _activeMask[rowWordOffset + wordIndex] & (0xFFFFFFFF << startBit);
+    int word =
+        _activeMask[rowWordOffset + wordIndex] & (0xFFFFFFFF << startBit);
     while (true) {
       if (word != 0) {
         final bit = _firstSetBit(word);
@@ -731,5 +747,4 @@ class BLAnalyticRasterizer {
     final low = word & -word;
     return low.bitLength - 1;
   }
-
 }

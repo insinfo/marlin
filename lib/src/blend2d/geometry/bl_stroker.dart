@@ -170,13 +170,13 @@ class BLStroker {
 
       if (cross >= 0.0) {
         // Vira esquerda: A externo → join; B interno
-        _addOuterJoin(aVerts, px[i], py[i], hw, npx, npy, nnx, nny,
-            kx, ky, kLenSq, miterLimitSq, options.join);
+        _addOuterJoin(aVerts, px[i], py[i], hw, npx, npy, nnx, nny, kx, ky,
+            kLenSq, miterLimitSq, options.join);
         _addInnerJoin(bVerts, px[i], py[i], -kx, -ky);
       } else {
         // Vira direita: B externo → join; A interno
-        _addOuterJoin(bVerts, px[i], py[i], -hw, -npx, -npy, -nnx, -nny,
-            -kx, -ky, kLenSq, miterLimitSq, options.join);
+        _addOuterJoin(bVerts, px[i], py[i], -hw, -npx, -npy, -nnx, -nny, -kx,
+            -ky, kLenSq, miterLimitSq, options.join);
         _addInnerJoin(aVerts, px[i], py[i], kx, ky);
       }
     }
@@ -198,6 +198,7 @@ class BLStroker {
       }
 
       // End cap: do último A ao último B
+      // C++ Blend2D: add_cap(a_out(), _p0, b_out().vtx[-1], end_cap)
       _addCapToPath(
         out,
         aVerts[(na - 1) * 2],
@@ -208,8 +209,6 @@ class BLStroker {
         bVerts[(nb - 1) * 2 + 1],
         options.endCap,
         hw,
-        nx[n - 2],
-        ny[n - 2],
       );
 
       // B invertido
@@ -218,7 +217,7 @@ class BLStroker {
       }
 
       // Start cap: do primeiro B ao primeiro A
-      // A direção de entrada do cap é o oposto do segmento inicial
+      // C++ Blend2D: add_cap(c_out, _pInitial, a_path[figure_offset], start_cap)
       _addCapToPath(
         out,
         bVerts[0],
@@ -229,8 +228,6 @@ class BLStroker {
         aVerts[1],
         options.startCap,
         hw,
-        -nx[0],
-        -ny[0],
       );
 
       out.close();
@@ -380,8 +377,7 @@ class BLStroker {
     }
 
     // Subdividir a ~45° por passo para qualidade suficiente
-    final int steps =
-        math.max(1, (deltaAngle.abs() / (math.pi / 4)).ceil());
+    final int steps = math.max(1, (deltaAngle.abs() / (math.pi / 4)).ceil());
     final double step = deltaAngle / steps;
 
     for (int i = 1; i <= steps; i++) {
@@ -393,12 +389,16 @@ class BLStroker {
 
   // ---------------------------------------------------------------------------
   // Cap de extremidade → emite direto no BLPath de saída
-  // Inspirado em add_cap() de pathstroke.cpp
+  // Port fiel de add_cap() de pathstroke.cpp
   // Parâmetros:
-  //   p0x/p0y   = último ponto do lado A (ou primeiro do B)  
-  //   pivX/pivY = ponto final do contorno original
-  //   p1x/p1y   = primeiro ponto do lado B (ou último do A)
-  //   segNx/Ny  = normal do segmento adjacente ao pivot (direção de saída)
+  //   p0x/p0y   = último ponto emitido no path de saída (out.vtx[-1] do C++)
+  //   pivX/pivY = ponto original do contorno (pivot)
+  //   p1x/p1y   = ponto correspondente do outro lado
+  //
+  // q = normal(p1 - p0) * 0.5
+  //   onde normal(v) = (-v.y, v.x)
+  //   |p1 - p0| == width → |q| == hw — perpendicular a (p1-p0), na direção
+  //   que se afasta do pivot (extensão do cap para fora).
   // ---------------------------------------------------------------------------
 
   static void _addCapToPath(
@@ -411,48 +411,63 @@ class BLStroker {
     double p1y,
     BLStrokeCap cap,
     double hw,
-    double segNx,   // normal do segmento (nx[último ou primeiro])
-    double segNy,
   ) {
-    // Vetor de avanço do cap na tangente do segmento.
-    // A tangente é perpendicular à normal do segmento: (tx, ty)=(-ny, nx).
-    // O sinal já vem correto via segNx/segNy no chamador (end/start cap).
-    final double qx = -segNy * hw;
-    final double qy = segNx * hw;
+    // q = normal(p1 - p0) * 0.5  (Blend2D C++ pathstroke.cpp line 923)
+    final double dx = p1x - p0x;
+    final double dy = p1y - p0y;
+    final double qx = -dy * 0.5;
+    final double qy = dx * 0.5;
 
     switch (cap) {
       case BLStrokeCap.butt:
+        // C++: out.line_to(p1)
         out.lineTo(p1x, p1y);
         return;
 
       case BLStrokeCap.square:
-        // Estender por hw além do pivot
+        // C++: out.line_to(p0 + q), out.line_to(p1 + q), out.line_to(p1)
         out.lineTo(p0x + qx, p0y + qy);
         out.lineTo(p1x + qx, p1y + qy);
         out.lineTo(p1x, p1y);
         return;
 
       case BLStrokeCap.round:
-        // Arco semicircular de 180° ao redor do pivot
-        _addRoundCapToPath(out, p0x, p0y, pivX, pivY, p1x, p1y, segNx, segNy, hw);
+        // C++: arc_quadrant_to(p0 + q, pivot + q), arc_quadrant_to(p1 + q, p1)
+        // Implementado como arco subdividido com midpoint em (pivot + q)
+        _addRoundCapToPath(out, p0x, p0y, pivX, pivY, p1x, p1y, qx, qy, hw);
         return;
 
       case BLStrokeCap.roundRev:
-        // Arco reverso: recua para dentro
-        final double cx2 = (p0x + p1x) * 0.5;
-        final double cy2 = (p0y + p1y) * 0.5;
-        out.lineTo(cx2 + qx, cy2 + qy); // extender
-        out.lineTo(pivX, pivY);          // recuar ao centro
-        out.lineTo(cx2 + qx, cy2 + qy); // re-extender (outro lado)
+        // C++: line_to(p0+q), arc_quadrant(p0, pivot), arc_quadrant(p1, p1+q), line_to(p1)
+        out.lineTo(p0x + qx, p0y + qy);
+        // Arco de (p0+q) passando por (p0) até (pivot), e de (pivot) passando por (p1) até (p1+q)
+        {
+          // Arco de recuo: (p0+q) ao redor do midpoint entre p0 e pivot
+          final tmpVerts = <double>[];
+          _addArcPoints(
+              tmpVerts, pivX, pivY, p0x + qx, p0y + qy, pivX + qx, pivY + qy);
+          for (int i = 0; i < tmpVerts.length; i += 2) {
+            out.lineTo(tmpVerts[i], tmpVerts[i + 1]);
+          }
+          tmpVerts.clear();
+          // Continuação: de (pivot) passando por (p1) até (p1+q)
+          _addArcPoints(
+              tmpVerts, pivX, pivY, pivX + qx, pivY + qy, p1x + qx, p1y + qy);
+          for (int i = 0; i < tmpVerts.length; i += 2) {
+            out.lineTo(tmpVerts[i], tmpVerts[i + 1]);
+          }
+        }
         out.lineTo(p1x, p1y);
         return;
 
       case BLStrokeCap.triangle:
-        out.lineTo(pivX, pivY);
+        // C++: out.line_to(pivot + q), out.line_to(p1)
+        out.lineTo(pivX + qx, pivY + qy);
         out.lineTo(p1x, p1y);
         return;
 
       case BLStrokeCap.triangleRev:
+        // C++: line_to(p0+q), line_to(pivot), line_to(p1+q), line_to(p1)
         out.lineTo(p0x + qx, p0y + qy);
         out.lineTo(pivX, pivY);
         out.lineTo(p1x + qx, p1y + qy);
@@ -462,6 +477,8 @@ class BLStroker {
   }
 
   /// Arco de cap semicircular: de p0 ao redor de piv até p1 (180°).
+  /// Usa o midpoint `pivot + q` (onde q = normal(p1-p0)*0.5) como waypoint,
+  /// equivalente ao arc_quadrant_to do C++ Blend2D.
   static void _addRoundCapToPath(
     BLPath out,
     double p0x,
@@ -470,34 +487,19 @@ class BLStroker {
     double pivY,
     double p1x,
     double p1y,
-    double segNx,
-    double segNy,
+    double qx,
+    double qy,
     double hw,
   ) {
-    // O ponto de meia-lua do cap: pivot + hw * tangente_forward.
-    // Tangente forward = (segNy, -segNx) onde segN é a normal esquerda do segmento.
-    // Para o end cap: tangente = (ny_last, -nx_last)
-    // Para o start cap: a direção é invertida.
-    final double tx = segNy, ty = -segNx;
-    final double midX = pivX + hw * tx;
-    final double midY = pivY + hw * ty;
+    // Midpoint do arco semicircular: pivot + q
+    // C++: arc_quadrant_to(p0 + q, pivot + q), arc_quadrant_to(p1 + q, p1)
+    final double midX = pivX + qx;
+    final double midY = pivY + qy;
 
-    // Cross de (p0 - piv) com (mid - piv): determina sentido do arco
-    final double ax = p0x - pivX, ay = p0y - pivY;
-    final double mx = midX - pivX, my = midY - pivY;
-    final double cross0 = ax * my - ay * mx;
-
-    // Arco de p0 passando por mid até p1
-    // Subdividir em 2 passos via mid como waypoint
+    // Arco de p0 passando por mid até p1 (dois quadrantes de ~90° cada)
     final tmpVerts = <double>[];
-    if (cross0 >= 0.0) {
-      _addArcPoints(tmpVerts, pivX, pivY, p0x, p0y, midX, midY);
-      _addArcPoints(tmpVerts, pivX, pivY, midX, midY, p1x, p1y);
-    } else {
-      // Sentido inverso: p0 → mid do outro lado
-      _addArcPoints(tmpVerts, pivX, pivY, p0x, p0y, midX, midY);
-      _addArcPoints(tmpVerts, pivX, pivY, midX, midY, p1x, p1y);
-    }
+    _addArcPoints(tmpVerts, pivX, pivY, p0x, p0y, midX, midY);
+    _addArcPoints(tmpVerts, pivX, pivY, midX, midY, p1x, p1y);
 
     final int nPts = tmpVerts.length ~/ 2;
     for (int i = 0; i < nPts; i++) {

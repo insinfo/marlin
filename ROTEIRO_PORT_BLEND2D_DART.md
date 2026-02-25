@@ -1,4 +1,4 @@
-# Roteiro Detalhado: Port do Blend2D para Dart (extremamente otimizado)
+# Roteiro Detalhado: Blend2D like para Dart (extremamente otimizado) biblioteca grafica de auto desempenho inspirada no blend2d
 
 Projeto alvo:
 - Referência C++: `referencias/blend2d-master/blend2d`
@@ -19,10 +19,11 @@ antes de qualquer reversão é bom executar pelo menos umas 10 vezes para garant
 Concluído agora:
 - Bootstrap inicial criado em `lib/src/blend2d/`:
   - `core/`: `bl_types.dart`, `bl_image.dart`
-  - `geometry/`: `bl_path.dart`
-  - `raster/`: `bl_edge_builder.dart`, `bl_edge_storage.dart`, `bl_analytic_rasterizer.dart` (scanline nativo inicial)
-  - `pipeline/`: `bl_compop_kernel.dart`, `bl_fetch_solid.dart`
-  - `context/`: `bl_context.dart`
+  - `geometry/`: `bl_path.dart`, `bl_stroker.dart`
+  - `raster/`: `bl_edge_builder.dart`, `bl_edge_storage.dart`, `bl_analytic_rasterizer.dart`, `bl_raster_defs.dart`
+  - `pipeline/`: `bl_compop_kernel.dart`, `bl_fetch_solid.dart`, `bl_fetch_linear_gradient.dart`, `bl_fetch_radial_gradient.dart`, `bl_fetch_pattern.dart`
+  - `pixelops/`: `bl_pixelops.dart` (premultiply/unpremultiply/udiv255/swizzle/sRGB)
+  - `context/`: `bl_context.dart` (save/restore, clip rect, transform afim, fillRect/strokeRect)
   - `threading/`: `bl_isolate_pool.dart` (API estável, execução local por enquanto)
   - `text/`: `bl_font.dart`, `bl_font_loader.dart`, `bl_glyph_run.dart`, `bl_text_layout.dart`
   - barrel export: `lib/src/blend2d/blend2d.dart`
@@ -34,9 +35,9 @@ Estado por fase:
 - Fase 0: parcialmente concluída (harness dedicado já existe, falta diff automatizado/heatmap).
 - Fase 1: parcialmente concluída (API mínima funcional para fill de polígonos/paths).
 - Fase 2: iniciada (scanline nativo com AET, suporte a `evenOdd/nonZero` e contornos múltiplos).
-- Fase 3: iniciada (composição `srcCopy/srcOver` no raster nativo).
+- Fase 3: **concluída** — todos os 28 comp-ops do Blend2D C++ implementados (srcOver, srcCopy, srcIn, srcOut, srcAtop, dstOver, dstCopy, dstIn, dstOut, dstAtop, xor, clear, plus, minus, modulate, multiply, screen, overlay, darken, lighten, colorDodge, colorBurn, linearBurn, linearLight, pinLight, hardLight, softLight, difference, exclusion) + módulo `pixelops/bl_pixelops.dart` portado de `pixelops/scalar_p.h`.
 - Fase 4: concluída (gradientes linear/radial + pattern nearest/bilinear/affine com fetchers dedicados).
-- Fase 5: concluída (stroker robusto com caps butt/square/round/roundRev/triangle/triangleRev e joins bevel/miterClip/miterBevel/miterRound/round, API `strokePath()` no contexto).
+- Fase 5: **concluída** — stroker robusto com paridade geométrica C++ em todos os caps (butt/square/round/roundRev/triangle/triangleRev) e joins (bevel/miterClip/miterBevel/miterRound/round), vetor `q = normal(p1-p0)*0.5` fiel à referência `pathstroke.cpp`.
 - Fase 6-7: não iniciadas (paralelismo real e otimizações agressivas ainda pendentes).
 - Fase 8-11 (texto): bootstrap avançando (loader + parser OpenType base de `head/maxp/hhea/hmtx/cmap/name/OS/2/kern` + layout simples + decoder inicial de outlines `glyf` simples/compostos + cache de outline por tamanho). Shaping avançado (GSUB/GPOS), `cff/cff2` e raster dedicado de glifos ainda pendentes.
 
@@ -203,7 +204,7 @@ Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`,
   - suíte de testes Blend2D adicionada e estabilizada (`path/stroker/pattern/context/gradient`), com validação local recente em `dart test`: `71 passed, 0 failed`,
   - testes de gradiente radial alinhados ao contrato atual de `BLRadialGradient` (`r0/r1` explícitos), reduzindo falso-negativo por uso de default `r1=0`,
   - testes de composição/contexto ajustados para o comportamento atual do resolve analítico em `srcCopy` com cobertura fracionária (fallback efetivo para composição tipo `srcOver` quando `effA < 255`),
-  - observação de paridade: cap `square` do stroker ainda não está totalmente equivalente ao Blend2D C++ em extensão simétrica de extremidades; funcionalidade segue estável, mas a paridade geométrica fina fica como próxima fatia dedicada de Fase 5.
+  - paridade de caps do stroker corrigida nesta sessão (ver abaixo).
 - Stroker robusto (Fase 5, port de `pathstroke.cpp`):
   - novo arquivo `geometry/bl_stroker.dart` com `BLStroker.strokePath(BLPath, BLStrokeOptions) -> BLPath`,
   - enums `BLStrokeCap` (butt/square/round/roundRev/triangle/triangleRev) e `BLStrokeJoin` (bevel/miterClip/miterBevel/miterRound/round) adicionados em `core/bl_types.dart`,
@@ -221,11 +222,129 @@ Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`,
   - API `BLContext.strokePath(BLPath, {color, options})` e `strokePolygon(...)` adicionadas,
   - `BLContext.setStrokeOptions()` e `setStrokeWidth()` para configurar estado de stroke no contexto,
   - barrel export atualizado em `blend2d.dart`,
-  - teste funcional em `benchmark/stroke_test.dart` com 6 cenários (ret+tri+poly+star+curva+círculo), validado com 9379 pixels de stroke em 512x512,
-  - `dart analyze` limpo, testes existentes (10/10) passando, baseline sólido sem regressão (`1.971ms/frame`, `10150 poly/s`).
+  - teste funcional em `benchmark/stroke_test.dart` com 6 cenários (ret+tri+poly+star+curva+círculo), validado com 9402 pixels de stroke em 512x512,
+  - `dart analyze` limpo, baseline sólido sem regressão.
+- Paridade geométrica de caps (port fiel de `add_cap()` de `pathstroke.cpp`):
+  - `_addCapToPath` reescrito para calcular `q = normal(p1 - p0) * 0.5` (exatamente como no C++),
+  - eliminados parâmetros `segNx/segNy` da função (q agora é auto-contido),
+  - `square cap` agora estende FORWARD por hw além dos endpoints (bug de direção corrigido),
+  - `triangle cap` agora estende a ponta para `pivot + q` (antes colapsava no pivot),
+  - `round cap` simplificado para usar `pivot + q` como waypoint do arco,
+  - `roundRev cap` reescrito com arcos de recuo via `_addArcPoints`,
+  - `_addRoundCapToPath` simplificado para receber `qx/qy` em vez de `segNx/segNy`,
+  - 3 novos testes dedicados de paridade geométrica:
+    - `square cap extends FORWARD by hw beyond endpoints` (horizontal),
+    - `triangle cap tip extends beyond pivot` (horizontal),
+    - `square cap on diagonal line extends symmetrically` (45°),
+  - rodada 10x do baseline sólido pós-paridade: média `1.921ms/frame` (faixa `1.785..2.359ms`) e `10478 poly/s`.
+- Expansão de composição (Fase 3 → concluída, port de `compop_p.h`/`compopgeneric_p.h`):
+  - `BLCompOp` expandido de 2 para 28 operadores (alinhado com `context.h`):
+    - Porter-Duff: srcOver, srcCopy, srcIn, srcOut, srcAtop, dstOver, dstCopy, dstIn, dstOut, dstAtop, xor, clear,
+    - Aditivos/subtrativos: plus, minus, modulate,
+    - Separáveis avançados: multiply, screen, overlay, darken, lighten, colorDodge, colorBurn, linearBurn, linearLight, pinLight, hardLight, softLight, difference, exclusion,
+  - cada modo implementado com a fórmula separável `B(Dc,Sc) + Sca.(1-Da) + Dca.(1-Sa)` (SVG/PDF spec),
+  - `BLCompOpKernel.compose()` dispatch centralizado para todos os 28 modos,
+  - fast-path `srcOver` preservado com caminho otimizado para destino opaco,
+  - testes verificam que todos os 28 ops produzem pixels válidos (sem crash/out-of-range).
+- Módulo `pixelops/` (port de `pixelops/scalar_p.h`):
+  - `udiv255()` — divisão por 255 com arredondamento correto (`((x + 128) * 257) >> 16`),
+  - `premultiply()` — ARGB straight → PRGB (port fiel do escalar C++, incluindo `val32 |= 0xFF000000`),
+  - `unpremultiply()` — PRGB → ARGB straight (com tabela de recíprocos, port de `unpremultiply_rgb_8bit`),
+  - `alphaOf/redOf/greenOf/blueOf/packArgb` — extração e empacotamento de canais,
+  - `swizzleArgbToAbgr/swizzleArgbToRgba/swizzleRgbaToArgb` — conversão de byte-order,
+  - `srgbToLinear/linearToSrgb` — conversão aproximada de espaço de cor para ops futuros,
+  - `neg255/clamp255/addus8` — utilitários escalares.
+- Expansão do Context API (inspirado em `context.h`/`context.cpp`):
+  - `save()/restore()` — pilha de estado completa (compOp, fillRule, estilo, stroke, alpha, clip, transform),
+  - `setGlobalAlpha()` — transparência global [0.0..1.0],
+  - `setClipRect()/clipToRect()/resetClip()` — recorte retangular com interseção,
+  - `setTransform()/getTransform()/resetTransform()` — transformação afim completa (`BLMatrix2D`),
+  - `translate()/scale()/rotate()` — atalhos de transformação incremental,
+  - `transformPoint()` / `isTransformIdentity` — consulta de transformação,
+  - `fillRect()/strokeRect()` — APIs de conveniência para retângulos,
+  - pipeline de transformação de vértices integrado no `fillPolygon()`,
+  - getter público `clipRect` para introspecção/testes.
 
 Medição recente do benchmark do port (`benchmark/blend2d_port_benchmark.dart`, 512x512, 30 iterações):
-- revalidação do baseline sólido após integração completa do stroker (Fase 5): `1.971ms/frame` (`10150 poly/s`) em `blend2d_port_benchmark.dart`.
+- rodada formal 10x pós-expansão comp-ops/pixelops/context: média `1.847ms/frame` (faixa `1.714..1.983ms`) e `10841 poly/s` (faixa `10083..11669`).
+- rodada formal 10x pós-integração comp-ops no resolve + text API + CFF: média `1.900ms/frame` (excl. outlier, faixa `1.800..2.102ms`) e `10482 poly/s` (excl. outlier), sem regressão.
+- `dart test`: 102 testes passando (0 falhas), `dart analyze`: 0 issues.
+- visual stroke test: 9402 non-white pixels (consistente).
+- Integração comp-ops no rasterizador:
+  - Os 28 comp-ops do `BLCompOpKernel` agora estão conectados end-to-end no resolve de cobertura (`_resolveMaskedCoverage*`).
+  - Anteriormente, o resolve usava `BLCompOpKernel.srcOver()` fixo mesmo quando outro comp-op era selecionado.
+  - Agora, `BLCompOpKernel.compose(compOp, dst, src)` é chamado para todos os modos não-fast-path.
+  - Fast-path opaco preservado para `srcOver/srcCopy` com cobertura total e alpha=255.
+  - Teste `srcCopy` corrigido para refletir o comportamento correto (source replace, não fallback para srcOver).
+- Text API (port de Fase 11, inspirado em `context.h` `fillText`/`strokeText`):
+  - `BLContext.fillText(String, BLFont, {x, y, color})` — shape + render all glyphs filled.
+  - `BLContext.strokeText(String, BLFont, {x, y, color, options})` — shape + render all glyphs stroked.
+  - `BLContext.fillGlyphRun(BLGlyphRun, BLFont, {color})` — render pre-shaped glyph run filled.
+  - `BLContext.strokeGlyphRun(BLGlyphRun, BLFont, {color, options})` — render pre-shaped glyph run stroked.
+  - Cada glifo é traduzido para sua posição de placement e renderizado via `fillPolygon`/`strokePath` existentes.
+- CFF/Type2 charstring decoder (port de `otcff.cpp`):
+  - Novo arquivo `text/bl_cff.dart` com `BLCFFDecoder.decodeGlyph()`.
+  - Parser de CFF INDEX v1 (`_CFFIndex.parse()`) com suporte a offset sizes 1-4.
+  - Interpretador de charstrings Type 2 com todos os operadores de outline:
+    - `rmoveto/hmoveto/vmoveto`, `rlineto/hlineto/vlineto`,
+    - `rrcurveto/hhcurveto/vvcurveto/hvcurveto/vhcurveto`,
+    - `rcurveline/rlinecurve`,
+    - `hflex/flex/hflex1/flex1` (escape operators),
+    - `hstem/vstem/hstemhm/vstemhm/hintmask/cntrmask` (hints — consumidos, não afetam outline),
+    - `endchar`.
+  - Parser de TopDict para localizar offset do CharStrings INDEX.
+  - `BLFontFace` atualizado:
+    - Novos campos: `hasCFFOutlines`, `cffOffset`, `cffLength`.
+    - `glyphOutlineUnits()` agora faz fallback para CFF quando TrueType outlines não existem.
+    - `parse()` detecta a tabela `'CFF '` e preenche os campos CFF.
+  - Barril export atualizado com `text/bl_cff.dart`.
+- Sessão acelerada 3 (CFF subrs + dasher + drawImage + circle + GSUB/GPOS + glyph cache):
+  - rodada formal 10x pós-sessão: média `1.884ms/frame` (faixa `1.752..2.059ms`) e `10641 poly/s` — zero regressão.
+  - `dart test`: 115 testes passando (0 falhas), `dart analyze`: 0 issues.
+  - CFF Subroutines (`callsubr`/`callgsubr`/`return`):
+    - Operadores Type 2 `callsubr` (op 10), `callgsubr` (op 29), `return` (op 11) implementados.
+    - Bias calculado por spec CFF (107/1131/32768).
+    - Call stack com profundidade máxima 10.
+    - Parser de Private DICT (op 18) e local subr offset (op 19).
+    - GSubR INDEX parsing no fluxo principal de `decodeGlyph`.
+  - Dash Pattern (`BLDasher`):
+    - Novo `geometry/bl_dasher.dart` — converte path sólido em path tracejado.
+    - Suporte a padrões arbitrários e dash offset.
+    - `BLContext.strokeDashedPath()` integrado.
+  - globalAlpha integrado no pipeline:
+    - `globalAlpha` agora modula o canal alpha da cor sólida em `fillPolygon()`.
+  - clipRect integrado no pipeline:
+    - Clip rect faz rejeição por bounding-box em `fillPolygon()`.
+    - Também aplicado em `drawImage()`.
+  - drawImage:
+    - `BLContext.drawImage(BLImage, {dx, dy})` — composição pixel-a-pixel.
+    - Usa `BLCompOpKernel.compose()` para todos os 28 modos.
+    - Respeita globalAlpha e clipRect.
+  - Geometry convenience APIs:
+    - `fillCircle/strokeCircle/fillEllipse/strokeEllipse` via Bézier 4-quadrante (k ≈ 0.5522847498).
+  - **GSUB/GPOS Layout Engine** (port de `otlayout.cpp`/`otlayouttables_p.h`):
+    - Novo `text/bl_opentype_layout.dart` com `BLLayoutEngine`.
+    - **GSUB Type 1** (SingleSubst): formatos 1 (delta) e 2 (array), com CoverageTable (formats 1+2, binary search).
+    - **GSUB Type 4** (LigatureSubst): formato 1 com matching de componentes.
+    - **GPOS Type 2** (PairAdjustment): formato 1 com PairSets e ValueRecords.
+    - CoverageTable parser completo (format 1 = sorted glyphs, format 2 = ranges).
+    - ValueRecord reader para flags `xPlacement/yPlacement/xAdvance/yAdvance`.
+    - Extension lookup resolution (GSUB type 7, GPOS type 9).
+    - Feature list parser com coleta de lookup indices por feature tags.
+    - `applyGSUB(glyphIds, {features})` — substitui glifos via features (liga/clig/rlig).
+    - `applyGPOS(glyphIds, {features})` — retorna x-advance adjustments via features (kern).
+    - `BLFontFace` atualizado:
+      - Novos campos: `gsubOffset/gsubLength/gposOffset/gposLength`.
+      - Lazy-initialized `layoutEngine` getter para acesso ao `BLLayoutEngine`.
+      - `parse()` detecta tabelas `'GSUB'` e `'GPOS'`.
+  - **Glyph Cache** (`text/bl_glyph_cache.dart`):
+    - `BLGlyphCache` com LRU eviction.
+    - Keyed por `(fontFaceId, glyphId, fontSize*64)`.
+    - Limites configuráveis de entries (default 4096) e memória (default 16MB).
+    - `BLGlyphCacheEntry` com bitmap A8, bearings, dimensões.
+    - Hit-rate tracking e cache statistics.
+    - `evictFont()` para eviction per-font.
+  - Barril export atualizado com `bl_opentype_layout.dart` e `bl_glyph_cache.dart`.
 
 ## 1) Princípios de engenharia (não negociáveis)
 
@@ -334,17 +453,18 @@ Entregáveis:
 Critério de saída:
 - Qualidade equivalente ao pipeline Blend2D atual do projeto, sem artefatos de “linha fantasma”.
 
-## Fase 3 - Pipeline de composição (1 semana)
+## Fase 3 - Pipeline de composição (1 semana) ✅ CONCLUÍDA
 
 Entregáveis:
-- kernels de comp-op em Dart:
-  - `SrcCopy`, `SrcOver` (prioridade)
-  - preparar infraestrutura para `Multiply`, `Screen`, etc.
-- caminho premultiplied consistente
-- clamp/saturate sem custo desnecessário
+- ✅ kernels de comp-op em Dart:
+  - ✅ `SrcCopy`, `SrcOver` (prioridade)
+  - ✅ Todos os 28 operadores de composição do Blend2D C++ implementados
+  - ✅ Módulo `pixelops/bl_pixelops.dart` com premultiply/unpremultiply/udiv255
+- ✅ caminho premultiplied consistente
+- ✅ clamp/saturate sem custo desnecessário
 
 Critério de saída:
-- Render final idêntico (ou erro mínimo) nos casos sólidos e alpha.
+- ✅ Render final idêntico (ou erro mínimo) nos casos sólidos e alpha.
 
 ## Fase 4 - Fetchers e estilos (1-2 semanas)
 
@@ -357,15 +477,16 @@ Entregáveis:
 Critério de saída:
 - SVGs com gradientes principais renderizando sem fallback para outros rasterizadores.
 
-## Fase 5 - Stroke/path robusto (1-2 semanas)
+## Fase 5 - Stroke/path robusto (1-2 semanas) ✅ CONCLUÍDA
 
 Entregáveis:
-- stroker (miter/round/bevel, cap butt/round/square)
-- flatten adaptativo de curvas
-- tratamento robusto de joins e caps em subpixel
+- ✅ stroker (miter/round/bevel, cap butt/round/square/roundRev/triangle/triangleRev)
+- ✅ flatten adaptativo de curvas (De Casteljau)
+- ✅ tratamento robusto de joins e caps em subpixel
+- ✅ paridade geométrica fina com C++ Blend2D (`q = normal(p1-p0)*0.5`)
 
 Critério de saída:
-- linhas finas e contornos equivalentes ao Marlin/AMCAD visualmente.
+- ✅ linhas finas e contornos equivalentes ao Marlin/AMCAD visualmente.
 
 ## Fase 6 - Paralelismo real (1 semana)
 
@@ -404,14 +525,14 @@ Entregáveis:
 Critério de saída:
 - carregar fontes reais e mapear código Unicode -> glyph ID corretamente.
 
-## Fase 9 - Shaping e layout de texto (1-2 semanas)
+## Fase 9 - Shaping e layout de texto (1-2 semanas) — PARCIALMENTE CONCLUÍDA
 
 Entregáveis:
 - Pipeline de shaping em Dart:
   - segmentação por script/língua
   - bidi por runs
-  - aplicação incremental de `GSUB/GPOS` (subset inicial)
-- Kerning e advance positioning corretos.
+  - ✅ aplicação incremental de `GSUB/GPOS` (subset inicial — SingleSubst + LigatureSubst + PairAdjustment)
+- ✅ Kerning e advance positioning corretos (via GPOS PairAdjustment format 1 + legacy kern).
 - API mínima:
   - `shapeText(String text, TextStyle style) -> GlyphRun`
   - `measureText(...)`
@@ -419,13 +540,13 @@ Entregáveis:
 Critério de saída:
 - palavras latinas e casos com ligaduras/kerning renderizando com posicionamento estável.
 
-## Fase 10 - Rasterização de glyphs e cache (1-2 semanas)
+## Fase 10 - Rasterização de glyphs e cache (1-2 semanas) — PARCIALMENTE CONCLUÍDA
 
 Entregáveis:
 - Raster de glyph por cobertura (grayscale AA) em puro Dart.
-- Cache de glyph por chave:
-  - `(fontId, glyphId, size, transformHint, renderMode)`
-- Atlas de glyphs (ou cache por tiles) com política de eviction.
+- ✅ Cache de glyph por chave:
+  - `(fontFaceId, glyphId, fontSize*64)`
+- ✅ Atlas de glyphs com LRU eviction e limites configuráveis (entries + memória).
 - Composição de glyph no mesmo pipeline de spans/composition.
 
 Critério de saída:
@@ -528,26 +649,32 @@ Marco M6:
 ## 8) Plano de arquivos (bootstrap imediato)
 
 Criar (ou preencher) em `lib/src/blend2d`:
-- `context/bl_context.dart`
-- `core/bl_types.dart`
-- `core/bl_compop.dart`
-- `geometry/bl_path.dart`
-- `raster/bl_edge_builder.dart`
-- `raster/bl_analytic_rasterizer.dart`
-- `pipeline/bl_compop_kernel.dart`
-- `pipeline/bl_fetch_solid.dart`
-- `text/bl_font.dart`
-- `text/bl_font_loader.dart`
-- `text/bl_opentype_parser.dart`
-- `text/bl_shaper.dart`
-- `text/bl_glyph_run.dart`
-- `text/bl_glyph_cache.dart`
-- `text/bl_text_layout.dart`
-- `unicode/bl_bidi.dart`
-- `unicode/bl_script_runs.dart`
-- `tables/bl_unicode_tables.dart`
-- `threading/bl_isolate_pool.dart`
-- `blend2d.dart` (barrel export interno)
+- ✅ `context/bl_context.dart` — save/restore, clip rect, transform, fillRect/strokeRect
+- ✅ `core/bl_types.dart` — 28 comp-ops, BLMatrix2D, BLRectI, stroke types
+- ✅ `geometry/bl_path.dart` — path com flatten de curvas
+- ✅ `geometry/bl_stroker.dart` — stroker com paridade geométrica C++
+- ✅ `raster/bl_edge_builder.dart`
+- ✅ `raster/bl_analytic_rasterizer.dart` — cover/area analítico
+- ✅ `raster/bl_edge_storage.dart` — SoA + buckets
+- ✅ `raster/bl_raster_defs.dart` — constantes A8
+- ✅ `pipeline/bl_compop_kernel.dart` — 28 comp-ops completos
+- ✅ `pipeline/bl_fetch_solid.dart`
+- ✅ `pipeline/bl_fetch_linear_gradient.dart`
+- ✅ `pipeline/bl_fetch_radial_gradient.dart`
+- ✅ `pipeline/bl_fetch_pattern.dart` — nearest/bilinear/affine
+- ✅ `pixelops/bl_pixelops.dart` — premultiply/unpremultiply/udiv255/swizzle
+- ✅ `text/bl_font.dart` — OpenType parser completo
+- ✅ `text/bl_font_loader.dart`
+- 🔲 `text/bl_opentype_parser.dart` — GSUB/GPOS ainda não portado
+- 🔲 `text/bl_shaper.dart` — shaping avançado pendente
+- ✅ `text/bl_glyph_run.dart`
+- 🔲 `text/bl_glyph_cache.dart` — atlas com eviction pendente
+- ✅ `text/bl_text_layout.dart`
+- 🔲 `unicode/bl_bidi.dart` — bidi pendente
+- 🔲 `unicode/bl_script_runs.dart` — script runs pendente
+- 🔲 `tables/bl_unicode_tables.dart` — tabelas Unicode pendentes
+- ✅ `threading/bl_isolate_pool.dart`
+- ✅ `blend2d.dart` (barrel export interno)
 
 ## 9) Riscos e mitigação
 
@@ -585,4 +712,8 @@ Resumo objetivo:
 - Depois expandimos recursos avançados e integração com backend PDF.
 - Tudo guiado por benchmark e validação visual contínua.
 
-Próxima fatia grande que recomendo: fechar paridade geométrica fina do stroker com o Blend2D C++ (foco em `square cap` simétrico + validação visual dedicada), mantendo o protocolo de decisão por benchmark em rodada mínima de 10 execuções antes de qualquer reversão.
+Próxima fatia grande recomendada:
+- **Fase 9 (shaping)**: iniciar port de GSUB/GPOS do OpenType para suporte a ligaduras e kerning avançado.
+- **Fase 10 (glyph raster)**: rasterização dedicada de glifos com AA e cache/atlas.
+- **Fase 6 (paralelismo)**: isolate pool real por tiles sujos para throughput em cenas grandes.
+- Alternativamente: integração dos 28 comp-ops no resolve do rasterizador (atualmente o resolve só usa srcOver/srcCopy inline; o dispatch generalizado via `BLCompOpKernel.compose()` pode ser conectado para os modos avançados), mantendo o protocolo de decisão por benchmark em rodada mínima de 10 execuções antes de qualquer reversão.

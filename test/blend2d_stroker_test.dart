@@ -1,4 +1,3 @@
-
 import 'package:test/test.dart';
 import '../lib/src/blend2d/geometry/bl_path.dart';
 import '../lib/src/blend2d/geometry/bl_stroker.dart';
@@ -13,7 +12,8 @@ void main() {
 
       final outline = BLStroker.strokePath(
         path,
-        const BLStrokeOptions(width: 10.0, startCap: BLStrokeCap.butt, endCap: BLStrokeCap.butt),
+        const BLStrokeOptions(
+            width: 10.0, startCap: BLStrokeCap.butt, endCap: BLStrokeCap.butt),
       );
       final data = outline.toPathData();
 
@@ -139,7 +139,8 @@ void main() {
 
       final outline = BLStroker.strokePath(
         path,
-        const BLStrokeOptions(width: 6.0, startCap: BLStrokeCap.round, endCap: BLStrokeCap.round),
+        const BLStrokeOptions(
+            width: 6.0, startCap: BLStrokeCap.round, endCap: BLStrokeCap.round),
       );
       final data = outline.toPathData();
 
@@ -181,6 +182,127 @@ void main() {
       }
     });
 
+    test(
+        'square cap extends FORWARD by hw beyond endpoints (C++ Blend2D parity)',
+        () {
+      // Horizontal line (50,50) -> (150,50), width=20 (hw=10).
+      // Square cap should extend the stroke by hw=10 BEYOND each endpoint:
+      //   start: x should reach 50 - 10 = 40
+      //   end:   x should reach 150 + 10 = 160
+      final path = BLPath();
+      path.moveTo(50, 50);
+      path.lineTo(150, 50);
+
+      final outline = BLStroker.strokePath(
+        path,
+        const BLStrokeOptions(
+          width: 20.0,
+          startCap: BLStrokeCap.square,
+          endCap: BLStrokeCap.square,
+        ),
+      );
+      final data = outline.toPathData();
+
+      double minX = double.infinity;
+      double maxX = double.negativeInfinity;
+      double minY = double.infinity;
+      double maxY = double.negativeInfinity;
+      for (int i = 0; i < data.vertices.length; i += 2) {
+        final x = data.vertices[i];
+        final y = data.vertices[i + 1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+
+      // Forward extension: minX should be exactly 50 - hw = 40
+      expect(minX, closeTo(40.0, 0.01),
+          reason: 'Square cap start should extend hw=10 before x=50');
+      // Forward extension: maxX should be exactly 150 + hw = 160
+      expect(maxX, closeTo(160.0, 0.01),
+          reason: 'Square cap end should extend hw=10 beyond x=150');
+      // Y span should be exactly width=20: 50 ± 10
+      expect(minY, closeTo(40.0, 0.01));
+      expect(maxY, closeTo(60.0, 0.01));
+    });
+
+    test('triangle cap tip extends beyond pivot (C++ Blend2D parity)', () {
+      // Horizontal line (50,50) -> (150,50), width=20 (hw=10).
+      // Triangle cap tip should be at (pivot + q) where q extends forward by hw.
+      final path = BLPath();
+      path.moveTo(50, 50);
+      path.lineTo(150, 50);
+
+      final outline = BLStroker.strokePath(
+        path,
+        const BLStrokeOptions(
+          width: 20.0,
+          startCap: BLStrokeCap.triangle,
+          endCap: BLStrokeCap.triangle,
+        ),
+      );
+      final data = outline.toPathData();
+
+      double minX = double.infinity;
+      double maxX = double.negativeInfinity;
+      for (int i = 0; i < data.vertices.length; i += 2) {
+        final x = data.vertices[i];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+      }
+
+      // Triangle cap should extend to pivot + q, i.e. 50 - 10 = 40 and 150 + 10 = 160
+      expect(minX, closeTo(40.0, 0.01),
+          reason: 'Triangle cap should extend hw beyond start pivot');
+      expect(maxX, closeTo(160.0, 0.01),
+          reason: 'Triangle cap should extend hw beyond end pivot');
+    });
+
+    test('square cap on diagonal line extends symmetrically (C++ parity)', () {
+      // Diagonal line (50,50) -> (150,150), width=20 (hw=10).
+      // Square cap extends in the direction perpendicular to (p1-p0), i.e. along
+      // the tangent of the original segment, by hw from each endpoint.
+      final path = BLPath();
+      path.moveTo(50, 50);
+      path.lineTo(150, 150);
+
+      final outline = BLStroker.strokePath(
+        path,
+        const BLStrokeOptions(
+          width: 20.0,
+          startCap: BLStrokeCap.square,
+          endCap: BLStrokeCap.square,
+        ),
+      );
+      final data = outline.toPathData();
+
+      double minX = double.infinity;
+      double maxX = double.negativeInfinity;
+      double minY = double.infinity;
+      double maxY = double.negativeInfinity;
+      for (int i = 0; i < data.vertices.length; i += 2) {
+        final x = data.vertices[i];
+        final y = data.vertices[i + 1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+
+      // For a 45-degree line, the hw=10 stroke crosses ±10/sqrt(2) ≈ ±7.071
+      // in each axis from the line, plus the square cap extends hw=10 along
+      // the tangent direction, adding another 10/sqrt(2) ≈ 7.071 beyond end.
+      // Total X span: (50 - 7.071 - 7.071) to (150 + 7.071 + 7.071)
+      // ≈ 35.86 to 164.14
+      final double hw = 10.0;
+      final double d = hw / 1.4142135623730951; // hw / sqrt(2)
+      expect(minX, closeTo(50 - d - d, 0.5));
+      expect(maxX, closeTo(150 + d + d, 0.5));
+      expect(minY, closeTo(50 - d - d, 0.5));
+      expect(maxY, closeTo(150 + d + d, 0.5));
+    });
+
     test('BLStrokeOptions copyWith preserves defaults', () {
       const opts = BLStrokeOptions();
       final copy = opts.copyWith(width: 5.0);
@@ -198,7 +320,10 @@ void main() {
         path.lineTo(100, 50);
         final outline = BLStroker.strokePath(
           path,
-          BLStrokeOptions(width: width, startCap: BLStrokeCap.butt, endCap: BLStrokeCap.butt),
+          BLStrokeOptions(
+              width: width,
+              startCap: BLStrokeCap.butt,
+              endCap: BLStrokeCap.butt),
         );
         final data = outline.toPathData();
         // Measure bounding box height as proxy for stroke width
