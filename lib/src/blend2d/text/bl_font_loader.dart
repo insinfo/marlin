@@ -133,31 +133,102 @@ class BLFontLoader {
   /// que uma fonte defeituosa do sistema não invalide o catálogo inteiro.
   /// [onError] permite registrar esses casos. [maxFonts] limita o consumo de
   /// memória em dispositivos móveis; `null` tenta carregar todas as faces.
+  /// [concurrency] controla quantos arquivos são lidos em paralelo. O parsing
+  /// continua determinístico e as faces são adicionadas na ordem dos caminhos.
   Future<int> loadSystemFonts(
     BLFontCollection collection, {
     List<String>? directories,
     int? maxFonts,
+    int concurrency = 8,
     void Function(String path, Object error)? onError,
   }) async {
     if (maxFonts != null && maxFonts < 0) {
       throw ArgumentError.value(maxFonts, 'maxFonts', 'deve ser nulo ou >= 0');
     }
+    if (concurrency < 1) {
+      throw ArgumentError.value(concurrency, 'concurrency', 'deve ser >= 1');
+    }
     if (maxFonts == 0) return 0;
     final files = await discoverSystemFontFiles(directories: directories);
     var loaded = 0;
-    for (final path in files) {
-      if (maxFonts != null && loaded >= maxFonts) break;
-      try {
-        final faces = await loadFileFaces(path);
-        for (final face in faces) {
-          if (maxFonts != null && loaded >= maxFonts) break;
-          collection.addFace(face);
-          loaded++;
+    var cursor = 0;
+    while (cursor < files.length && (maxFonts == null || loaded < maxFonts)) {
+      final remaining = maxFonts == null ? concurrency : maxFonts - loaded;
+      final count = remaining < concurrency ? remaining : concurrency;
+      final end = (cursor + count).clamp(0, files.length);
+      final reads = await Future.wait([
+        for (final path in files.sublist(cursor, end)) _readFont(path),
+      ]);
+      cursor = end;
+      for (final read in reads) {
+        if (maxFonts != null && loaded >= maxFonts) break;
+        if (read.error != null) {
+          onError?.call(read.path, read.error!);
+          continue;
         }
-      } on Object catch (error) {
-        onError?.call(path, error);
+        try {
+          final faces = loadFaces(read.data!);
+          for (final face in faces) {
+            if (maxFonts != null && loaded >= maxFonts) break;
+            collection.addFace(face);
+            loaded++;
+          }
+        } on Object catch (error) {
+          onError?.call(read.path, error);
+        }
       }
     }
     return loaded;
+  }
+
+  /// Carrega arquivos do catálogo nativo até encontrar uma face para [query].
+  ///
+  /// É o caminho indicado para fallback sob demanda: evita analisar centenas
+  /// de fontes quando o documento precisa de apenas uma família. As faces já
+  /// examinadas permanecem em [collection] e podem atender consultas futuras.
+  Future<BLFontFace?> loadSystemFont(
+    BLFontCollection collection,
+    BLFontQuery query, {
+    List<String>? directories,
+    int concurrency = 4,
+    void Function(String path, Object error)? onError,
+  }) async {
+    if (concurrency < 1) {
+      throw ArgumentError.value(concurrency, 'concurrency', 'deve ser >= 1');
+    }
+    final existing = collection.resolveLocal(query);
+    if (existing != null) return existing;
+    final files = await discoverSystemFontFiles(directories: directories);
+    for (var cursor = 0; cursor < files.length; cursor += concurrency) {
+      final end = (cursor + concurrency).clamp(0, files.length);
+      final reads = await Future.wait([
+        for (final path in files.sublist(cursor, end)) _readFont(path),
+      ]);
+      for (final read in reads) {
+        if (read.error != null) {
+          onError?.call(read.path, read.error!);
+          continue;
+        }
+        try {
+          for (final face in loadFaces(read.data!)) {
+            collection.addFace(face);
+          }
+        } on Object catch (error) {
+          onError?.call(read.path, error);
+        }
+      }
+      final match = collection.resolveLocal(query);
+      if (match != null) return match;
+    }
+    return null;
+  }
+
+  Future<({String path, Uint8List? data, Object? error})> _readFont(
+      String path) async {
+    try {
+      return (path: path, data: await File(path).readAsBytes(), error: null);
+    } on Object catch (error) {
+      return (path: path, data: null, error: error);
+    }
   }
 }

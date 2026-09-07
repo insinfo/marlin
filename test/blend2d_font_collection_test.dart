@@ -164,4 +164,54 @@ void main() {
     expect(count, 1);
     expect(collection.faces, hasLength(1));
   });
+
+  test('carregamento nativo valida concorrência e preserva ordem', () async {
+    final root = await Directory.systemTemp.createTemp('dgfx-batch-fonts-');
+    addTearDown(() => root.delete(recursive: true));
+    await File('${root.path}/b.otf').writeAsBytes(_font('Beta-Regular'));
+    await File('${root.path}/a.otf').writeAsBytes(_font('Alpha-Regular'));
+    final collection = BLFontCollection();
+
+    final count = await const BLFontLoader().loadSystemFonts(
+      collection,
+      directories: [root.path],
+      concurrency: 2,
+    );
+
+    expect(count, 2);
+    expect(collection.faces.map((face) => face.familyName), ['Alpha', 'Beta']);
+    await expectLater(
+      const BLFontLoader().loadSystemFonts(collection,
+          directories: [root.path], concurrency: 0),
+      throwsArgumentError,
+    );
+  });
+
+  test('busca seletiva para ao encontrar a família solicitada', () async {
+    final root = await Directory.systemTemp.createTemp('dgfx-find-font-');
+    addTearDown(() => root.delete(recursive: true));
+    await File('${root.path}/a.otf').writeAsBytes(_font('Alpha-Regular'));
+    await File('${root.path}/b.otf').writeAsBytes(_font('Beta-Regular'));
+    await File('${root.path}/c.otf').writeAsBytes(_font('Gamma-Regular'));
+    final collection = BLFontCollection();
+
+    final face = await const BLFontLoader().loadSystemFont(
+      collection,
+      const BLFontQuery(['Beta']),
+      directories: [root.path],
+      concurrency: 1,
+    );
+
+    expect(face?.familyName, 'Beta');
+    expect(collection.faces.map((face) => face.familyName), ['Alpha', 'Beta']);
+    await expectLater(
+      const BLFontLoader().loadSystemFont(
+        collection,
+        const BLFontQuery(['Missing']),
+        directories: [root.path],
+        concurrency: 0,
+      ),
+      throwsArgumentError,
+    );
+  });
 }
