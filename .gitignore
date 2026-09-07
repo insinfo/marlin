@@ -2,4 +2,9 @@
 pubspec.lock
 referencias/
 
-tmp/*.ppm
+tmp/
+
+# Dumps de inspeção visual gerados pelos benchmarks.
+*.ppm
+output/
+
