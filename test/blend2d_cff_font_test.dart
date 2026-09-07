@@ -59,6 +59,23 @@ Uint8List _cffIndex(List<Uint8List> entries) {
   return out.toBytes();
 }
 
+Uint8List _cff2Index(List<Uint8List> entries) {
+  final out = BytesBuilder();
+  _u32(out, entries.length);
+  if (entries.isEmpty) return out.toBytes();
+  _u8(out, 2);
+  var offset = 1;
+  _u16(out, offset);
+  for (final entry in entries) {
+    offset += entry.length;
+    _u16(out, offset);
+  }
+  for (final entry in entries) {
+    out.add(entry);
+  }
+  return out.toBytes();
+}
+
 /// Operando inteiro de DICT no formato de 5 bytes (`29` + int32).
 ///
 /// Sempre o mesmo tamanho, o que mantém o Top DICT estável entre as duas
@@ -398,7 +415,8 @@ Uint8List _buildCidCff({required bool fdSelectFormat3, int? fdSelectSentinel}) {
 }
 
 /// Embrulha um CFF num sfnt OpenType mínimo (`OTTO` + `CFF ` + `head` + `maxp`).
-Uint8List wrapInOpenType(Uint8List cff, int glyphCount, int unitsPerEm) {
+Uint8List wrapInOpenType(Uint8List cff, int glyphCount, int unitsPerEm,
+    {String cffTag = 'CFF '}) {
   final head = BytesBuilder();
   _u32(head, 0x00010000);
   _u32(head, 0x00010000);
@@ -424,7 +442,7 @@ Uint8List wrapInOpenType(Uint8List cff, int glyphCount, int unitsPerEm) {
   _u16(maxp, glyphCount); // offset 4
 
   final tables = <String, Uint8List>{
-    'CFF ': cff,
+    cffTag: cff,
     'head': head.toBytes(),
     'maxp': maxp.toBytes(),
   };
@@ -455,6 +473,56 @@ Uint8List wrapInOpenType(Uint8List cff, int glyphCount, int unitsPerEm) {
     ..add(directory.toBytes())
     ..add(body.toBytes());
   return file.toBytes();
+}
+
+Uint8List _buildCff2(List<Uint8List> charstrings,
+    {bool withVariationStore = false}) {
+  final globalSubrs = _cff2Index(const <Uint8List>[]);
+  final charStrings = _cff2Index(charstrings);
+  final variationStore = BytesBuilder();
+  if (withVariationStore) {
+    _u16(variationStore, 1); // ItemVariationStore format
+    _u32(variationStore, 20); // VariationRegionList offset
+    _u16(variationStore, 1); // uma ItemVariationData
+    _u32(variationStore, 12); // offset da ItemVariationData
+    _u16(variationStore, 0); // itemCount (irrelevante para blend)
+    _u16(variationStore, 0); // shortDeltaCount
+    _u16(variationStore, 1); // regionIndexCount
+    _u16(variationStore, 0); // region index
+    _u16(variationStore, 1); // axisCount
+    _u16(variationStore, 1); // regionCount
+    _u16(variationStore, 0); // startCoord
+    _u16(variationStore, 0x4000); // peakCoord = 1
+    _u16(variationStore, 0x4000); // endCoord = 1
+  }
+  final variationBytes = variationStore.toBytes();
+  Uint8List topDict(int charStringsOffset, int variationOffset) {
+    final out = BytesBuilder();
+    if (withVariationStore) {
+      _dictInt(out, variationOffset);
+      _dictOp(out, 24);
+    }
+    _dictInt(out, charStringsOffset);
+    _dictOp(out, 17);
+    return out.toBytes();
+  }
+
+  final probe = topDict(0, 0);
+  const headerSize = 5;
+  final variationOffset = headerSize + probe.length + globalSubrs.length;
+  final charStringsOffset = variationOffset + variationBytes.length;
+  final top = topDict(charStringsOffset, variationOffset);
+  final out = BytesBuilder();
+  _u8(out, 2);
+  _u8(out, 0);
+  _u8(out, headerSize);
+  _u16(out, top.length);
+  return (out
+        ..add(top)
+        ..add(globalSubrs)
+        ..add(variationBytes)
+        ..add(charStrings))
+      .toBytes();
 }
 
 /// Caixa envolvente de um contorno, em unidades de fonte.
@@ -762,6 +830,56 @@ void main() {
       expect(box.right, closeTo(500, 0.001));
       expect(box.top, closeTo(-700, 0.001));
       expect(box.bottom, closeTo(-50, 0.001));
+    });
+  });
+
+  group('OpenType/CFF2', () {
+    final cff2 = _buildCff2(<Uint8List>[_rectOps(20, 30, 220, 330)]);
+    final otf = wrapInOpenType(cff2, 1, 1000, cffTag: 'CFF2');
+
+    test('reconhece a tabela e o INDEX com contagem de 32 bits', () {
+      final face = BLFontFace.parse(otf);
+
+      expect(face.hasCFFOutlines, isTrue);
+      expect(face.hasTrueTypeOutlines, isFalse);
+      expect(face.glyphCount, 1);
+      expect(face.cffInfo?.glyphCount, 1);
+    });
+
+    test('decodifica charstring sem endchar', () {
+      final face = BLFontFace.parse(otf);
+      final box = _boxOf(face.glyphOutlineUnits(0)!);
+
+      expect(box.left, closeTo(20, .001));
+      expect(box.right, closeTo(220, .001));
+      expect(box.top, closeTo(-330, .001));
+      expect(box.bottom, closeTo(-30, .001));
+    });
+
+    test('blend conserva valores-base da instância variável padrão', () {
+      final program = BytesBuilder();
+      _csNum(program, 0);
+      _u8(program, 15); // vsindex
+      // Dois valores-base, um delta para cada valor, quantidade e blend.
+      for (final value in <int>[20, 30, 500, 600, 2]) {
+        _csNum(program, value);
+      }
+      _u8(program, 16); // blend
+      _u8(program, 21); // rmoveto usa os dois valores-base
+      for (final value in <int>[200, 0, 0, 300, -200, 0]) {
+        _csNum(program, value);
+      }
+      _u8(program, 5); // rlineto
+      final variable =
+          _buildCff2(<Uint8List>[program.toBytes()], withVariationStore: true);
+      final face =
+          BLFontFace.parse(wrapInOpenType(variable, 1, 1000, cffTag: 'CFF2'));
+      final box = _boxOf(face.glyphOutlineUnits(0)!);
+
+      expect(box.left, closeTo(20, .001));
+      expect(box.right, closeTo(220, .001));
+      expect(box.top, closeTo(-330, .001));
+      expect(box.bottom, closeTo(-30, .001));
     });
   });
 

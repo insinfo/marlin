@@ -26,9 +26,10 @@ class _CFFIndex {
 
   /// Posição onde este INDEX começa (o campo `count`).
   final int start;
+  final int countSize;
 
   const _CFFIndex(this.count, this.offsetSize, this.offsetsStart,
-      this.dataStart, this.view, this.start);
+      this.dataStart, this.view, this.start, this.countSize);
 
   /// Total de bytes ocupados por este INDEX.
   ///
@@ -38,7 +39,7 @@ class _CFFIndex {
   /// deslocamento inicial duas vezes e fazia o parser errar o String INDEX e
   /// o Global Subr INDEX em qualquer CFF que não começasse no offset zero.
   int get totalSize {
-    if (count == 0) return 2; // INDEX vazio ocupa só os 2 bytes do count
+    if (count == 0) return countSize;
     final end = dataStart + _readOffset(count) - 1;
     return end - start;
   }
@@ -74,20 +75,24 @@ class _CFFIndex {
   }
 
   /// Parse a CFF v1 INDEX starting at [offset].
-  static _CFFIndex? parse(ByteData view, int offset) {
-    if (offset < 0 || offset + 2 > view.lengthInBytes) return null;
-    final count = view.getUint16(offset, Endian.big);
+  static _CFFIndex? parse(ByteData view, int offset, {int countSize = 2}) {
+    if (countSize != 2 && countSize != 4) return null;
+    if (offset < 0 || offset + countSize > view.lengthInBytes) return null;
+    final count = countSize == 2
+        ? view.getUint16(offset, Endian.big)
+        : view.getUint32(offset, Endian.big);
     if (count == 0) {
-      return _CFFIndex(0, 0, offset + 2, offset + 2, view, offset);
+      return _CFFIndex(0, 0, offset + countSize, offset + countSize, view,
+          offset, countSize);
     }
-    if (offset + 3 > view.lengthInBytes) return null;
-    final offSize = view.getUint8(offset + 2);
+    if (offset + countSize + 1 > view.lengthInBytes) return null;
+    final offSize = view.getUint8(offset + countSize);
     if (offSize < 1 || offSize > 4) return null;
-    final offsetsStart = offset + 3;
+    final offsetsStart = offset + countSize + 1;
     final dataStart = offsetsStart + (count + 1) * offSize;
     if (dataStart > view.lengthInBytes) return null;
-    final index =
-        _CFFIndex(count, offSize, offsetsStart, dataStart, view, offset);
+    final index = _CFFIndex(
+        count, offSize, offsetsStart, dataStart, view, offset, countSize);
     // O ultimo offset marca o fim dos dados; se ele estoura o buffer, o INDEX
     // esta truncado e não pode ser usado.
     if (index.endOffset > view.lengthInBytes) return null;
@@ -111,6 +116,8 @@ class _T2Op {
   static const int callsubr = 10;
   static const int returnOp = 11;
   static const int endchar = 14;
+  static const int vsindex = 15;
+  static const int blend = 16;
   static const int hstemhm = 18;
   static const int hintmask = 19;
   static const int cntrmask = 20;
@@ -140,6 +147,7 @@ bool _interpretCharstring(
   double offsetY, {
   _CFFIndex? localSubrs,
   _CFFIndex? globalSubrs,
+  List<int> variationRegionCounts = const <int>[],
 }) {
   final stack = Float64List(48); // CFF operand stack (max 48 per spec)
   int sp = 0; // stack pointer
@@ -147,6 +155,7 @@ bool _interpretCharstring(
   bool hasWidth = false;
   bool hasMoveTo = false;
   int stemCount = 0;
+  var variationIndex = 0;
 
   void moveTo(double dx, double dy) {
     x += dx;
@@ -434,6 +443,29 @@ bool _interpretCharstring(
         sp = 0;
         return true;
 
+      case _T2Op.vsindex:
+        if (sp < 1) return false;
+        variationIndex = stack[--sp].toInt();
+        if (variationIndex < 0 ||
+            variationIndex >= variationRegionCounts.length) {
+          return false;
+        }
+        break;
+
+      case _T2Op.blend:
+        if (sp < 1 || variationIndex >= variationRegionCounts.length) {
+          return false;
+        }
+        final valueCount = stack[sp - 1].toInt();
+        final regionCount = variationRegionCounts[variationIndex];
+        final required = valueCount * (regionCount + 1) + 1;
+        if (valueCount < 0 || required > sp) return false;
+        // A instância padrão tem todas as coordenadas normalizadas em zero:
+        // os deltas desaparecem e permanecem apenas os valores-base.
+        final first = sp - required;
+        sp = first + valueCount;
+        break;
+
       case _T2Op.callsubr:
         if (localSubrs == null || sp < 1 || callStack.length >= maxCallDepth) {
           return false;
@@ -634,6 +666,7 @@ class _CFFOp {
   static const int charStrings = 17;
   static const int private = 18;
   static const int localSubrs = 19; // dentro do Private DICT
+  static const int vstore = 24;
   static const int fontMatrix = 1207;
   static const int ros = 1230; // presente apenas em CIDFonts
   static const int fdArray = 1236;
@@ -648,12 +681,14 @@ class _CFFStructure {
   final ByteData view;
   final int cffOffset;
   final int cffEnd;
-  final _CFFIndex nameIndex;
-  final _CFFIndex topDictIndex;
+  final _CFFIndex? nameIndex;
+  final _CFFIndex? topDictIndex;
   final _CFFIndex? stringIndex;
   final _CFFIndex? globalSubrs;
   final Map<int, List<double>> topDict;
   final _CFFIndex charStrings;
+  final bool isCff2;
+  final List<int> variationRegionCounts;
 
   const _CFFStructure({
     required this.view,
@@ -665,6 +700,8 @@ class _CFFStructure {
     required this.globalSubrs,
     required this.topDict,
     required this.charStrings,
+    required this.isCff2,
+    this.variationRegionCounts = const <int>[],
   });
 
   /// INDEX de subrotinas locais, extraido do Private DICT (se houver).
@@ -686,23 +723,24 @@ class _CFFStructure {
     final subrs = privDict[_CFFOp.localSubrs];
     if (subrs == null || subrs.isEmpty) return null;
     // O offset de Subrs é relativo ao início do Private DICT, não ao CFF.
-    final index = _CFFIndex.parse(view, privOffset + subrs.last.toInt());
+    final index = _CFFIndex.parse(view, privOffset + subrs.last.toInt(),
+        countSize: isCff2 ? 4 : 2);
     return index != null && index.endOffset <= cffEnd ? index : null;
   }
 
   /// Subrotinas do Font DICT selecionado por FDSelect num CID-keyed CFF.
   _CFFIndex? localSubrsForGlyph(int glyphId) {
-    if (!topDict.containsKey(_CFFOp.ros)) return localSubrs;
     final fdArrayOperands = topDict[_CFFOp.fdArray];
     final fdSelectOperands = topDict[_CFFOp.fdSelect];
     if (fdArrayOperands == null ||
         fdArrayOperands.isEmpty ||
         fdSelectOperands == null ||
         fdSelectOperands.isEmpty) {
-      return null;
+      return localSubrs;
     }
-    final array =
-        _CFFIndex.parse(view, cffOffset + fdArrayOperands.last.toInt());
+    final array = _CFFIndex.parse(
+        view, cffOffset + fdArrayOperands.last.toInt(),
+        countSize: isCff2 ? 4 : 2);
     if (array == null || array.endOffset > cffEnd) return null;
     final fd =
         _fontDictForGlyph(cffOffset + fdSelectOperands.last.toInt(), glyphId);
@@ -752,9 +790,44 @@ class _CFFStructure {
     final cffEnd = cffOffset + cffLength;
 
     final major = view.getUint8(cffOffset);
-    if (major != 1) return null; // só CFF v1 nesta implementação
+    if (major != 1 && major != 2) return null;
     final headerSize = view.getUint8(cffOffset + 2);
     if (headerSize < 4 || headerSize >= cffLength) return null;
+
+    if (major == 2) {
+      if (headerSize < 5 || cffOffset + 5 > cffEnd) return null;
+      final topDictLength = view.getUint16(cffOffset + 3, Endian.big);
+      final topStart = cffOffset + headerSize;
+      final topEnd = topStart + topDictLength;
+      if (topDictLength <= 0 || topEnd > cffEnd) return null;
+      final topDict = _parseDict(view, topStart, topEnd);
+      final globalSubrs = _CFFIndex.parse(view, topEnd, countSize: 4);
+      if (globalSubrs == null || globalSubrs.endOffset > cffEnd) return null;
+      final csOperands = topDict[_CFFOp.charStrings];
+      if (csOperands == null || csOperands.isEmpty) return null;
+      final charStrings = _CFFIndex.parse(
+          view, cffOffset + csOperands.last.toInt(),
+          countSize: 4);
+      if (charStrings == null ||
+          charStrings.count == 0 ||
+          charStrings.endOffset > cffEnd) {
+        return null;
+      }
+      return _CFFStructure(
+        view: view,
+        cffOffset: cffOffset,
+        cffEnd: cffEnd,
+        nameIndex: null,
+        topDictIndex: null,
+        stringIndex: null,
+        globalSubrs: globalSubrs,
+        topDict: topDict,
+        charStrings: charStrings,
+        isCff2: true,
+        variationRegionCounts:
+            _parseVariationRegionCounts(view, cffOffset, cffEnd, topDict),
+      );
+    }
 
     final nameIndex = _CFFIndex.parse(view, cffOffset + headerSize);
     if (nameIndex == null || nameIndex.endOffset > cffEnd) return null;
@@ -801,8 +874,28 @@ class _CFFStructure {
       globalSubrs: globalSubrs,
       topDict: topDict,
       charStrings: charStrings,
+      isCff2: false,
     );
   }
+}
+
+List<int> _parseVariationRegionCounts(
+    ByteData view, int cffOffset, int cffEnd, Map<int, List<double>> topDict) {
+  final operands = topDict[_CFFOp.vstore];
+  if (operands == null || operands.isEmpty) return const <int>[0];
+  final start = cffOffset + operands.last.toInt();
+  if (start < cffOffset || start + 8 > cffEnd) return const <int>[];
+  if (view.getUint16(start, Endian.big) != 1) return const <int>[];
+  final count = view.getUint16(start + 6, Endian.big);
+  if (count == 0 || start + 8 + count * 4 > cffEnd) return const <int>[];
+  final result = <int>[];
+  for (var i = 0; i < count; i++) {
+    final relative = view.getUint32(start + 8 + i * 4, Endian.big);
+    final data = start + relative;
+    if (data < start || data + 6 > cffEnd) return const <int>[];
+    result.add(view.getUint16(data + 4, Endian.big));
+  }
+  return List<int>.unmodifiable(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,7 +1127,7 @@ class BLCFFInfo {
     }
 
     var name = '';
-    final nameRange = cff.nameIndex.entryRange(0);
+    final nameRange = cff.nameIndex?.entryRange(0);
     if (nameRange != null) {
       name = _latin1(view, nameRange.$1, nameRange.$2);
     }
@@ -1045,7 +1138,7 @@ class BLCFFInfo {
     final nameToGlyphId = <String, int>{};
     var codeToGlyphId = const <int, int>{};
     var cidToGlyphId = const <int, int>{};
-    if (!isCID) {
+    if (!cff.isCff2 && !isCID) {
       final charsetOffset = cff.topDict[_CFFOp.charset]?.last.toInt() ?? 0;
       final sids =
           _parseCharsetSids(view, cffOffset, charsetOffset, glyphCount);
@@ -1067,7 +1160,7 @@ class BLCFFInfo {
           nameToGlyphId,
         );
       }
-    } else {
+    } else if (!cff.isCff2) {
       final charsetOffset = cff.topDict[_CFFOp.charset]?.last.toInt() ?? 0;
       final cids =
           _parseCharsetSids(view, cffOffset, charsetOffset, glyphCount);
@@ -1193,6 +1286,7 @@ class BLCFFDecoder {
       0,
       localSubrs: cff.localSubrsForGlyph(glyphId),
       globalSubrs: cff.globalSubrs,
+      variationRegionCounts: cff.variationRegionCounts,
     );
     if (!ok) return null;
 

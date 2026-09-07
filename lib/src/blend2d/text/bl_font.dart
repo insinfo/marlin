@@ -698,6 +698,7 @@ class BLFontFace {
     final loca = tableMap[_tag('loca')];
     final glyf = tableMap[_tag('glyf')];
     final cffTable = tableMap[_tag('CFF ')];
+    final cff2Table = tableMap[_tag('CFF2')];
     final gsubTable = tableMap[_tag('GSUB')];
     final gposTable = tableMap[_tag('GPOS')];
 
@@ -794,10 +795,13 @@ class BLFontFace {
     bool hasCFFOutlines = false;
     int cffOffsetVal = 0;
     int cffLengthVal = 0;
-    if (!hasTrueTypeOutlines && cffTable != null && cffTable.length > 4) {
+    final outlineTable = cffTable ?? cff2Table;
+    if (!hasTrueTypeOutlines &&
+        outlineTable != null &&
+        outlineTable.length > 4) {
       hasCFFOutlines = true;
-      cffOffsetVal = cffTable.offset;
-      cffLengthVal = cffTable.length;
+      cffOffsetVal = outlineTable.offset;
+      cffLengthVal = outlineTable.length;
     }
 
     bool isSymbolFont = false;
