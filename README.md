@@ -109,7 +109,8 @@ final face = BLFontFace.parse(fontBytes);
 alvo, inclusive web e wasm.
 
 `package:dgfx/dgfx_io.dart` reexporta tudo isso e adiciona os recursos que só
-existem fora do navegador: `BLFontLoader`, que lê fontes do disco, e
+existem fora do navegador: `BLFontLoader`, que descobre fontes do sistema e lê
+fontes OpenType/TrueType/CFF e todas as faces de coleções TTC, e
 `BLIsolatePool`. Importá-lo tira o seu programa da compatibilidade com web —
 use-o apenas em aplicações nativas.
 

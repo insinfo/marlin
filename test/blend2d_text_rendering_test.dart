@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:dgfx/dgfx.dart';
+import 'package:dgfx/dgfx_io.dart';
 import 'package:test/test.dart';
 
 // Monta uma fonte TrueType mínima em memória, com glifos de geometria
@@ -219,6 +219,37 @@ Uint8List _buildFont(List<_Glyph> glyphs, {int firstChar = 0x41}) {
   return file.toBytes();
 }
 
+Uint8List _buildCollection(List<Uint8List> fonts) {
+  final headerLength = 12 + fonts.length * 4;
+  final offsets = <int>[];
+  var offset = headerLength;
+  final relocated = <Uint8List>[];
+  for (final font in fonts) {
+    offsets.add(offset);
+    final copy = Uint8List.fromList(font);
+    final view = ByteData.sublistView(copy);
+    final tables = view.getUint16(4, Endian.big);
+    for (var i = 0; i < tables; i++) {
+      final record = 12 + i * 16;
+      view.setUint32(record + 8,
+          view.getUint32(record + 8, Endian.big) + offset, Endian.big);
+    }
+    relocated.add(copy);
+    offset += copy.length;
+  }
+  final out = BytesBuilder();
+  out.add('ttcf'.codeUnits);
+  _u32(out, 0x00010000);
+  _u32(out, fonts.length);
+  for (final faceOffset in offsets) {
+    _u32(out, faceOffset);
+  }
+  for (final font in relocated) {
+    out.add(font);
+  }
+  return out.toBytes();
+}
+
 /// Retângulo envolvente da tinta, ou null se nada foi desenhado.
 ({int left, int top, int right, int bottom})? _inkBounds(BLImage image) {
   int? left, top, right, bottom;
@@ -255,6 +286,22 @@ void main() {
   ]);
 
   group('BLFontFace lê um sfnt mínimo', () {
+    test('lê todas as faces de uma coleção TrueType', () {
+      final second = _buildFont(const [
+        _Glyph(null, 500),
+        _Glyph(_Rect(100, 100, 700, 800), 900),
+      ], firstChar: 0x42);
+      final collection = _buildCollection([font2, second]);
+
+      final faces = BLFontFace.parseCollection(collection);
+      expect(faces, hasLength(2));
+      expect(faces[0].mapCodePoint(0x41), 1);
+      expect(faces[1].mapCodePoint(0x42), 1);
+      expect(const BLFontLoader().loadFaces(collection), hasLength(2));
+      expect(
+          () => BLFontFace.parse(collection, faceIndex: 2), throwsRangeError);
+    });
+
     test('extrai as métricas do cabeçalho', () {
       final face = BLFontFace.parse(font2);
 

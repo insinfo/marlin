@@ -4,10 +4,7 @@ import 'dart:typed_data';
 import 'bl_font.dart';
 import 'bl_font_collection.dart';
 
-/// Loader inicial de fontes para o port Blend2D em Dart.
-///
-/// Nesta etapa, apenas encapsula bytes da fonte.
-/// O parser OpenType completo entra nas proximas fases.
+/// Carregador nativo de fontes OpenType, TrueType, CFF e coleções TTC.
 class BLFontLoader {
   const BLFontLoader();
 
@@ -18,6 +15,9 @@ class BLFontLoader {
     final data = await File(path).readAsBytes();
     return loadBytes(data, familyName: familyName);
   }
+
+  Future<List<BLFontFace>> loadFileFaces(String path) async =>
+      loadFaces(await File(path).readAsBytes());
 
   BLFontFace loadBytes(
     Uint8List data, {
@@ -30,6 +30,14 @@ class BLFontLoader {
       data,
       familyName: familyName,
     );
+  }
+
+  /// Loads every face from a `.ttc`, or the single face in another font file.
+  List<BLFontFace> loadFaces(Uint8List data) {
+    if (!_hasRecognizedHeader(data)) {
+      throw const FormatException('Cabeçalho de fonte OpenType/CFF inválido.');
+    }
+    return BLFontFace.parseCollection(data);
   }
 
   static bool _hasRecognizedHeader(Uint8List data) {
@@ -140,8 +148,12 @@ class BLFontLoader {
     for (final path in files) {
       if (maxFonts != null && loaded >= maxFonts) break;
       try {
-        collection.addFace(await loadFile(path));
-        loaded++;
+        final faces = await loadFileFaces(path);
+        for (final face in faces) {
+          if (maxFonts != null && loaded >= maxFonts) break;
+          collection.addFace(face);
+          loaded++;
+        }
       } on Object catch (error) {
         onError?.call(path, error);
       }

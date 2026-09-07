@@ -673,19 +673,27 @@ class BLFontFace {
   static BLFontFace parse(
     Uint8List data, {
     String? familyName,
+    int faceIndex = 0,
   }) {
+    if (faceIndex < 0) {
+      throw RangeError.value(faceIndex, 'faceIndex', 'must be nonnegative');
+    }
     // Um CFF puro (bare CFF / Type1C) não tem contêiner sfnt: nem diretorio de
     // tabelas, nem `maxp`, nem `head`, nem `cmap`. E' exatamente o que um PDF
     // embute em /FontFile3 com /Subtype /Type1C. Sem este desvio o caminho
     // abaixo leria lixo como diretorio de tabelas e devolveria uma face com
     // glyphCount = 0, na qual nenhum glifo resolve.
     if (BLCFFDecoder.looksLikeBareCFF(data)) {
+      if (faceIndex != 0) {
+        throw RangeError.index(faceIndex, const [0], 'faceIndex');
+      }
       final bare = _parseBareCFF(data, familyName);
       if (bare != null) return bare;
     }
 
     final view = ByteData.sublistView(data);
-    final tableMap = _readSfntTableDirectory(view);
+    final sfntOffset = _sfntOffset(view, faceIndex);
+    final tableMap = _readSfntTableDirectory(view, sfntOffset);
 
     final head = tableMap[_tag('head')];
     final maxp = tableMap[_tag('maxp')];
@@ -872,6 +880,25 @@ class BLFontFace {
     );
   }
 
+  /// Parses every face stored in an OpenType/TrueType Collection (`.ttc`).
+  /// Ordinary sfnt and bare CFF inputs return a one-element list.
+  static List<BLFontFace> parseCollection(Uint8List data) {
+    if (data.length < 4 || String.fromCharCodes(data.take(4)) != 'ttcf') {
+      return <BLFontFace>[parse(data)];
+    }
+    final view = ByteData.sublistView(data);
+    if (view.lengthInBytes < 12) {
+      throw const FormatException('Truncated TrueType collection header.');
+    }
+    final count = _u32(view, 8);
+    if (count <= 0 || count > 0xffff || 12 + count * 4 > view.lengthInBytes) {
+      throw const FormatException('Invalid TrueType collection face count.');
+    }
+    return <BLFontFace>[
+      for (var i = 0; i < count; i++) parse(data, faceIndex: i)
+    ];
+  }
+
   /// Monta uma face a partir de um CFF puro, sem sfnt em volta.
   ///
   /// Tudo o que normalmente viria das tabelas OpenType sai do próprio CFF:
@@ -965,12 +992,37 @@ class BLFontFace {
     );
   }
 
-  static Map<int, _BLTableRecord> _readSfntTableDirectory(ByteData view) {
-    final out = <int, _BLTableRecord>{};
-    if (view.lengthInBytes < 12) return out;
+  static int _sfntOffset(ByteData view, int faceIndex) {
+    if (view.lengthInBytes < 4 || _u32(view, 0) != _tag('ttcf')) {
+      if (faceIndex != 0) {
+        throw RangeError.index(faceIndex, const [0], 'faceIndex');
+      }
+      return 0;
+    }
+    if (view.lengthInBytes < 12) {
+      throw const FormatException('Truncated TrueType collection header.');
+    }
+    final count = _u32(view, 8);
+    if (count <= 0 || count > 0xffff || 12 + count * 4 > view.lengthInBytes) {
+      throw const FormatException('Invalid TrueType collection face count.');
+    }
+    if (faceIndex >= count) {
+      throw RangeError.range(faceIndex, 0, count - 1, 'faceIndex');
+    }
+    final offset = _u32(view, 12 + faceIndex * 4);
+    if (offset < 0 || offset + 12 > view.lengthInBytes) {
+      throw const FormatException('Invalid TrueType collection face offset.');
+    }
+    return offset;
+  }
 
-    final numTables = _u16(view, 4);
-    final recordsOffset = 12;
+  static Map<int, _BLTableRecord> _readSfntTableDirectory(
+      ByteData view, int sfntOffset) {
+    final out = <int, _BLTableRecord>{};
+    if (sfntOffset < 0 || sfntOffset + 12 > view.lengthInBytes) return out;
+
+    final numTables = _u16(view, sfntOffset + 4);
+    final recordsOffset = sfntOffset + 12;
     final recordsEnd = recordsOffset + numTables * 16;
     if (numTables == 0 || recordsEnd > view.lengthInBytes) return out;
 
