@@ -74,6 +74,23 @@ void main() {
       expect((after >> 16) & 0xFF, greaterThan(245));
     });
 
+    test('can disable extension independently at each endpoint', () {
+      final grad = BLLinearGradient(
+        p0: const BLPoint(20, 0),
+        p1: const BLPoint(80, 0),
+        stops: const [
+          BLGradientStop(0, 0xFFFF0000),
+          BLGradientStop(1, 0xFF0000FF),
+        ],
+        extendStart: false,
+        extendEnd: true,
+      );
+      final fetcher = BLLinearGradientFetcher(grad);
+
+      expect(fetcher.fetch(0, 0), 0);
+      expect(fetcher.fetch(100, 0), 0xFF0000FF);
+    });
+
     test('repeat extend creates periodic pattern', () {
       final grad = BLLinearGradient(
         p0: const BLPoint(0, 0),
@@ -124,6 +141,22 @@ void main() {
   });
 
   group('BLRadialGradientFetcher', () {
+    test('returns transparent beyond a disabled outer extension', () {
+      final fetcher = BLRadialGradientFetcher(BLRadialGradient(
+        c0: const BLPoint(50, 50),
+        c1: const BLPoint(50, 50),
+        r0: 0,
+        r1: 20,
+        stops: const [
+          BLGradientStop(0, 0xFFFFFFFF),
+          BLGradientStop(1, 0xFF000000),
+        ],
+        extendEnd: false,
+      ));
+
+      expect(fetcher.fetch(90, 50), 0);
+    });
+
     test('radial gradient: center is start color', () {
       final grad = BLRadialGradient(
         c0: const BLPoint(50, 50),

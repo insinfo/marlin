@@ -75,6 +75,10 @@ class BLRadialGradientFetcher {
     final c = vx * vx + vy * vy - _r0Sq;
 
     final t = _solveT(_isLinear, _a, _invA, b, c);
+    if ((t < 0.0 && !gradient.extendStart) ||
+        (t > 1.0 && !gradient.extendEnd)) {
+      return 0x00000000;
+    }
     final tc = _applyExtend(t, gradient.extendMode);
     final idx = (tc * (_kLutSize - 1)).round();
     return _lut[idx];

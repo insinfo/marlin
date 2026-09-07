@@ -203,12 +203,16 @@ class BLLinearGradient {
   final BLPoint p1;
   final List<BLGradientStop> stops;
   final BLGradientExtendMode extendMode;
+  final bool extendStart;
+  final bool extendEnd;
 
   const BLLinearGradient({
     required this.p0,
     required this.p1,
     required this.stops,
     this.extendMode = BLGradientExtendMode.pad,
+    this.extendStart = true,
+    this.extendEnd = true,
   });
 }
 
@@ -219,6 +223,8 @@ class BLRadialGradient {
   final double r1;
   final List<BLGradientStop> stops;
   final BLGradientExtendMode extendMode;
+  final bool extendStart;
+  final bool extendEnd;
 
   const BLRadialGradient({
     required this.c0,
@@ -227,6 +233,8 @@ class BLRadialGradient {
     this.r1 = 0.0,
     required this.stops,
     this.extendMode = BLGradientExtendMode.pad,
+    this.extendStart = true,
+    this.extendEnd = true,
   });
 }
 

@@ -29,6 +29,10 @@ class BLLinearGradientFetcher {
     final px = x + 0.5;
     final py = y + 0.5;
     final t = ((px - _x0) * _dx + (py - _y0) * _dy) * _invLen2;
+    if ((t < 0.0 && !gradient.extendStart) ||
+        (t > 1.0 && !gradient.extendEnd)) {
+      return 0x00000000;
+    }
     final tc = _applyExtend(t, gradient.extendMode);
     final idx = (tc * (_kLutSize - 1)).round();
     return _lut[idx];
