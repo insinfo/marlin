@@ -982,6 +982,13 @@ class BLCFFInfo {
   /// E' o substituto do `cmap` num CFF puro. Vazio em CIDFonts.
   final Map<int, int> codeToGlyphId;
 
+  /// CID -> GID vindo do charset de uma fonte CID-keyed.
+  ///
+  /// Diferentemente de uma fonte CFF por nomes, os valores do charset são
+  /// CIDs. Um consumidor PDF usa este mapa quando o CIDFontType0 não possui
+  /// `/CIDToGIDMap` (esse mapa é próprio de CIDFontType2/TrueType).
+  final Map<int, int> cidToGlyphId;
+
   const BLCFFInfo({
     required this.glyphCount,
     required this.unitsPerEm,
@@ -992,6 +999,7 @@ class BLCFFInfo {
     required this.glyphNames,
     required this.nameToGlyphId,
     required this.codeToGlyphId,
+    required this.cidToGlyphId,
   });
 
   /// Le os metadados de um bloco CFF em [view], começando em [cffOffset].
@@ -1036,6 +1044,7 @@ class BLCFFInfo {
     final glyphNames = <String>[];
     final nameToGlyphId = <String, int>{};
     var codeToGlyphId = const <int, int>{};
+    var cidToGlyphId = const <int, int>{};
     if (!isCID) {
       final charsetOffset = cff.topDict[_CFFOp.charset]?.last.toInt() ?? 0;
       final sids =
@@ -1058,6 +1067,17 @@ class BLCFFInfo {
           nameToGlyphId,
         );
       }
+    } else {
+      final charsetOffset = cff.topDict[_CFFOp.charset]?.last.toInt() ?? 0;
+      final cids =
+          _parseCharsetSids(view, cffOffset, charsetOffset, glyphCount);
+      if (cids != null) {
+        final mapped = <int, int>{};
+        for (var gid = 0; gid < cids.length; gid++) {
+          mapped.putIfAbsent(cids[gid], () => gid);
+        }
+        cidToGlyphId = mapped;
+      }
     }
 
     return BLCFFInfo(
@@ -1070,6 +1090,7 @@ class BLCFFInfo {
       glyphNames: List<String>.unmodifiable(glyphNames),
       nameToGlyphId: Map<String, int>.unmodifiable(nameToGlyphId),
       codeToGlyphId: Map<int, int>.unmodifiable(codeToGlyphId),
+      cidToGlyphId: Map<int, int>.unmodifiable(cidToGlyphId),
     );
   }
 

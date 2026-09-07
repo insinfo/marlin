@@ -283,7 +283,7 @@ Uint8List _buildCidCff({required bool fdSelectFormat3, int? fdSelectSentinel}) {
   final nameIndex = _cffIndex(<Uint8List>[_latin1('TestCID')]);
   final stringIndex = _cffIndex(const <Uint8List>[]);
   final globalSubrs = _cffIndex(const <Uint8List>[]);
-  final charset = Uint8List.fromList(<int>[0, 0, 1, 0, 2]);
+  final charset = Uint8List.fromList(<int>[0, 0, 42, 1, 44]);
   final fdSelect = fdSelectFormat3
       ? Uint8List.fromList(<int>[
           3, 0, 2, // formato, nRanges
@@ -772,6 +772,7 @@ void main() {
           () {
         final face = BLFontFace.parse(_buildCidCff(fdSelectFormat3: format3));
         expect(face.cffInfo!.isCID, isTrue);
+        expect(face.cffInfo!.cidToGlyphId, <int, int>{0: 0, 42: 1, 300: 2});
 
         final first = _boxOf(face.glyphOutlineUnits(1)!);
         final second = _boxOf(face.glyphOutlineUnits(2)!);
