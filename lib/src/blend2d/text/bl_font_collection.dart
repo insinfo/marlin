@@ -84,6 +84,13 @@ class BLFontCollection implements BLFontProvider {
       final face = await provider.resolve(query);
       if (face != null) {
         addFace(face);
+        // A remote source may serve a face whose internal OpenType family is
+        // different from the CSS/application family used to locate it. Keep
+        // the query names as aliases so the successful lookup is genuinely
+        // cached and subsequent resolutions do not fetch the same bytes.
+        for (final family in query.families) {
+          addAlias(family, face);
+        }
         return face;
       }
     }

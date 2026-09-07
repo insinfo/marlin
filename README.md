@@ -114,6 +114,10 @@ fontes OpenType/TrueType/CFF e todas as faces de coleções TTC, e
 `BLIsolatePool`. Importá-lo tira o seu programa da compatibilidade com web —
 use-o apenas em aplicações nativas.
 
+No navegador, registre um `BLCallbackFontProvider` na `BLFontCollection` para
+resolver URLs, Google Fonts ou `FontFace`. A coleção mantém a face em cache
+pelos nomes solicitados, mesmo quando o nome interno OpenType é diferente.
+
 ## Origem
 
 Este pacote é uma reimplementação independente em Dart, derivada do

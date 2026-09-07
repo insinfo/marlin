@@ -109,6 +109,24 @@ void main() {
     expect(failures.single, endsWith('broken.ttf'));
   });
 
+  test('fonte remota fica em cache pelo nome solicitado', () async {
+    final collection = BLFontCollection();
+    var requests = 0;
+    collection.addProvider(BLCallbackFontProvider((query) async {
+      requests++;
+      return _font('InternalName-Regular');
+    }));
+    const query = BLFontQuery(['Web Alias']);
+
+    final first = await collection.resolve(query);
+    final second = await collection.resolve(query);
+
+    expect(first, isNotNull);
+    expect(second, same(first));
+    expect(first!.familyName, 'InternalName');
+    expect(requests, 1);
+  });
+
   test('limite de carregamento nativo evita catálogo sem teto', () async {
     final root = await Directory.systemTemp.createTemp('dgfx-limit-fonts-');
     addTearDown(() => root.delete(recursive: true));
