@@ -45,6 +45,13 @@ class BLFontFace {
   final _BLCmapMapper _cmapMapper;
   final Map<int, BLPathData> _glyphOutlineUnitsCache = <int, BLPathData>{};
 
+  /// Metadados do CFF (contagem de glifos, charset, encoding). Já vêm
+  /// preenchido quando a face nasceu de um CFF puro; para OpenType/CFF é
+  /// resolvido sob demanda, para não pagar a leitura do charset em fontes
+  /// que nunca consultam nomes de glifo.
+  BLCFFInfo? _cffInfo;
+  bool _cffInfoResolved;
+
   static const int _ttOnCurvePoint = 0x01;
   static const int _ttXIsByte = 0x02;
   static const int _ttYIsByte = 0x04;
@@ -102,8 +109,11 @@ class BLFontFace {
     required this.gposLength,
     required Map<int, int> kernPairUnits,
     required _BLCmapMapper cmapMapper,
+    BLCFFInfo? cffInfo,
   })  : _kernPairUnits = kernPairUnits,
         _cmapMapper = cmapMapper,
+        _cffInfo = cffInfo,
+        _cffInfoResolved = cffInfo != null,
         _view = ByteData.sublistView(data);
 
   /// Lazy-initialized layout engine for GSUB/GPOS.
@@ -121,6 +131,37 @@ class BLFontFace {
       gposLength: gposLength,
     );
     return _layoutEngine;
+  }
+
+  /// Metadados do CFF desta face, ou `null` se ela não tiver contornos CFF.
+  BLCFFInfo? get cffInfo {
+    if (_cffInfoResolved) return _cffInfo;
+    _cffInfoResolved = true;
+    if (hasCFFOutlines && cffLength > 4) {
+      _cffInfo = BLCFFInfo.parse(_view, cffOffset, cffLength);
+    }
+    return _cffInfo;
+  }
+
+  /// Resolve o GID de um glifo pelo nome PostScript, via CHARSET do CFF.
+  ///
+  /// E' o caminho que um consumidor de PDF precisa: numa fonte simples o
+  /// mapeamento é código -> nome do glifo (pela `/Encoding` do PDF) -> GID,
+  /// porque um CFF puro não tem `cmap`. Devolve `null` para fontes sem
+  /// contornos CFF, para CIDFonts (cujo charset guarda CIDs, não nomes) e para
+  /// nomes ausentes.
+  int? glyphIdForName(String name) {
+    if (name.isEmpty) return null;
+    return cffInfo?.nameToGlyphId[name];
+  }
+
+  /// Nome PostScript do glifo [glyphId], ou `null` se indisponivel.
+  String? glyphNameForId(int glyphId) {
+    final info = cffInfo;
+    if (info == null) return null;
+    if (glyphId < 0 || glyphId >= info.glyphNames.length) return null;
+    final name = info.glyphNames[glyphId];
+    return name.isEmpty ? null : name;
   }
 
   int mapCodePoint(int codePoint) {
@@ -633,6 +674,16 @@ class BLFontFace {
     Uint8List data, {
     String? familyName,
   }) {
+    // Um CFF puro (bare CFF / Type1C) não tem contêiner sfnt: nem diretorio de
+    // tabelas, nem `maxp`, nem `head`, nem `cmap`. E' exatamente o que um PDF
+    // embute em /FontFile3 com /Subtype /Type1C. Sem este desvio o caminho
+    // abaixo leria lixo como diretorio de tabelas e devolveria uma face com
+    // glyphCount = 0, na qual nenhum glifo resolve.
+    if (BLCFFDecoder.looksLikeBareCFF(data)) {
+      final bare = _parseBareCFF(data, familyName);
+      if (bare != null) return bare;
+    }
+
     final view = ByteData.sublistView(data);
     final tableMap = _readSfntTableDirectory(view);
 
@@ -814,6 +865,99 @@ class BLFontFace {
       gposLength: gposTable?.length ?? 0,
       kernPairUnits: kernPairUnits,
       cmapMapper: cmapMapper,
+    );
+  }
+
+  /// Monta uma face a partir de um CFF puro, sem sfnt em volta.
+  ///
+  /// Tudo o que normalmente viria das tabelas OpenType sai do próprio CFF:
+  /// `glyphCount` do CharStrings INDEX, `unitsPerEm` do FontMatrix do Top
+  /// DICT, o mapeamento de código pelo Encoding e os nomes pelo charset.
+  ///
+  /// Devolve `null` se a estrutura não fechar, para o chamador cair de volta
+  /// no caminho sfnt.
+  static BLFontFace? _parseBareCFF(Uint8List data, String? familyName) {
+    final bytes = Uint8List.fromList(data);
+    final info = BLCFFInfo.parse(ByteData.sublistView(bytes), 0, bytes.length);
+    if (info == null || info.glyphCount <= 0) return null;
+
+    final upm = info.unitsPerEm;
+
+    // Sem `hhea`/`OS/2` a FontBBox é a única pista de métrica vertical. Não é
+    // a mesma coisa que ascender/descender tipograficos, mas mantém o
+    // espacamento de linha plausível em vez de zero.
+    var ascender = (upm * 0.8).round();
+    var descender = -(upm * 0.2).round();
+    final bbox = info.fontBBox;
+    if (bbox != null && bbox[3] > bbox[1]) {
+      ascender = bbox[3].round();
+      descender = bbox[1].round();
+    }
+
+    // Fontes subsetadas em PDF trazem o prefixo de tag "ABCDEF+" no nome
+    // PostScript; a família é o que sobra antes do primeiro hífen.
+    final postScriptName = info.name;
+    var stripped = postScriptName;
+    if (stripped.length > 7 && stripped[6] == '+') {
+      stripped = stripped.substring(7);
+    }
+    var subfamily = '';
+    final dash = stripped.indexOf('-');
+    if (dash > 0) {
+      subfamily = stripped.substring(dash + 1);
+      stripped = stripped.substring(0, dash);
+    }
+    var resolvedFamily = stripped;
+    if (familyName != null && familyName.trim().isNotEmpty) {
+      resolvedFamily = familyName;
+    }
+    if (resolvedFamily.isEmpty) resolvedFamily = 'Unknown';
+
+    final lowerSub = subfamily.toLowerCase();
+    final weightClass = lowerSub.contains('bold') ? 700 : 400;
+
+    return BLFontFace._(
+      familyName: resolvedFamily,
+      subfamilyName: subfamily,
+      fullName: postScriptName,
+      postScriptName: postScriptName,
+      data: bytes,
+      unitsPerEm: upm,
+      glyphCount: info.glyphCount,
+      ascender: ascender,
+      descender: descender,
+      lineGap: 0,
+      xHeight: 0,
+      capHeight: 0,
+      weightClass: weightClass,
+      widthClass: 5,
+      useTypographicMetrics: false,
+      indexToLocFormat: 0,
+      locaOffset: 0,
+      locaLength: 0,
+      glyfOffset: 0,
+      glyfLength: 0,
+      hasTrueTypeOutlines: false,
+      hasCFFOutlines: true,
+      cffOffset: 0,
+      cffLength: bytes.length,
+      // Sem `hmtx`: os avanços teriam de sair da largura embutida em cada
+      // charstring, o que este decodificador ainda não expõe. Um consumidor de
+      // PDF usa o array /Widths do dicionário da fonte, então a perda é
+      // contornável do lado de fora.
+      numHMetrics: 0,
+      hmtxOffset: 0,
+      hmtxLength: 0,
+      isSymbolFont: false,
+      gsubOffset: 0,
+      gsubLength: 0,
+      gposOffset: 0,
+      gposLength: 0,
+      kernPairUnits: const <int, int>{},
+      cmapMapper: info.codeToGlyphId.isEmpty
+          ? _BLCmapNone.instance
+          : _BLCffEncoding(info.codeToGlyphId),
+      cffInfo: info,
     );
   }
 
@@ -1544,6 +1688,19 @@ class _BLCmapNone implements _BLCmapMapper {
     if (codePoint == 0) return 0;
     return 0;
   }
+}
+
+/// Mapeador de código para GID baseado no Encoding de um CFF puro.
+///
+/// Faz o papel que o `cmap` faria num sfnt. Cobre apenas códigos de 0 a 255,
+/// que é o alcance do Encoding do CFF.
+class _BLCffEncoding implements _BLCmapMapper {
+  final Map<int, int> _codeToGlyphId;
+
+  const _BLCffEncoding(this._codeToGlyphId);
+
+  @override
+  int map(int codePoint) => _codeToGlyphId[codePoint] ?? 0;
 }
 
 class _BLCmapFormat0 implements _BLCmapMapper {

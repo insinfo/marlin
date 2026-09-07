@@ -10,6 +10,7 @@ library;
 import 'dart:typed_data';
 
 import '../geometry/bl_path.dart';
+import 'bl_cff_strings.dart';
 
 // ---------------------------------------------------------------------------
 // CFF INDEX parser (v1)
@@ -23,14 +24,27 @@ class _CFFIndex {
   final int dataStart;
   final ByteData view;
 
-  const _CFFIndex(this.count, this.offsetSize, this.offsetsStart,
-      this.dataStart, this.view);
+  /// Posição onde este INDEX começa (o campo `count`).
+  final int start;
 
-  /// Total bytes consumed by this INDEX.
+  const _CFFIndex(this.count, this.offsetSize, this.offsetsStart,
+      this.dataStart, this.view, this.start);
+
+  /// Total de bytes ocupados por este INDEX.
+  ///
+  /// Precisa ser o TAMANHO, e não a posição final absoluta: quem percorre o
+  /// CFF caminha com `offset += index.totalSize` a partir do início do INDEX.
+  /// A versão anterior devolvia a posição absoluta do fim, o que somava o
+  /// deslocamento inicial duas vezes e fazia o parser errar o String INDEX e
+  /// o Global Subr INDEX em qualquer CFF que não começasse no offset zero.
   int get totalSize {
-    if (count == 0) return 2; // empty index = 2 bytes
-    return dataStart + _readOffset(count) - 1;
+    if (count == 0) return 2; // INDEX vazio ocupa só os 2 bytes do count
+    final end = dataStart + _readOffset(count) - 1;
+    return end - start;
   }
+
+  /// Posição logo após o ultimo byte deste INDEX.
+  int get endOffset => start + totalSize;
 
   int _readOffset(int index) {
     final off = offsetsStart + index * offsetSize;
@@ -61,16 +75,23 @@ class _CFFIndex {
 
   /// Parse a CFF v1 INDEX starting at [offset].
   static _CFFIndex? parse(ByteData view, int offset) {
-    if (offset + 2 > view.lengthInBytes) return null;
+    if (offset < 0 || offset + 2 > view.lengthInBytes) return null;
     final count = view.getUint16(offset, Endian.big);
-    if (count == 0) return _CFFIndex(0, 0, offset + 2, offset + 2, view);
+    if (count == 0) {
+      return _CFFIndex(0, 0, offset + 2, offset + 2, view, offset);
+    }
     if (offset + 3 > view.lengthInBytes) return null;
     final offSize = view.getUint8(offset + 2);
     if (offSize < 1 || offSize > 4) return null;
     final offsetsStart = offset + 3;
     final dataStart = offsetsStart + (count + 1) * offSize;
     if (dataStart > view.lengthInBytes) return null;
-    return _CFFIndex(count, offSize, offsetsStart, dataStart, view);
+    final index =
+        _CFFIndex(count, offSize, offsetsStart, dataStart, view, offset);
+    // O ultimo offset marca o fim dos dados; se ele estoura o buffer, o INDEX
+    // esta truncado e não pode ser usado.
+    if (index.endOffset > view.lengthInBytes) return null;
+    return index;
   }
 }
 
@@ -227,6 +248,16 @@ bool _interpretCharstring(
 
     // Operator
     switch (b0) {
+      // 28 não é operador: é o prefixo de um inteiro de 16 bits com sinal,
+      // a única forma de escrever valores fora de -1131..1131 numa charstring.
+      // Sem este caso o número caía no `default`, que limpa a pilha e faz o
+      // glifo perder o segmento inteiro.
+      case 28:
+        if (p + 2 > end) return false;
+        if (sp < 48) stack[sp++] = view.getInt16(p, Endian.big).toDouble();
+        p += 2;
+        break;
+
       case _T2Op.rmoveto:
         if (!hasWidth && sp > 2) hasWidth = true;
         if (hasMoveTo) path.close();
@@ -515,23 +546,527 @@ bool _interpretCharstring(
 }
 
 // ---------------------------------------------------------------------------
+// Parser de DICT (Top DICT / Private DICT)
+// ---------------------------------------------------------------------------
+
+/// Chave de um operador de dois bytes (`12 x`) dentro do mapa devolvido por
+/// [_parseDict]. Operadores de um byte usam o próprio valor como chave.
+int _escOp(int b1) => 1200 + b1;
+
+/// Le um DICT do CFF inteiro e devolve `operador -> operandos`.
+///
+/// O parser precisa decodificar números reais de verdade (e não trata-los como
+/// zero) porque o FontMatrix — de onde sai o unitsPerEm — é justamente uma
+/// lista de reais.
+Map<int, List<double>> _parseDict(ByteData view, int start, int end) {
+  final out = <int, List<double>>{};
+  var operands = <double>[];
+  var p = start;
+
+  while (p < end) {
+    final b0 = view.getUint8(p++);
+
+    if (b0 >= 32 && b0 <= 246) {
+      operands.add((b0 - 139).toDouble());
+    } else if (b0 >= 247 && b0 <= 250) {
+      if (p >= end) break;
+      final b1 = view.getUint8(p++);
+      operands.add(((b0 - 247) * 256 + b1 + 108).toDouble());
+    } else if (b0 >= 251 && b0 <= 254) {
+      if (p >= end) break;
+      final b1 = view.getUint8(p++);
+      operands.add((-(b0 - 251) * 256 - b1 - 108).toDouble());
+    } else if (b0 == 28) {
+      if (p + 2 > end) break;
+      operands.add(view.getInt16(p, Endian.big).toDouble());
+      p += 2;
+    } else if (b0 == 29) {
+      if (p + 4 > end) break;
+      operands.add(view.getInt32(p, Endian.big).toDouble());
+      p += 4;
+    } else if (b0 == 30) {
+      // Real codificado em nibbles (BCD).
+      final text = StringBuffer();
+      var done = false;
+      while (p < end && !done) {
+        final byte = view.getUint8(p++);
+        for (final nibble in <int>[byte >> 4, byte & 0x0F]) {
+          if (nibble <= 9) {
+            text.write(nibble);
+          } else if (nibble == 0x0A) {
+            text.write('.');
+          } else if (nibble == 0x0B) {
+            text.write('E');
+          } else if (nibble == 0x0C) {
+            text.write('E-');
+          } else if (nibble == 0x0E) {
+            text.write('-');
+          } else if (nibble == 0x0F) {
+            done = true;
+            break;
+          }
+          // 0x0D é reservado: ignorado.
+        }
+      }
+      operands.add(double.tryParse(text.toString()) ?? 0.0);
+    } else if (b0 == 12) {
+      if (p >= end) break;
+      final b1 = view.getUint8(p++);
+      out[_escOp(b1)] = operands;
+      operands = <double>[];
+    } else {
+      out[b0] = operands;
+      operands = <double>[];
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Estrutura de um CFF: header + INDEXes de topo + Top DICT
+// ---------------------------------------------------------------------------
+
+/// Operadores de DICT usados aqui.
+class _CFFOp {
+  static const int fontBBox = 5;
+  static const int charset = 15;
+  static const int encoding = 16;
+  static const int charStrings = 17;
+  static const int private = 18;
+  static const int localSubrs = 19; // dentro do Private DICT
+  static const int fontMatrix = 1207;
+  static const int ros = 1230; // presente apenas em CIDFonts
+}
+
+/// Resultado da leitura da "espinha dorsal" de um CFF.
+///
+/// Os deslocamentos guardados aqui já são absolutos dentro do [view]: um CFF
+/// puro tem `cffOffset == 0`, um OpenType/CFF tem o offset da tabela `CFF `.
+class _CFFStructure {
+  final ByteData view;
+  final int cffOffset;
+  final _CFFIndex nameIndex;
+  final _CFFIndex topDictIndex;
+  final _CFFIndex? stringIndex;
+  final _CFFIndex? globalSubrs;
+  final Map<int, List<double>> topDict;
+  final _CFFIndex charStrings;
+
+  const _CFFStructure({
+    required this.view,
+    required this.cffOffset,
+    required this.nameIndex,
+    required this.topDictIndex,
+    required this.stringIndex,
+    required this.globalSubrs,
+    required this.topDict,
+    required this.charStrings,
+  });
+
+  /// INDEX de subrotinas locais, extraido do Private DICT (se houver).
+  _CFFIndex? get localSubrs {
+    final priv = topDict[_CFFOp.private];
+    if (priv == null || priv.length < 2) return null;
+    final privSize = priv[0].toInt();
+    final privOffset = cffOffset + priv[1].toInt();
+    if (privSize <= 0 ||
+        privOffset < cffOffset ||
+        privOffset + privSize > view.lengthInBytes) {
+      return null;
+    }
+    final privDict = _parseDict(view, privOffset, privOffset + privSize);
+    final subrs = privDict[_CFFOp.localSubrs];
+    if (subrs == null || subrs.isEmpty) return null;
+    // O offset de Subrs é relativo ao início do Private DICT, não ao CFF.
+    return _CFFIndex.parse(view, privOffset + subrs.last.toInt());
+  }
+
+  /// Le o header e os quatro INDEXes de topo. Devolve `null` se algo não
+  /// bater — o que também serve de validação para detectar um CFF puro.
+  static _CFFStructure? parse(ByteData view, int cffOffset, int cffLength) {
+    if (cffOffset < 0 || cffLength < 4) return null;
+    if (cffOffset + cffLength > view.lengthInBytes) return null;
+
+    final major = view.getUint8(cffOffset);
+    if (major != 1) return null; // só CFF v1 nesta implementação
+    final headerSize = view.getUint8(cffOffset + 2);
+    if (headerSize < 4 || headerSize >= cffLength) return null;
+
+    final nameIndex = _CFFIndex.parse(view, cffOffset + headerSize);
+    if (nameIndex == null) return null;
+
+    final topDictIndex = _CFFIndex.parse(view, nameIndex.endOffset);
+    if (topDictIndex == null || topDictIndex.count == 0) return null;
+
+    final stringIndex = _CFFIndex.parse(view, topDictIndex.endOffset);
+    final globalSubrs = stringIndex == null
+        ? null
+        : _CFFIndex.parse(view, stringIndex.endOffset);
+
+    final topRange = topDictIndex.entryRange(0);
+    if (topRange == null) return null;
+    final topDict = _parseDict(view, topRange.$1, topRange.$2);
+
+    final csOperands = topDict[_CFFOp.charStrings];
+    if (csOperands == null || csOperands.isEmpty) return null;
+    final charStrings =
+        _CFFIndex.parse(view, cffOffset + csOperands.last.toInt());
+    if (charStrings == null || charStrings.count == 0) return null;
+
+    return _CFFStructure(
+      view: view,
+      cffOffset: cffOffset,
+      nameIndex: nameIndex,
+      topDictIndex: topDictIndex,
+      stringIndex: stringIndex,
+      globalSubrs: globalSubrs,
+      topDict: topDict,
+      charStrings: charStrings,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Charset -> nomes de glifo
+// ---------------------------------------------------------------------------
+
+/// Le o charset e devolve o SID de cada GID (índice = GID).
+///
+/// Devolve `null` para os charsets predefinidos Expert (1) e ExpertSubset (2),
+/// que não são tabelados aqui.
+List<int>? _parseCharsetSids(
+  ByteData view,
+  int cffOffset,
+  int charsetOffset,
+  int glyphCount,
+) {
+  if (glyphCount <= 0) return null;
+
+  // Charset 0 = ISOAdobe: a ordem dos glifos é a das strings padrão, ou seja
+  // SID == GID. E' o caso quando o Top DICT nem traz o operador `charset`.
+  if (charsetOffset == 0) {
+    return List<int>.generate(glyphCount, (gid) => gid);
+  }
+  if (charsetOffset == 1 || charsetOffset == 2) return null;
+
+  final base = cffOffset + charsetOffset;
+  if (base < 0 || base >= view.lengthInBytes) return null;
+
+  final sids = List<int>.filled(glyphCount, 0);
+  final format = view.getUint8(base);
+  var p = base + 1;
+
+  if (format == 0) {
+    for (var gid = 1; gid < glyphCount; gid++) {
+      if (p + 2 > view.lengthInBytes) return null;
+      sids[gid] = view.getUint16(p, Endian.big);
+      p += 2;
+    }
+    return sids;
+  }
+
+  if (format == 1 || format == 2) {
+    final nLeftBytes = format == 1 ? 1 : 2;
+    var gid = 1;
+    while (gid < glyphCount) {
+      if (p + 2 + nLeftBytes > view.lengthInBytes) return null;
+      final first = view.getUint16(p, Endian.big);
+      p += 2;
+      final nLeft =
+          nLeftBytes == 1 ? view.getUint8(p) : view.getUint16(p, Endian.big);
+      p += nLeftBytes;
+      for (var i = 0; i <= nLeft && gid < glyphCount; i++) {
+        sids[gid++] = first + i;
+      }
+    }
+    return sids;
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Encoding -> código de caractere
+// ---------------------------------------------------------------------------
+
+/// Monta o mapa `código (0..255) -> GID` a partir do Encoding do CFF.
+///
+/// Um CFF puro não tem `cmap`; o equivalente é este Encoding, e quando o Top
+/// DICT não o declara vale o Standard Encoding. E' o que faz um consumidor
+/// genérico conseguir resolver 'A' sem saber nada do PDF em volta.
+Map<int, int> _buildCodeToGlyphId(
+  ByteData view,
+  int cffOffset,
+  int encodingOffset,
+  int glyphCount,
+  List<int> sids,
+  Map<String, int> nameToGlyphId,
+) {
+  final out = <int, int>{};
+
+  if (encodingOffset == 0) {
+    // Standard Encoding: código -> SID -> nome -> GID.
+    for (var code = 0; code < cffStandardEncodingSids.length; code++) {
+      final sid = cffStandardEncodingSids[code];
+      if (sid == 0) continue;
+      final gid = nameToGlyphId[cffStandardStrings[sid]];
+      if (gid != null && gid != 0) out[code] = gid;
+    }
+    return out;
+  }
+  if (encodingOffset == 1) return out; // Expert Encoding: não tabelado aqui
+
+  final base = cffOffset + encodingOffset;
+  if (base < 0 || base >= view.lengthInBytes) return out;
+
+  final b0 = view.getUint8(base);
+  final format = b0 & 0x7F;
+  var p = base + 1;
+
+  if (format == 0) {
+    if (p >= view.lengthInBytes) return out;
+    final nCodes = view.getUint8(p++);
+    for (var gid = 1; gid <= nCodes && p < view.lengthInBytes; gid++) {
+      final code = view.getUint8(p++);
+      if (gid < glyphCount) out.putIfAbsent(code, () => gid);
+    }
+  } else if (format == 1) {
+    if (p >= view.lengthInBytes) return out;
+    final nRanges = view.getUint8(p++);
+    var gid = 1;
+    for (var r = 0; r < nRanges && p + 2 <= view.lengthInBytes; r++) {
+      final first = view.getUint8(p++);
+      final nLeft = view.getUint8(p++);
+      for (var i = 0; i <= nLeft; i++) {
+        if (gid < glyphCount) out.putIfAbsent(first + i, () => gid);
+        gid++;
+      }
+    }
+  } else {
+    return out;
+  }
+
+  // O bit alto do formato indica que seguem "supplements": pares
+  // código -> SID que dao um segundo código a um glifo já mapeado.
+  if ((b0 & 0x80) != 0 && p < view.lengthInBytes) {
+    final nSups = view.getUint8(p++);
+    for (var i = 0; i < nSups && p + 3 <= view.lengthInBytes; i++) {
+      final code = view.getUint8(p++);
+      final sid = view.getUint16(p, Endian.big);
+      p += 2;
+      final gid = sids.indexOf(sid);
+      if (gid > 0) out[code] = gid;
+    }
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Metadados de um CFF (API publica)
+// ---------------------------------------------------------------------------
+
+/// Informações estruturais de uma fonte CFF, o suficiente para montar uma
+/// face quando não existe um contêiner sfnt em volta.
+///
+/// Um PDF embute fontes assim em `/FontFile3` com `/Subtype /Type1C`: não há
+/// `maxp` de onde tirar a contagem de glifos, nem `head` de onde tirar o
+/// unitsPerEm, nem `cmap` para mapear códigos. Tudo isso sai daqui.
+class BLCFFInfo {
+  /// Número de glifos = número de entradas do CharStrings INDEX.
+  final int glyphCount;
+
+  /// Unidades por em, derivadas do FontMatrix (`1 / matrix[0]`).
+  final int unitsPerEm;
+
+  /// FontMatrix declarado (ou o padrão `[0.001, 0, 0, 0.001, 0, 0]`).
+  final List<double> fontMatrix;
+
+  /// FontBBox declarado (`[xMin, yMin, xMax, yMax]`), ou `null` se ausente.
+  final List<double>? fontBBox;
+
+  /// Nome PostScript (primeira entrada do Name INDEX).
+  final String name;
+
+  /// `true` quando a fonte é um CIDFont: o charset mapeia GID -> CID, e não
+  /// GID -> SID, então não há nomes de glifo a extrair.
+  final bool isCID;
+
+  /// Nome de cada glifo por GID; vazio em CIDFonts ou charsets não suportados.
+  final List<String> glyphNames;
+
+  /// Nome do glifo -> GID. Em caso de nomes repetidos, vence o menor GID.
+  final Map<String, int> nameToGlyphId;
+
+  /// Código de caractere (0..255) -> GID, vindo do Encoding do CFF.
+  ///
+  /// E' o substituto do `cmap` num CFF puro. Vazio em CIDFonts.
+  final Map<int, int> codeToGlyphId;
+
+  const BLCFFInfo({
+    required this.glyphCount,
+    required this.unitsPerEm,
+    required this.fontMatrix,
+    required this.fontBBox,
+    required this.name,
+    required this.isCID,
+    required this.glyphNames,
+    required this.nameToGlyphId,
+    required this.codeToGlyphId,
+  });
+
+  /// Le os metadados de um bloco CFF em [view], começando em [cffOffset].
+  ///
+  /// Serve tanto para um CFF puro (`cffOffset = 0`, `cffLength = data.length`)
+  /// quanto para a tabela `CFF ` de um OpenType.
+  static BLCFFInfo? parse(ByteData view, int cffOffset, int cffLength) {
+    final cff = _CFFStructure.parse(view, cffOffset, cffLength);
+    if (cff == null) return null;
+
+    final glyphCount = cff.charStrings.count;
+
+    // FontMatrix: 0.001 é o padrão do CFF e corresponde a um em de 1000.
+    var matrix = const <double>[0.001, 0.0, 0.0, 0.001, 0.0, 0.0];
+    final declared = cff.topDict[_CFFOp.fontMatrix];
+    if (declared != null && declared.length >= 6) {
+      matrix = List<double>.unmodifiable(declared.sublist(0, 6));
+    }
+    var unitsPerEm = 1000;
+    final sx = matrix[0];
+    if (sx.isFinite && sx > 0) {
+      final derived = (1.0 / sx).round();
+      // Um em fora desta faixa só pode vir de dado corrompido; cair no padrão
+      // é melhor do que propagar uma escala absurda para o rasterizador.
+      if (derived >= 16 && derived <= 16384) unitsPerEm = derived;
+    }
+
+    List<double>? bbox;
+    final bboxOperands = cff.topDict[_CFFOp.fontBBox];
+    if (bboxOperands != null && bboxOperands.length >= 4) {
+      bbox = List<double>.unmodifiable(bboxOperands.sublist(0, 4));
+    }
+
+    var name = '';
+    final nameRange = cff.nameIndex.entryRange(0);
+    if (nameRange != null) {
+      name = _latin1(view, nameRange.$1, nameRange.$2);
+    }
+
+    final isCID = cff.topDict.containsKey(_CFFOp.ros);
+
+    final glyphNames = <String>[];
+    final nameToGlyphId = <String, int>{};
+    var codeToGlyphId = const <int, int>{};
+    if (!isCID) {
+      final charsetOffset = cff.topDict[_CFFOp.charset]?.last.toInt() ?? 0;
+      final sids =
+          _parseCharsetSids(view, cffOffset, charsetOffset, glyphCount);
+      if (sids != null) {
+        for (var gid = 0; gid < glyphCount; gid++) {
+          final glyphName = _sidToName(view, cff.stringIndex, sids[gid]);
+          glyphNames.add(glyphName);
+          if (glyphName.isNotEmpty) {
+            nameToGlyphId.putIfAbsent(glyphName, () => gid);
+          }
+        }
+        final encodingOffset = cff.topDict[_CFFOp.encoding]?.last.toInt() ?? 0;
+        codeToGlyphId = _buildCodeToGlyphId(
+          view,
+          cffOffset,
+          encodingOffset,
+          glyphCount,
+          sids,
+          nameToGlyphId,
+        );
+      }
+    }
+
+    return BLCFFInfo(
+      glyphCount: glyphCount,
+      unitsPerEm: unitsPerEm,
+      fontMatrix: matrix,
+      fontBBox: bbox,
+      name: name,
+      isCID: isCID,
+      glyphNames: List<String>.unmodifiable(glyphNames),
+      nameToGlyphId: Map<String, int>.unmodifiable(nameToGlyphId),
+      codeToGlyphId: Map<int, int>.unmodifiable(codeToGlyphId),
+    );
+  }
+
+  /// Resolve um SID para o nome correspondente.
+  ///
+  /// SIDs abaixo de 391 vêm da tabela de strings padrão do CFF; acima disso o
+  /// índice `sid - 391` aponta para o String INDEX da própria fonte.
+  static String _sidToName(ByteData view, _CFFIndex? stringIndex, int sid) {
+    if (sid < 0) return '';
+    if (sid < cffStandardStrings.length) return cffStandardStrings[sid];
+    if (stringIndex == null) return '';
+    final range = stringIndex.entryRange(sid - cffStandardStrings.length);
+    if (range == null) return '';
+    return _latin1(view, range.$1, range.$2);
+  }
+
+  static String _latin1(ByteData view, int start, int end) {
+    if (start < 0 || end > view.lengthInBytes || end <= start) return '';
+    final buffer = StringBuffer();
+    for (var i = start; i < end; i++) {
+      buffer.writeCharCode(view.getUint8(i));
+    }
+    return buffer.toString();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CFF font outline decoder (public API)
 // ---------------------------------------------------------------------------
 
-/// Decodes a CFF glyph outline from font data.
+/// Decodifica contornos de glifo a partir de um bloco CFF.
 ///
-/// [cffOffset] and [cffLength] point to the 'CFF ' table in the font.
-/// [glyphId] is the glyph to decode.
-/// [unitsPerEm] is used for scaling if [fontSize] is provided.
-///
-/// Returns a [BLPathData] or null if decoding fails.
+/// [cffOffset] e [cffLength] delimitam o CFF dentro do buffer: a tabela
+/// `CFF ` de um OpenType, ou o arquivo inteiro no caso de um CFF puro.
 class BLCFFDecoder {
   const BLCFFDecoder._();
 
-  /// Decodes glyph outline from a CFF table.
+  /// Diz se [data] é um CFF "puro" (bare CFF / Type1C), sem contêiner sfnt.
   ///
-  /// Parses the CFF header, Name INDEX, TopDict INDEX, String INDEX, GSubR INDEX,
-  /// and the CharStrings INDEX to locate and interpret the charstring for [glyphId].
+  /// A detecção é deliberadamente conservadora: além de exigir o header CFF
+  /// (`major = 1`, `minor = 0`, `hdrSize` e `offSize` plausíveis), recusa
+  /// qualquer `sfntVersion` conhecido e só aceita se a estrutura inteira até
+  /// o CharStrings INDEX puder ser lida. Classificar um sfnt errado aqui
+  /// custaria uma fonte inteira sem glifos, então vale errar para o lado de
+  /// não detectar.
+  static bool looksLikeBareCFF(Uint8List data) {
+    if (data.length < 8) return false;
+
+    // Versões de sfnt conhecidas: 1.0 (TrueType), 'OTTO', 'true', 'ttcf' e
+    // 'typ1'. Nenhuma começa com 0x01 0x00, mas a checagem fica explicita.
+    final tag = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+    const sfntVersions = <int>[
+      0x00010000, // TrueType
+      0x4F54544F, // 'OTTO'
+      0x74727565, // 'true'
+      0x74746366, // 'ttcf'
+      0x74797031, // 'typ1'
+    ];
+    if (sfntVersions.contains(tag)) return false;
+
+    if (data[0] != 1 || data[1] != 0) return false; // major.minor = 1.0
+    final headerSize = data[2];
+    final offSize = data[3];
+    if (headerSize < 4 || headerSize >= data.length) return false;
+    if (offSize < 1 || offSize > 4) return false;
+
+    // Validação estrutural: sem um CharStrings INDEX legível não seria um CFF
+    // utilizável de qualquer forma.
+    final view = ByteData.sublistView(data);
+    return _CFFStructure.parse(view, 0, data.length) != null;
+  }
+
+  /// Decodifica o contorno do glifo [glyphId].
+  ///
+  /// Percorre header, Name INDEX, Top DICT INDEX, String INDEX, Global Subr
+  /// INDEX e CharStrings INDEX para localizar e interpretar a charstring.
   static BLPathData? decodeGlyph(
     ByteData view,
     int cffOffset,
@@ -540,60 +1075,10 @@ class BLCFFDecoder {
     double scaleX = 1.0,
     double scaleY = 1.0,
   }) {
-    if (cffLength < 4) return null;
+    final cff = _CFFStructure.parse(view, cffOffset, cffLength);
+    if (cff == null) return null;
 
-    // Header
-    final major = view.getUint8(cffOffset);
-    if (major != 1) return null; // Only CFF v1 supported in this bootstrap
-    final headerSize = view.getUint8(cffOffset + 2);
-
-    // Name INDEX (skip)
-    final nameIdx = _CFFIndex.parse(view, cffOffset + headerSize);
-    if (nameIdx == null) return null;
-
-    // TopDict INDEX
-    int nextOff =
-        cffOffset + headerSize + (nameIdx.count == 0 ? 2 : nameIdx.totalSize);
-    final topDictIdx = _CFFIndex.parse(view, nextOff);
-    if (topDictIdx == null || topDictIdx.count == 0) return null;
-
-    // String INDEX (skip)
-    nextOff += (topDictIdx.count == 0 ? 2 : topDictIdx.totalSize);
-    final stringIdx = _CFFIndex.parse(view, nextOff);
-
-    // GSubR INDEX
-    _CFFIndex? gsubrIdx;
-    if (stringIdx != null) {
-      final gsubrOff =
-          nextOff + (stringIdx.count == 0 ? 2 : stringIdx.totalSize);
-      gsubrIdx = _CFFIndex.parse(view, gsubrOff);
-    }
-
-    // Parse TopDict to find CharStrings offset and Private DICT
-    final topDictRange = topDictIdx.entryRange(0);
-    if (topDictRange == null) return null;
-    final charStringsOffset =
-        _findCharStringsOffset(view, topDictRange.$1, topDictRange.$2);
-    if (charStringsOffset < 0) return null;
-
-    // Parse Private DICT to find local subrs
-    final privInfo = _findPrivateDict(view, topDictRange.$1, topDictRange.$2);
-    _CFFIndex? localSubrs;
-    if (privInfo != null) {
-      final privOffset = cffOffset + privInfo.$1;
-      final privLength = privInfo.$2;
-      final localSubrOffset =
-          _findLocalSubrOffset(view, privOffset, privOffset + privLength);
-      if (localSubrOffset >= 0) {
-        localSubrs = _CFFIndex.parse(view, privOffset + localSubrOffset);
-      }
-    }
-
-    // CharStrings INDEX
-    final csIdx = _CFFIndex.parse(view, cffOffset + charStringsOffset);
-    if (csIdx == null || glyphId >= csIdx.count) return null;
-
-    final csRange = csIdx.entryRange(glyphId);
+    final csRange = cff.charStrings.entryRange(glyphId);
     if (csRange == null) return null;
 
     final path = BLPath();
@@ -606,151 +1091,11 @@ class BLCFFDecoder {
       scaleY,
       0,
       0,
-      localSubrs: localSubrs,
-      globalSubrs: gsubrIdx,
+      localSubrs: cff.localSubrs,
+      globalSubrs: cff.globalSubrs,
     );
     if (!ok) return null;
 
     return path.toPathData();
-  }
-
-  /// Finds the Private DICT offset and size from the TopDict (operator 18).
-  static (int, int)? _findPrivateDict(ByteData view, int start, int end) {
-    int p = start;
-    final operands = <int>[];
-
-    while (p < end) {
-      final b0 = view.getUint8(p++);
-      if (b0 >= 32 && b0 <= 246) {
-        operands.add(b0 - 139);
-      } else if (b0 >= 247 && b0 <= 250) {
-        if (p >= end) return null;
-        final b1 = view.getUint8(p++);
-        operands.add((b0 - 247) * 256 + b1 + 108);
-      } else if (b0 >= 251 && b0 <= 254) {
-        if (p >= end) return null;
-        final b1 = view.getUint8(p++);
-        operands.add(-(b0 - 251) * 256 - b1 - 108);
-      } else if (b0 == 28) {
-        if (p + 2 > end) return null;
-        operands.add(view.getInt16(p, Endian.big));
-        p += 2;
-      } else if (b0 == 29) {
-        if (p + 4 > end) return null;
-        operands.add(view.getInt32(p, Endian.big));
-        p += 4;
-      } else if (b0 == 30) {
-        while (p < end) {
-          final nibByte = view.getUint8(p++);
-          if ((nibByte & 0xF) == 0xF || (nibByte >> 4) == 0xF) break;
-        }
-        operands.add(0);
-      } else if (b0 == 12) {
-        if (p >= end) return null;
-        p++;
-        operands.clear();
-      } else {
-        // operator 18 = Private
-        if (b0 == 18 && operands.length >= 2) {
-          return (operands[operands.length - 1], operands[operands.length - 2]);
-        }
-        operands.clear();
-      }
-    }
-    return null;
-  }
-
-  /// Finds the local Subrs offset from a Private DICT (operator 19).
-  static int _findLocalSubrOffset(ByteData view, int start, int end) {
-    int p = start;
-    final operands = <int>[];
-
-    while (p < end) {
-      final b0 = view.getUint8(p++);
-      if (b0 >= 32 && b0 <= 246) {
-        operands.add(b0 - 139);
-      } else if (b0 >= 247 && b0 <= 250) {
-        if (p >= end) return -1;
-        final b1 = view.getUint8(p++);
-        operands.add((b0 - 247) * 256 + b1 + 108);
-      } else if (b0 >= 251 && b0 <= 254) {
-        if (p >= end) return -1;
-        final b1 = view.getUint8(p++);
-        operands.add(-(b0 - 251) * 256 - b1 - 108);
-      } else if (b0 == 28) {
-        if (p + 2 > end) return -1;
-        operands.add(view.getInt16(p, Endian.big));
-        p += 2;
-      } else if (b0 == 29) {
-        if (p + 4 > end) return -1;
-        operands.add(view.getInt32(p, Endian.big));
-        p += 4;
-      } else if (b0 == 30) {
-        while (p < end) {
-          final nibByte = view.getUint8(p++);
-          if ((nibByte & 0xF) == 0xF || (nibByte >> 4) == 0xF) break;
-        }
-        operands.add(0);
-      } else if (b0 == 12) {
-        if (p >= end) return -1;
-        p++;
-        operands.clear();
-      } else {
-        // operator 19 = Subrs
-        if (b0 == 19 && operands.isNotEmpty) {
-          return operands.last;
-        }
-        operands.clear();
-      }
-    }
-    return -1;
-  }
-
-  /// Scans a TopDict for the CharStrings offset (operator 17).
-  static int _findCharStringsOffset(ByteData view, int start, int end) {
-    int p = start;
-    final operands = <int>[];
-
-    while (p < end) {
-      final b0 = view.getUint8(p++);
-      if (b0 >= 32 && b0 <= 246) {
-        operands.add(b0 - 139);
-      } else if (b0 >= 247 && b0 <= 250) {
-        if (p >= end) return -1;
-        final b1 = view.getUint8(p++);
-        operands.add((b0 - 247) * 256 + b1 + 108);
-      } else if (b0 >= 251 && b0 <= 254) {
-        if (p >= end) return -1;
-        final b1 = view.getUint8(p++);
-        operands.add(-(b0 - 251) * 256 - b1 - 108);
-      } else if (b0 == 28) {
-        if (p + 2 > end) return -1;
-        operands.add(view.getInt16(p, Endian.big));
-        p += 2;
-      } else if (b0 == 29) {
-        if (p + 4 > end) return -1;
-        operands.add(view.getInt32(p, Endian.big));
-        p += 4;
-      } else if (b0 == 30) {
-        // Skip CFF float (nibble-encoded)
-        while (p < end) {
-          final nibByte = view.getUint8(p++);
-          if ((nibByte & 0xF) == 0xF || (nibByte >> 4) == 0xF) break;
-        }
-        operands.add(0); // placeholder
-      } else if (b0 == 12) {
-        // Two-byte operator — we just skip
-        if (p >= end) return -1;
-        p++;
-        operands.clear();
-      } else {
-        // Single-byte operator
-        if (b0 == 17 && operands.isNotEmpty) {
-          return operands.last; // CharStrings offset
-        }
-        operands.clear();
-      }
-    }
-    return -1;
   }
 }
