@@ -49,6 +49,8 @@ class BLFontCollection implements BLFontProvider {
   final List<BLFontFace> _faces = <BLFontFace>[];
   final List<BLFontProvider> _providers = <BLFontProvider>[];
   final Map<String, List<BLFontFace>> _aliases = <String, List<BLFontFace>>{};
+  final Map<String, Future<BLFontFace?>> _pending =
+      <String, Future<BLFontFace?>>{};
 
   List<BLFontFace> get faces => List<BLFontFace>.unmodifiable(_faces);
 
@@ -80,6 +82,18 @@ class BLFontCollection implements BLFontProvider {
   Future<BLFontFace?> resolve(BLFontQuery query) async {
     final local = resolveLocal(query);
     if (local != null) return local;
+    final key = '${query.families.map(_normalize).join('|')}:'
+        '${query.weight}:${query.slant.index}';
+    final pending = _pending[key];
+    if (pending != null) return pending;
+    final request = _resolveProviders(query).whenComplete(() {
+      _pending.remove(key);
+    });
+    _pending[key] = request;
+    return request;
+  }
+
+  Future<BLFontFace?> _resolveProviders(BLFontQuery query) async {
     for (final provider in _providers) {
       final face = await provider.resolve(query);
       if (face != null) {

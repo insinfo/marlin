@@ -116,7 +116,8 @@ use-o apenas em aplicações nativas.
 
 No navegador, registre um `BLCallbackFontProvider` na `BLFontCollection` para
 resolver URLs, Google Fonts ou `FontFace`. A coleção mantém a face em cache
-pelos nomes solicitados, mesmo quando o nome interno OpenType é diferente.
+pelos nomes solicitados, mesmo quando o nome interno OpenType é diferente, e
+compartilha uma única consulta entre resoluções simultâneas da mesma face.
 
 ## Origem
 

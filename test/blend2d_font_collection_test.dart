@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -124,6 +125,26 @@ void main() {
     expect(first, isNotNull);
     expect(second, same(first));
     expect(first!.familyName, 'InternalName');
+    expect(requests, 1);
+  });
+
+  test('resoluções remotas simultâneas compartilham o mesmo download',
+      () async {
+    final collection = BLFontCollection();
+    final bytes = Completer<Uint8List?>();
+    var requests = 0;
+    collection.addProvider(BLCallbackFontProvider((query) {
+      requests++;
+      return bytes.future;
+    }));
+    const query = BLFontQuery(['Concurrent Web Font'], weight: 700);
+
+    final first = collection.resolve(query);
+    final second = collection.resolve(query);
+    expect(requests, 1);
+    bytes.complete(_font('Downloaded-Bold'));
+
+    expect(await second, same(await first));
     expect(requests, 1);
   });
 
