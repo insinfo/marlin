@@ -74,4 +74,40 @@ void main() {
       unorderedEquals(['a.TTF', 'font.ttc', 'z.otf']),
     );
   });
+
+  test('carrega fontes descobertas e ignora arquivos inválidos', () async {
+    final root = await Directory.systemTemp.createTemp('dgfx-load-fonts-');
+    addTearDown(() => root.delete(recursive: true));
+    await File('${root.path}/valid.otf').writeAsBytes(_font('Local-Regular'));
+    await File('${root.path}/broken.ttf').writeAsBytes(const []);
+    final failures = <String>[];
+    final collection = BLFontCollection();
+
+    final count = await const BLFontLoader().loadSystemFonts(
+      collection,
+      directories: [root.path],
+      onError: (path, error) => failures.add(path),
+    );
+
+    expect(count, 1);
+    expect(collection.faces.single.familyName, 'Local');
+    expect(failures.single, endsWith('broken.ttf'));
+  });
+
+  test('limite de carregamento nativo evita catálogo sem teto', () async {
+    final root = await Directory.systemTemp.createTemp('dgfx-limit-fonts-');
+    addTearDown(() => root.delete(recursive: true));
+    await File('${root.path}/a.otf').writeAsBytes(_font('Alpha-Regular'));
+    await File('${root.path}/b.otf').writeAsBytes(_font('Beta-Regular'));
+    final collection = BLFontCollection();
+
+    final count = await const BLFontLoader().loadSystemFonts(
+      collection,
+      directories: [root.path],
+      maxFonts: 1,
+    );
+
+    expect(count, 1);
+    expect(collection.faces, hasLength(1));
+  });
 }

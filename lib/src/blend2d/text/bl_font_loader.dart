@@ -23,10 +23,33 @@ class BLFontLoader {
     Uint8List data, {
     String? familyName,
   }) {
+    if (!_hasRecognizedHeader(data)) {
+      throw const FormatException('Cabeçalho de fonte OpenType/CFF inválido.');
+    }
     return BLFontFace.parse(
       data,
       familyName: familyName,
     );
+  }
+
+  static bool _hasRecognizedHeader(Uint8List data) {
+    if (data.length < 4) return false;
+    final signature = String.fromCharCodes(data.take(4));
+    if (signature == 'OTTO' ||
+        signature == 'true' ||
+        signature == 'typ1' ||
+        signature == 'ttcf') {
+      return true;
+    }
+    if (data[0] == 0 && data[1] == 1 && data[2] == 0 && data[3] == 0) {
+      return true;
+    }
+    // CFF puro: major 1/2, minor, hdrSize e offSize válidos.
+    return (data[0] == 1 || data[0] == 2) &&
+        data[2] >= 4 &&
+        data[2] <= data.length &&
+        data[3] >= 1 &&
+        data[3] <= 4;
   }
 
   /// Diretórios usuais de fontes da plataforma atual.
@@ -94,5 +117,35 @@ class BLFontLoader {
     }
     final sorted = result.toList()..sort();
     return sorted;
+  }
+
+  /// Descobre, valida e adiciona fontes nativas a [collection].
+  ///
+  /// Arquivos ilegíveis ou formatos ainda não suportados são ignorados para
+  /// que uma fonte defeituosa do sistema não invalide o catálogo inteiro.
+  /// [onError] permite registrar esses casos. [maxFonts] limita o consumo de
+  /// memória em dispositivos móveis; `null` tenta carregar todas as faces.
+  Future<int> loadSystemFonts(
+    BLFontCollection collection, {
+    List<String>? directories,
+    int? maxFonts,
+    void Function(String path, Object error)? onError,
+  }) async {
+    if (maxFonts != null && maxFonts < 0) {
+      throw ArgumentError.value(maxFonts, 'maxFonts', 'deve ser nulo ou >= 0');
+    }
+    if (maxFonts == 0) return 0;
+    final files = await discoverSystemFontFiles(directories: directories);
+    var loaded = 0;
+    for (final path in files) {
+      if (maxFonts != null && loaded >= maxFonts) break;
+      try {
+        collection.addFace(await loadFile(path));
+        loaded++;
+      } on Object catch (error) {
+        onError?.call(path, error);
+      }
+    }
+    return loaded;
   }
 }
