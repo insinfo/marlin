@@ -278,6 +278,125 @@ Uint8List buildBareCFF({
   return file.toBytes();
 }
 
+/// CID-keyed CFF mínimo com dois Font DICTs e um subr local em cada um.
+Uint8List _buildCidCff({required bool fdSelectFormat3, int? fdSelectSentinel}) {
+  final nameIndex = _cffIndex(<Uint8List>[_latin1('TestCID')]);
+  final stringIndex = _cffIndex(const <Uint8List>[]);
+  final globalSubrs = _cffIndex(const <Uint8List>[]);
+  final charset = Uint8List.fromList(<int>[0, 0, 1, 0, 2]);
+  final fdSelect = fdSelectFormat3
+      ? Uint8List.fromList(<int>[
+          3, 0, 2, // formato, nRanges
+          0, 0, 0, // GID 0..1 usa FD 0
+          0, 2, 1, // GID 2 usa FD 1
+          0, fdSelectSentinel ?? 3, // sentinel
+        ])
+      : Uint8List.fromList(<int>[0, 0, 0, 1]);
+
+  final callSubr = BytesBuilder();
+  _csNum(callSubr, -107);
+  callSubr
+    ..addByte(10)
+    ..addByte(14);
+  final charStrings = _cffIndex(<Uint8List>[
+    _emptyCharstring(),
+    callSubr.toBytes(),
+    callSubr.toBytes(),
+  ]);
+  Uint8List privateDict(int relativeSubrs) {
+    final out = BytesBuilder();
+    _dictInt(out, relativeSubrs);
+    _dictOp(out, 19);
+    return out.toBytes();
+  }
+
+  final privateProbe = privateDict(0);
+  final private0 = privateDict(privateProbe.length);
+  final private1 = privateDict(privateProbe.length);
+  final subr0 = _cffIndex(<Uint8List>[
+    (BytesBuilder()
+          ..add(_rectOps(10, 20, 110, 220))
+          ..addByte(11))
+        .toBytes()
+  ]);
+  final subr1 = _cffIndex(<Uint8List>[
+    (BytesBuilder()
+          ..add(_rectOps(300, 40, 600, 440))
+          ..addByte(11))
+        .toBytes()
+  ]);
+
+  Uint8List fontDict(int privateOffset, int privateLength) {
+    final out = BytesBuilder();
+    _dictInt(out, privateLength);
+    _dictInt(out, privateOffset);
+    _dictOp(out, 18);
+    return out.toBytes();
+  }
+
+  Uint8List topDict(int charsetOffset, int charStringsOffset, int fdArrayOffset,
+      int fdSelectOffset) {
+    final out = BytesBuilder();
+    _dictInt(out, 0); // Registry SID
+    _dictInt(out, 0); // Ordering SID
+    _dictInt(out, 0); // Supplement
+    _dictOp(out, 1230); // ROS: torna a fonte CID-keyed
+    _dictInt(out, charsetOffset);
+    _dictOp(out, 15);
+    _dictInt(out, charStringsOffset);
+    _dictOp(out, 17);
+    _dictInt(out, fdArrayOffset);
+    _dictOp(out, 1236);
+    _dictInt(out, fdSelectOffset);
+    _dictOp(out, 1237);
+    return out.toBytes();
+  }
+
+  final topProbe = _cffIndex(<Uint8List>[topDict(0, 0, 0, 0)]);
+  final fdArrayProbe = _cffIndex(<Uint8List>[
+    fontDict(0, private0.length),
+    fontDict(0, private1.length),
+  ]);
+  const headerLength = 4;
+  final topOffset = headerLength + nameIndex.length;
+  final stringOffset = topOffset + topProbe.length;
+  final globalOffset = stringOffset + stringIndex.length;
+  final charsetOffset = globalOffset + globalSubrs.length;
+  final fdSelectOffset = charsetOffset + charset.length;
+  final charStringsOffset = fdSelectOffset + fdSelect.length;
+  final fdArrayOffset = charStringsOffset + charStrings.length;
+  final private0Offset = fdArrayOffset + fdArrayProbe.length;
+  final subr0Offset = private0Offset + private0.length;
+  final private1Offset = subr0Offset + subr0.length;
+
+  final fdArray = _cffIndex(<Uint8List>[
+    fontDict(private0Offset, private0.length),
+    fontDict(private1Offset, private1.length),
+  ]);
+  final top = _cffIndex(<Uint8List>[
+    topDict(charsetOffset, charStringsOffset, fdArrayOffset, fdSelectOffset),
+  ]);
+  if (top.length != topProbe.length || fdArray.length != fdArrayProbe.length) {
+    throw StateError('DICT CID mudou de tamanho entre as passadas');
+  }
+
+  return (BytesBuilder()
+        ..add(<int>[1, 0, headerLength, 2])
+        ..add(nameIndex)
+        ..add(top)
+        ..add(stringIndex)
+        ..add(globalSubrs)
+        ..add(charset)
+        ..add(fdSelect)
+        ..add(charStrings)
+        ..add(fdArray)
+        ..add(private0)
+        ..add(subr0)
+        ..add(private1)
+        ..add(subr1))
+      .toBytes();
+}
+
 /// Embrulha um CFF num sfnt OpenType mínimo (`OTTO` + `CFF ` + `head` + `maxp`).
 Uint8List wrapInOpenType(Uint8List cff, int glyphCount, int unitsPerEm) {
   final head = BytesBuilder();
@@ -643,6 +762,32 @@ void main() {
       expect(box.right, closeTo(500, 0.001));
       expect(box.top, closeTo(-700, 0.001));
       expect(box.bottom, closeTo(-50, 0.001));
+    });
+  });
+
+  group('CID-keyed CFF escolhe o Font DICT por glifo', () {
+    for (final format3 in <bool>[false, true]) {
+      test(
+          'FDSelect formato ${format3 ? 3 : 0} usa subrotinas locais distintas',
+          () {
+        final face = BLFontFace.parse(_buildCidCff(fdSelectFormat3: format3));
+        expect(face.cffInfo!.isCID, isTrue);
+
+        final first = _boxOf(face.glyphOutlineUnits(1)!);
+        final second = _boxOf(face.glyphOutlineUnits(2)!);
+        expect(first.left, closeTo(10, 0.001));
+        expect(first.right, closeTo(110, 0.001));
+        expect(first.top, closeTo(-220, 0.001));
+        expect(second.left, closeTo(300, 0.001));
+        expect(second.right, closeTo(600, 0.001));
+        expect(second.top, closeTo(-440, 0.001));
+      });
+    }
+
+    test('FDSelect formato 3 rejeita sentinel diferente de glyphCount', () {
+      final face = BLFontFace.parse(
+          _buildCidCff(fdSelectFormat3: true, fdSelectSentinel: 2));
+      expect(face.glyphOutlineUnits(2), isNull);
     });
   });
 }

@@ -435,27 +435,27 @@ bool _interpretCharstring(
         return true;
 
       case _T2Op.callsubr:
-        if (localSubrs != null && sp >= 1) {
-          final idx = stack[--sp].toInt() + subrBias(localSubrs.count);
-          final range = localSubrs.entryRange(idx);
-          if (range != null && callStack.length < maxCallDepth) {
-            callStack.add((p, end));
-            p = range.$1;
-            end = range.$2;
-          }
+        if (localSubrs == null || sp < 1 || callStack.length >= maxCallDepth) {
+          return false;
         }
+        final localIndex = stack[--sp].toInt() + subrBias(localSubrs.count);
+        final localRange = localSubrs.entryRange(localIndex);
+        if (localRange == null) return false;
+        callStack.add((p, end));
+        p = localRange.$1;
+        end = localRange.$2;
         break;
 
       case _T2Op.callgsubr:
-        if (globalSubrs != null && sp >= 1) {
-          final idx = stack[--sp].toInt() + subrBias(globalSubrs.count);
-          final range = globalSubrs.entryRange(idx);
-          if (range != null && callStack.length < maxCallDepth) {
-            callStack.add((p, end));
-            p = range.$1;
-            end = range.$2;
-          }
+        if (globalSubrs == null || sp < 1 || callStack.length >= maxCallDepth) {
+          return false;
         }
+        final globalIndex = stack[--sp].toInt() + subrBias(globalSubrs.count);
+        final globalRange = globalSubrs.entryRange(globalIndex);
+        if (globalRange == null) return false;
+        callStack.add((p, end));
+        p = globalRange.$1;
+        end = globalRange.$2;
         break;
 
       case _T2Op.returnOp:
@@ -636,6 +636,8 @@ class _CFFOp {
   static const int localSubrs = 19; // dentro do Private DICT
   static const int fontMatrix = 1207;
   static const int ros = 1230; // presente apenas em CIDFonts
+  static const int fdArray = 1236;
+  static const int fdSelect = 1237;
 }
 
 /// Resultado da leitura da "espinha dorsal" de um CFF.
@@ -645,6 +647,7 @@ class _CFFOp {
 class _CFFStructure {
   final ByteData view;
   final int cffOffset;
+  final int cffEnd;
   final _CFFIndex nameIndex;
   final _CFFIndex topDictIndex;
   final _CFFIndex? stringIndex;
@@ -655,6 +658,7 @@ class _CFFStructure {
   const _CFFStructure({
     required this.view,
     required this.cffOffset,
+    required this.cffEnd,
     required this.nameIndex,
     required this.topDictIndex,
     required this.stringIndex,
@@ -665,20 +669,79 @@ class _CFFStructure {
 
   /// INDEX de subrotinas locais, extraido do Private DICT (se houver).
   _CFFIndex? get localSubrs {
-    final priv = topDict[_CFFOp.private];
+    return _localSubrsFromDict(topDict);
+  }
+
+  _CFFIndex? _localSubrsFromDict(Map<int, List<double>> dict) {
+    final priv = dict[_CFFOp.private];
     if (priv == null || priv.length < 2) return null;
     final privSize = priv[0].toInt();
     final privOffset = cffOffset + priv[1].toInt();
     if (privSize <= 0 ||
         privOffset < cffOffset ||
-        privOffset + privSize > view.lengthInBytes) {
+        privOffset + privSize > cffEnd) {
       return null;
     }
     final privDict = _parseDict(view, privOffset, privOffset + privSize);
     final subrs = privDict[_CFFOp.localSubrs];
     if (subrs == null || subrs.isEmpty) return null;
     // O offset de Subrs é relativo ao início do Private DICT, não ao CFF.
-    return _CFFIndex.parse(view, privOffset + subrs.last.toInt());
+    final index = _CFFIndex.parse(view, privOffset + subrs.last.toInt());
+    return index != null && index.endOffset <= cffEnd ? index : null;
+  }
+
+  /// Subrotinas do Font DICT selecionado por FDSelect num CID-keyed CFF.
+  _CFFIndex? localSubrsForGlyph(int glyphId) {
+    if (!topDict.containsKey(_CFFOp.ros)) return localSubrs;
+    final fdArrayOperands = topDict[_CFFOp.fdArray];
+    final fdSelectOperands = topDict[_CFFOp.fdSelect];
+    if (fdArrayOperands == null ||
+        fdArrayOperands.isEmpty ||
+        fdSelectOperands == null ||
+        fdSelectOperands.isEmpty) {
+      return null;
+    }
+    final array =
+        _CFFIndex.parse(view, cffOffset + fdArrayOperands.last.toInt());
+    if (array == null || array.endOffset > cffEnd) return null;
+    final fd =
+        _fontDictForGlyph(cffOffset + fdSelectOperands.last.toInt(), glyphId);
+    if (fd == null || fd < 0 || fd >= array.count) return null;
+    final range = array.entryRange(fd);
+    if (range == null) return null;
+    return _localSubrsFromDict(_parseDict(view, range.$1, range.$2));
+  }
+
+  int? _fontDictForGlyph(int offset, int glyphId) {
+    if (glyphId < 0 ||
+        glyphId >= charStrings.count ||
+        offset < cffOffset ||
+        offset >= cffEnd) {
+      return null;
+    }
+    final format = view.getUint8(offset);
+    if (format == 0) {
+      final at = offset + 1 + glyphId;
+      return at < cffEnd ? view.getUint8(at) : null;
+    }
+    if (format != 3 || offset + 3 > cffEnd) return null;
+    final ranges = view.getUint16(offset + 1, Endian.big);
+    var p = offset + 3;
+    if (ranges == 0 || p + ranges * 3 + 2 > cffEnd) return null;
+    final sentinel = view.getUint16(offset + 3 + ranges * 3, Endian.big);
+    if (view.getUint16(p, Endian.big) != 0 || sentinel != charStrings.count) {
+      return null;
+    }
+    for (var i = 0; i < ranges; i++) {
+      final first = view.getUint16(p, Endian.big);
+      final fd = view.getUint8(p + 2);
+      final next =
+          i + 1 < ranges ? view.getUint16(p + 3, Endian.big) : sentinel;
+      if (next <= first) return null;
+      if (glyphId >= first && glyphId < next) return fd;
+      p += 3;
+    }
+    return null;
   }
 
   /// Le o header e os quatro INDEXes de topo. Devolve `null` se algo não
@@ -686,6 +749,7 @@ class _CFFStructure {
   static _CFFStructure? parse(ByteData view, int cffOffset, int cffLength) {
     if (cffOffset < 0 || cffLength < 4) return null;
     if (cffOffset + cffLength > view.lengthInBytes) return null;
+    final cffEnd = cffOffset + cffLength;
 
     final major = view.getUint8(cffOffset);
     if (major != 1) return null; // só CFF v1 nesta implementação
@@ -693,15 +757,25 @@ class _CFFStructure {
     if (headerSize < 4 || headerSize >= cffLength) return null;
 
     final nameIndex = _CFFIndex.parse(view, cffOffset + headerSize);
-    if (nameIndex == null) return null;
+    if (nameIndex == null || nameIndex.endOffset > cffEnd) return null;
 
     final topDictIndex = _CFFIndex.parse(view, nameIndex.endOffset);
-    if (topDictIndex == null || topDictIndex.count == 0) return null;
+    if (topDictIndex == null ||
+        topDictIndex.count == 0 ||
+        topDictIndex.endOffset > cffEnd) {
+      return null;
+    }
 
     final stringIndex = _CFFIndex.parse(view, topDictIndex.endOffset);
     final globalSubrs = stringIndex == null
         ? null
         : _CFFIndex.parse(view, stringIndex.endOffset);
+    if (stringIndex == null ||
+        stringIndex.endOffset > cffEnd ||
+        globalSubrs == null ||
+        globalSubrs.endOffset > cffEnd) {
+      return null;
+    }
 
     final topRange = topDictIndex.entryRange(0);
     if (topRange == null) return null;
@@ -711,11 +785,16 @@ class _CFFStructure {
     if (csOperands == null || csOperands.isEmpty) return null;
     final charStrings =
         _CFFIndex.parse(view, cffOffset + csOperands.last.toInt());
-    if (charStrings == null || charStrings.count == 0) return null;
+    if (charStrings == null ||
+        charStrings.count == 0 ||
+        charStrings.endOffset > cffEnd) {
+      return null;
+    }
 
     return _CFFStructure(
       view: view,
       cffOffset: cffOffset,
+      cffEnd: cffEnd,
       nameIndex: nameIndex,
       topDictIndex: topDictIndex,
       stringIndex: stringIndex,
@@ -1091,7 +1170,7 @@ class BLCFFDecoder {
       scaleY,
       0,
       0,
-      localSubrs: cff.localSubrs,
+      localSubrs: cff.localSubrsForGlyph(glyphId),
       globalSubrs: cff.globalSubrs,
     );
     if (!ok) return null;
