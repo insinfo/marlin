@@ -9,17 +9,18 @@
 ///   dart run benchmark/svg_render_benchmark.dart
 ///
 
-library benchmark;
+library;
 
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:marlin/marlin.dart';
-import 'package:marlin/src/svg/svg_parser.dart';
+import '../research/png/png_writer.dart';
+import '../research/rasterizers/rasterizers.dart';
+import '../research/svg/svg_parser.dart';
 
-import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer2.dart'
+import '../research/rasterizers/blend2d/blend2d_rasterizer2.dart'
     as b2d2;
 
 const outputDir = 'output/svg_renders';
@@ -429,19 +430,7 @@ List<RasterizerAdapter> _buildAdapters() {
 
       return _uint32ToRGBA(out);
     }),
-    FunctionAdapter('Marlin', (polygons) async {
-      final renderer = MarlinRenderer(renderWidth, renderHeight);
-      renderer.clear(0xFFFFFFFF);
-      renderer.init(0, 0, renderWidth, renderHeight, MarlinConst.windEvenOdd);
-
-      for (final poly in polygons) {
-        renderer.drawPolygon(poly.vertices, poly.color,
-            windingRule: poly.windingRule,
-            contourVertexCounts: poly.contourVertexCounts);
-      }
-
-      return _uint32ToRGBA(renderer.buffer.buffer.asUint32List());
-    }),
+    // Arm do Marlin (OpenJDK, GPL) removido junto com o port. Veja NOTICE.
     FunctionAdapter('SCANLINE_EO', (polygons) async {
       final r = ScanlineRasterizer(width: renderWidth, height: renderHeight);
       r.clear(0xFFFFFFFF);

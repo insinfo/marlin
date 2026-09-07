@@ -1,0 +1,40 @@
+MIT License
+
+Copyright (c) 2026 Isaque Neves
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+ESCOPO DESTA LICENÇA
+================================================================================
+
+A licença MIT acima cobre todo este repositório EXCETO o diretório
+`third_party/`, que contém software de terceiros sob licenças próprias.
+
+  third_party/marlin_openjdk/
+      Tradução para Dart do Marlin renderer do OpenJDK.
+      Copyright Oracle and/or its affiliates.
+      GNU General Public License versão 2, com Classpath Exception.
+      Veja third_party/marlin_openjdk/LICENSE.
+
+O diretório `third_party/` é usado apenas por testes e é excluído do pacote
+publicado no pub.dev (veja `.pubignore`). Nenhuma parte dele é alcançável a
+partir de `package:dgfx/dgfx.dart`, e um teste de arquitetura verifica isso.
+

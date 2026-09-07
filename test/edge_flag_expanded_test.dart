@@ -1,24 +1,27 @@
 import 'package:test/test.dart';
 
-import '../lib/src/rasterization_algorithms/edge_flag/rasterizer.dart';
+import '../research/rasterizers/edge_flag/rasterizer.dart';
 
 void main() {
   test('Render Triangle EvenOdd 8x', () {
     int w = 100;
     int h = 100;
     var rasterizer = ScanlineEdgeFlagRasterizer(w, h, samples: 8);
-    
+
     // Triangle
     List<double> vertices = [
-      10.0, 10.0,
-      90.0, 50.0,
-      10.0, 90.0,
+      10.0,
+      10.0,
+      90.0,
+      50.0,
+      10.0,
+      90.0,
     ];
-    
+
     rasterizer.rasterize(vertices, FillRule.evenOdd);
-    
+
     var output = rasterizer.outputBuffer;
-    
+
     int cx = 30;
     int cy = 50;
     int val = output[cy * w + cx];

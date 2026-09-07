@@ -1,0 +1,21 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  exclude:
+    # Material de pesquisa: fica no repositório mas fora da biblioteca e do
+    # pacote publicado. Não analisá-lo mantém o sinal do `dart analyze`
+    # focado no que é entregue.
+    - research/**
+    - referencias/**
+    - output/**
+    # Codigo de terceiros sob GPL: preservado como chegou, com os cabecalhos
+    # de copyright intactos. Nao aplicamos nosso estilo nem nossos lints nele.
+    - third_party/**
+
+linter:
+  rules:
+    # As classes do motor usam o prefixo `BL` e nomes de campo herdados da
+    # nomenclatura do Blend2D (kShift, kScale, A8Info...). Preservar essa
+    # correspondência é o que permite conferir o código contra a referência
+    # C++ — e a licença zlib pede justamente que a origem não seja obscurecida.
+    constant_identifier_names: false

@@ -1,0 +1,92 @@
+dgfx
+Copyright (c) 2026 Isaque Neves
+
+Distribuído sob a licença MIT — veja o arquivo LICENSE.
+
+================================================================================
+ATRIBUIÇÃO DE TERCEIROS
+================================================================================
+
+Este pacote é uma obra derivada. As seções abaixo identificam a origem do
+código e reproduzem as licenças que exigem retenção do aviso.
+
+--------------------------------------------------------------------------------
+1. Blend2D — lib/src/blend2d/
+--------------------------------------------------------------------------------
+
+O motor de rasterização, composição, gradientes, padrões, stroking e texto
+deste pacote é uma reimplementação independente em Dart, derivada do projeto
+Blend2D (C++).
+
+    Blend2D — 2D Vector Graphics Powered by a JIT Compiler
+    https://blend2d.com
+    Copyright (c) 2017-2025 Petr Kobalicek, Fabian Yzerman
+    Licença: zlib
+
+AVISO EXIGIDO PELA CLÁUSULA 2 DA LICENÇA ZLIB:
+
+    Esta é uma VERSÃO ALTERADA. `dgfx` NÃO é o Blend2D, não é distribuído
+    pelos autores do Blend2D e não é endossado por eles. Trata-se de uma
+    reimplementação em Dart, com arquitetura, API e comportamento próprios,
+    escrita a partir do estudo do projeto original. Bugs, diferenças de
+    renderização e características de desempenho aqui presentes são
+    responsabilidade deste pacote, não do Blend2D.
+
+Texto integral da licença zlib do Blend2D:
+
+    Copyright (c) 2017-2025 Petr Kobalicek, Fabian Yzerman
+
+    This software is provided 'as-is', without any express or implied
+    warranty. In no event will the authors be held liable for any damages
+    arising from the use of this software.
+
+    Permission is granted to anyone to use this software for any purpose,
+    including commercial applications, and to alter it and redistribute it
+    freely, subject to the following restrictions:
+
+    1. The origin of this software must not be misrepresented; you must not
+       claim that you wrote the original software. If you use this software
+       in a product, an acknowledgment in the product documentation would be
+       appreciated but is not required.
+    2. Altered source versions must be plainly marked as such, and must not be
+       misrepresented as being the original software.
+    3. This notice may not be removed or altered from any source distribution.
+
+--------------------------------------------------------------------------------
+2. Código NÃO incluído neste pacote
+--------------------------------------------------------------------------------
+
+O repositório de desenvolvimento contém material de pesquisa e rasterizadores
+experimentais que são deliberadamente EXCLUÍDOS do pacote publicado (veja
+`.pubignore`). Registrado aqui para que a procedência fique documentada:
+
+  - `lib/src/rasterization_algorithms/edge_flag*` deriva do algoritmo
+    "Scanline edge-flag algorithm for antialiasing", Copyright (c) 2005-2007
+    Kiia Kallio, licença BSD de 3 cláusulas.
+
+  - `lib/src/rasterization_algorithms/skia_scanline/` é inspirado no
+    rasterizador scanline do Skia, Copyright (c) 2011 Google Inc.,
+    licença BSD de 3 cláusulas.
+
+  - `lib/src/rasterization_algorithms/blend2d/` deriva do Blend2D (zlib),
+    creditado na seção 1.
+
+--------------------------------------------------------------------------------
+3. Marlin renderer (OpenJDK) — third_party/marlin_openjdk/
+--------------------------------------------------------------------------------
+
+O repositório contém, em `third_party/marlin_openjdk/`, uma tradução para Dart
+do Marlin renderer do OpenJDK.
+
+    Copyright Oracle and/or its affiliates
+    Original: sun.java2d.marlin / org.marlin.pisces
+    Licença: GNU General Public License versão 2, com Classpath Exception
+
+Traduzir código cria obra derivada, então esse port permanece sob a licença do
+original e NÃO é redistribuído sob MIT. Ele está licenciado separadamente no
+próprio diretório, com os cabeçalhos de copyright da Oracle preservados em cada
+arquivo e o aviso de modificação que a GPL exige.
+
+Esse diretório é usado apenas como oráculo independente em testes, é excluído
+do pacote publicado por `.pubignore`, e nenhuma linha dele é alcançável a
+partir de `package:dgfx/dgfx.dart`. Veja `third_party/marlin_openjdk/README.md`.

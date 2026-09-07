@@ -106,7 +106,7 @@ void main(List<String> args) {
 
   final kib = (table.length / 1024.0).toStringAsFixed(2);
   stdout.writeln(
-      'Generated $outPath (${table.length} entries, ${kib} KiB, bins=$binsPerOctant, maxDist16=$maxDist16)');
+      'Generated $outPath (${table.length} entries, $kib KiB, bins=$binsPerOctant, maxDist16=$maxDist16)');
 }
 
 int _parseIntArg(String arg, String prefix) {

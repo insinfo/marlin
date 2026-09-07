@@ -3,17 +3,19 @@
 /// Uso:
 ///   dart run benchmark/rasterization_benchmark.dart
 ///
+library;
 
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
 
-import 'package:marlin/marlin.dart';
+import '../research/png/png_writer.dart';
+import '../research/rasterizers/rasterizers.dart';
 
 // Import explícito das duas versões Blend2D (pra garantir acesso mesmo sem export)
-import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer.dart'
+import '../research/rasterizers/blend2d/blend2d_rasterizer.dart'
     as b2d1;
-import '../lib/src/rasterization_algorithms/blend2d/blend2d_rasterizer2.dart'
+import '../research/rasterizers/blend2d/blend2d_rasterizer2.dart'
     as b2d2;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +107,7 @@ class BenchmarkResult {
 
   @override
   String toString() {
-    return '$name: ${timeMs.toStringAsFixed(2)}ms (${polygonsPerSecond} poly/s)';
+    return '$name: ${timeMs.toStringAsFixed(2)}ms ($polygonsPerSecond poly/s)';
   }
 }
 
@@ -326,7 +328,7 @@ Future<void> main() async {
   print('╔══════════════════════════════════════════════════════════════════╗');
   print('║         MARLIN RASTERIZATION METHODS BENCHMARK                   ║');
   print(
-      '║         Resolution: ${width}x${height}, Iterations: $iterations              ║');
+      '║         Resolution: ${width}x$height, Iterations: $iterations              ║');
   print('╚══════════════════════════════════════════════════════════════════╝');
   print('');
 
@@ -386,27 +388,9 @@ Future<void> main() async {
     print('  ACDR failed: $e');
   }
 
-  // ─── MARLIN ─────────────────────────────────────────────────────────────
-  print('Testing Marlin...');
-  try {
-    final marlin = MarlinRenderer(width, height);
-    results.add(await runBenchmark(
-      'Marlin',
-      (vertices, color) {
-        marlin.drawPolygon(vertices, color);
-      },
-      polygons,
-      warmup,
-      iterations,
-      clear: () {
-        marlin.clear(0xFFFFFFFF);
-      },
-    ));
-    await saveImage(
-        'Marlin', marlin.buffer.buffer.asUint32List(), width, height);
-  } catch (e) {
-    print('  Marlin failed: $e');
-  }
+  // O arm de comparacao com o Marlin renderer do OpenJDK foi removido
+  // junto com o port, que era GPL e incompativel com a licenca MIT
+  // deste pacote. Veja NOTICE.
 
   // ─── SCANLINE_EO ────────────────────────────────────────────────────────
   print('Testing SCANLINE_EO (Scanline no AA)...');
