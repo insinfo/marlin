@@ -58,6 +58,7 @@ export 'src/blend2d/raster/bl_raster_defs.dart';
 export 'src/blend2d/text/bl_bidi.dart';
 export 'src/blend2d/text/bl_cff.dart';
 export 'src/blend2d/text/bl_font.dart';
+export 'src/blend2d/text/bl_font_collection.dart';
 export 'src/blend2d/text/bl_glyph_cache.dart';
 export 'src/blend2d/text/bl_glyph_rasterizer.dart';
 export 'src/blend2d/text/bl_glyph_run.dart';
