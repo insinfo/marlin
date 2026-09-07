@@ -199,6 +199,23 @@ class BLFontFace {
     );
   }
 
+  /// Contorno do glifo [glyphId] em unidades de fonte, já achatado em linhas.
+  ///
+  /// **Convenção de eixo:** o `y` devolvido cresce para BAIXO, ao contrário do
+  /// espaço de glifo do OpenType, onde ele cresce para cima. A inversão é feita
+  /// aqui para que o resultado possa ir direto ao rasterizador, que trabalha em
+  /// coordenadas de tela. Um contorno cuja caixa vai de `y=100` a `y=700` no
+  /// arquivo sai deste método indo de `-700` a `-100`.
+  ///
+  /// Quem compõe este contorno com uma matriz que já inverte o eixo — o
+  /// renderizador de PDF, por exemplo, onde a página é y-para-cima — precisa
+  /// contar com as duas inversões se cancelando.
+  ///
+  /// As coordenadas estão em unidades de [unitsPerEm]; divida por ele e
+  /// multiplique pelo corpo desejado para chegar ao espaço de texto.
+  ///
+  /// Devolve `null` quando o glifo não existe ou a fonte não traz contornos.
+  /// Um glifo em branco, como o espaço, devolve um caminho sem vértices.
   BLPathData? glyphOutlineUnits(
     int glyphId, {
     int maxCompoundDepth = 16,
@@ -549,6 +566,9 @@ class BLFontFace {
       final p = transform.apply(xs[idx].toDouble(), ys[idx].toDouble());
       points[i] = _BLGlyphPoint(
         p.$1,
+        // Inverte o eixo vertical: o espaço de glifo do OpenType é
+        // y-para-cima e o rasterizador é y-para-baixo. Documentado no
+        // contrato de `glyphOutlineUnits`, porque quem consome precisa saber.
         -p.$2,
         (flags[idx] & _ttOnCurvePoint) != 0,
       );
