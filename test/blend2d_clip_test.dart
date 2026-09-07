@@ -123,6 +123,35 @@ void main() {
       final ctx = BLContext(BLImage(2, 2));
       expect(() => ctx.intersectClipMask(Uint8List(3)), throwsArgumentError);
     });
+
+    test('opacity mask pode ser substituida sem perder o clip geometrico', () {
+      final image = BLImage(4, 1);
+      final ctx = BLContext(image);
+      final source = BLImage(4, 1)..clear(_kBlack);
+      ctx.intersectClipMask(Uint8List.fromList([255, 255, 0, 0]));
+      final geometric = ctx.clipMask;
+
+      ctx.setOpacityMask(Uint8List.fromList([0, 255, 255, 255]));
+      ctx.clear(_kWhite);
+      ctx.drawImage(source);
+      expect(image.pixels, [_kWhite, _kBlack, _kWhite, _kWhite]);
+
+      ctx.save();
+      ctx.setOpacityMask(null);
+      ctx.clear(_kWhite);
+      ctx.drawImage(source);
+      expect(image.pixels, [_kBlack, _kBlack, _kWhite, _kWhite]);
+      expect(identical(ctx.clipMask, geometric), isTrue);
+
+      ctx.restore();
+      expect(ctx.opacityMask, [0, 255, 255, 255]);
+      expect(identical(ctx.clipMask, geometric), isTrue);
+    });
+
+    test('setOpacityMask rejeita dimensao diferente da imagem', () {
+      final ctx = BLContext(BLImage(2, 2));
+      expect(() => ctx.setOpacityMask(Uint8List(3)), throwsArgumentError);
+    });
     test('clip circular transforma um retangulo em disco', () async {
       final image = BLImage(64, 64);
       final ctx = BLContext(image);

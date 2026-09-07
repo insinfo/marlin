@@ -47,6 +47,7 @@ class _BLContextState {
   /// numa máscara existente, sempre publica uma nova, então o snapshot não
   /// pode ser corrompido pelo estado que veio depois.
   final Uint8List? clipMask;
+  final Uint8List? opacityMask;
   final BLMatrix2D transform;
 
   _BLContextState({
@@ -62,6 +63,7 @@ class _BLContextState {
     required this.globalAlpha,
     required this.clipRect,
     required this.clipMask,
+    required this.opacityMask,
     required this.transform,
   });
 }
@@ -112,6 +114,13 @@ class BLContext {
 
   /// Máscara de clip corrente (null = sem clip de caminho).
   Uint8List? get clipMask => _clipMask;
+
+  /// Independent per-pixel opacity mask. Unlike the geometric clip, this can
+  /// be replaced or removed without losing the current clipping path.
+  Uint8List? _opacityMask;
+  Uint8List? _combinedMask;
+
+  Uint8List? get opacityMask => _opacityMask;
 
   /// Transformação afim corrente (identity por padrão).
   BLMatrix2D _transform = BLMatrix2D.identity;
@@ -169,6 +178,7 @@ class BLContext {
       globalAlpha: globalAlpha,
       clipRect: _clipRect,
       clipMask: _clipMask,
+      opacityMask: _opacityMask,
       transform: _transform,
     ));
     return _stateStack.length;
@@ -191,6 +201,8 @@ class BLContext {
     globalAlpha = state.globalAlpha;
     _clipRect = state.clipRect;
     _clipMask = state.clipMask;
+    _opacityMask = state.opacityMask;
+    _combinedMask = null;
     _transform = state.transform;
     return true;
   }
@@ -292,6 +304,35 @@ class BLContext {
   void resetClip() {
     _clipRect = null;
     _clipMask = null;
+    _combinedMask = null;
+  }
+
+  /// Replaces the current opacity mask, or removes it when [coverage] is null.
+  /// The geometric clip remains untouched. Input samples are copied so saved
+  /// states and caller-owned buffers cannot be mutated accidentally.
+  void setOpacityMask(Uint8List? coverage) {
+    final expected = image.width * image.height;
+    if (coverage != null && coverage.length != expected) {
+      throw ArgumentError.value(
+          coverage.length, 'coverage', 'Expected $expected mask samples.');
+    }
+    _opacityMask = coverage == null ? null : Uint8List.fromList(coverage);
+    _combinedMask = null;
+  }
+
+  Uint8List? _effectiveMask() {
+    final clip = _clipMask;
+    final opacity = _opacityMask;
+    if (clip == null) return opacity;
+    if (opacity == null) return clip;
+    final cached = _combinedMask;
+    if (cached != null) return cached;
+    final combined = Uint8List(clip.length);
+    for (var i = 0; i < combined.length; i++) {
+      final a = clip[i], b = opacity[i];
+      combined[i] = a == 255 ? b : (b == 255 ? a : (a * b + 127) ~/ 255);
+    }
+    return _combinedMask = combined;
   }
 
   /// Intersecta o clip corrente com [path] (regra [rule]).
@@ -308,6 +349,7 @@ class BLContext {
     if (data.vertices.length < 6) {
       // Caminho degenerado não delimita área nenhuma: clip vazio.
       _clipMask = Uint8List(image.width * image.height);
+      _combinedMask = null;
       return;
     }
 
@@ -334,6 +376,7 @@ class BLContext {
     // Publica uma máscara nova em vez de escrever na antiga: os snapshots em
     // _stateStack guardam a referência anterior e precisam continuar válidos.
     _clipMask = coverage;
+    _combinedMask = null;
   }
 
   /// Intersecta o clip vigente com uma cobertura externa em espaço de device.
@@ -357,6 +400,7 @@ class BLContext {
       }
     }
     _clipMask = combined;
+    _combinedMask = null;
   }
 
   /// Intersecta o clip corrente com um retângulo, materializado na máscara.
@@ -514,7 +558,7 @@ class BLContext {
       }
     }
 
-    final mask = _clipMask;
+    final mask = _effectiveMask();
 
     if (!useExplicitColor &&
         _fillStyleType == _BLFillStyleType.linearGradient &&
@@ -870,7 +914,7 @@ class BLContext {
     if (x0 >= x1 || y0 >= y1) return;
 
     final alphaScale = globalAlpha < 1.0;
-    final mask = _clipMask;
+    final mask = _effectiveMask();
 
     for (int py = y0; py < y1; py++) {
       final srcRow = (py - dy) * srcW;
