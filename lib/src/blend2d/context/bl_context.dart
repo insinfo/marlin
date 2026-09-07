@@ -336,6 +336,29 @@ class BLContext {
     _clipMask = coverage;
   }
 
+  /// Intersecta o clip vigente com uma cobertura externa em espaço de device.
+  ///
+  /// Cada byte corresponde a um pixel da imagem (`0` invisível, `255`
+  /// totalmente visível). A entrada é copiada para preservar os snapshots de
+  /// [save]/[restore] e pode ser reutilizada ou alterada pelo chamador.
+  void intersectClipMask(Uint8List coverage) {
+    final expected = image.width * image.height;
+    if (coverage.length != expected) {
+      throw ArgumentError.value(
+          coverage.length, 'coverage', 'Expected $expected mask samples.');
+    }
+    final combined = Uint8List.fromList(coverage);
+    final previous = _clipMask;
+    if (previous != null) {
+      for (var i = 0; i < combined.length; i++) {
+        final a = previous[i];
+        final b = combined[i];
+        combined[i] = a == 255 ? b : (b == 255 ? a : (a * b + 127) ~/ 255);
+      }
+    }
+    _clipMask = combined;
+  }
+
   /// Intersecta o clip corrente com um retângulo, materializado na máscara.
   ///
   /// Diferente de [clipToRect], que mantém o retângulo como caixa inteira

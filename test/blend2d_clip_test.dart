@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:test/test.dart';
 
 import 'package:dgfx/dgfx.dart';
@@ -103,6 +105,24 @@ void main() {
   });
 
   group('clipToPath', () {
+    test('intersectClipMask combina cobertura e participa de save/restore', () {
+      final image = BLImage(2, 2);
+      final ctx = BLContext(image);
+      ctx.intersectClipMask(Uint8List.fromList([255, 128, 64, 0]));
+      expect(ctx.clipMask, [255, 128, 64, 0]);
+
+      final original = ctx.clipMask;
+      ctx.save();
+      ctx.intersectClipMask(Uint8List.fromList([128, 128, 255, 255]));
+      expect(ctx.clipMask, [128, 64, 64, 0]);
+      ctx.restore();
+      expect(identical(ctx.clipMask, original), isTrue);
+    });
+
+    test('intersectClipMask rejeita dimensão diferente da imagem', () {
+      final ctx = BLContext(BLImage(2, 2));
+      expect(() => ctx.intersectClipMask(Uint8List(3)), throwsArgumentError);
+    });
     test('clip circular transforma um retangulo em disco', () async {
       final image = BLImage(64, 64);
       final ctx = BLContext(image);
