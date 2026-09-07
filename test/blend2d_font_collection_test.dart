@@ -53,6 +53,21 @@ void main() {
       expect((await collection.resolve(query))!.familyName, 'Remote');
       expect(calls, 1);
     });
+
+    test('resolve uma face por alias preservando seleção de peso', () {
+      final collection = BLFontCollection();
+      final regular = collection.addBytes(_font('Installed-Regular'));
+      final bold = collection.addBytes(_font('Installed-Bold'));
+      collection
+        ..addAlias('Author Face', regular)
+        ..addAlias('Author Face', bold);
+
+      expect(
+          collection
+              .resolveLocal(const BLFontQuery(['Author Face'], weight: 700)),
+          same(bold));
+      expect(regular.familyName, 'Installed');
+    });
   });
 
   test('descoberta nativa filtra extensões e ordena sem seguir links',

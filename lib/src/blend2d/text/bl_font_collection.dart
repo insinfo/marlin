@@ -48,10 +48,23 @@ class BLCallbackFontProvider implements BLFontProvider {
 class BLFontCollection implements BLFontProvider {
   final List<BLFontFace> _faces = <BLFontFace>[];
   final List<BLFontProvider> _providers = <BLFontProvider>[];
+  final Map<String, List<BLFontFace>> _aliases = <String, List<BLFontFace>>{};
 
   List<BLFontFace> get faces => List<BLFontFace>.unmodifiable(_faces);
 
   void addFace(BLFontFace face) => _faces.add(face);
+
+  /// Makes [face] selectable through an additional CSS or application family.
+  ///
+  /// This is useful for `@font-face { font-family: Alias; src: local(...) }`,
+  /// where the face keeps its intrinsic family name but must also answer to the
+  /// author-defined one. Several weights/styles may share the same alias.
+  void addAlias(String family, BLFontFace face) {
+    final normalized = _normalize(family);
+    if (normalized.isEmpty) return;
+    final faces = _aliases.putIfAbsent(normalized, () => <BLFontFace>[]);
+    if (!faces.contains(face)) faces.add(face);
+  }
 
   BLFontFace addBytes(Uint8List bytes, {String? familyName}) {
     final face = BLFontFace.parse(bytes, familyName: familyName);
@@ -81,7 +94,12 @@ class BLFontCollection implements BLFontProvider {
     BLFontFace? best;
     var bestScore = 1 << 30;
     for (final face in _faces) {
-      final familyRank = _familyRank(face.familyName, query.families);
+      var familyRank = _familyRank(face.familyName, query.families);
+      for (var i = 0; i < query.families.length; i++) {
+        if (_aliases[_normalize(query.families[i])]?.contains(face) ?? false) {
+          if (familyRank < 0 || i < familyRank) familyRank = i;
+        }
+      }
       if (familyRank < 0) continue;
       final faceSlant = _slantOf(face);
       final slantPenalty = faceSlant == query.slant
