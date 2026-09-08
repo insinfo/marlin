@@ -7,6 +7,7 @@
 /// Inspired by: `blend2d/opentype/otcff.cpp`, `otcff_p.h`
 library;
 
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../geometry/bl_path.dart';
@@ -150,12 +151,14 @@ bool _interpretCharstring(
   List<List<double>> variationScalars = const <List<double>>[],
 }) {
   final stack = Float64List(48); // CFF operand stack (max 48 per spec)
+  final transient = Float64List(32);
   int sp = 0; // stack pointer
   double x = offsetX, y = offsetY;
   bool hasWidth = false;
   bool hasMoveTo = false;
   int stemCount = 0;
   var variationIndex = 0;
+  var randomState = 0x1234567;
 
   void moveTo(double dx, double dy) {
     x += dx;
@@ -523,8 +526,125 @@ bool _interpretCharstring(
         if (p >= end) return false;
         final b1 = view.getUint8(p++);
         // Most escape operators are hints/math that don't affect outlines.
-        // We skip them but pop the stack appropriately.
+        // Operadores de pilha e aritmética precisam ser executados: seus
+        // resultados frequentemente alimentam os operadores de contorno.
         switch (b1) {
+          case 3: // and
+            if (sp < 2) return false;
+            stack[sp - 2] = stack[sp - 2] != 0 && stack[sp - 1] != 0 ? 1 : 0;
+            sp--;
+            break;
+          case 4: // or
+            if (sp < 2) return false;
+            stack[sp - 2] = stack[sp - 2] != 0 || stack[sp - 1] != 0 ? 1 : 0;
+            sp--;
+            break;
+          case 5: // not
+            if (sp < 1) return false;
+            stack[sp - 1] = stack[sp - 1] == 0 ? 1 : 0;
+            break;
+          case 9: // abs
+            if (sp < 1) return false;
+            stack[sp - 1] = stack[sp - 1].abs();
+            break;
+          case 10: // add
+            if (sp < 2) return false;
+            stack[sp - 2] += stack[sp - 1];
+            sp--;
+            break;
+          case 11: // sub
+            if (sp < 2) return false;
+            stack[sp - 2] -= stack[sp - 1];
+            sp--;
+            break;
+          case 12: // div
+            if (sp < 2 || stack[sp - 1] == 0) return false;
+            stack[sp - 2] /= stack[sp - 1];
+            sp--;
+            break;
+          case 14: // neg
+            if (sp < 1) return false;
+            stack[sp - 1] = -stack[sp - 1];
+            break;
+          case 15: // eq
+            if (sp < 2) return false;
+            stack[sp - 2] = stack[sp - 2] == stack[sp - 1] ? 1 : 0;
+            sp--;
+            break;
+          case 18: // drop
+            if (sp < 1) return false;
+            sp--;
+            break;
+          case 20: // put
+            if (sp < 2) return false;
+            final index = stack[sp - 1].toInt();
+            if (index < 0 || index >= transient.length) return false;
+            transient[index] = stack[sp - 2];
+            sp -= 2;
+            break;
+          case 21: // get
+            if (sp < 1) return false;
+            final index = stack[sp - 1].toInt();
+            if (index < 0 || index >= transient.length) return false;
+            stack[sp - 1] = transient[index];
+            break;
+          case 22: // ifelse: s1 s2 v1 v2 -> s1 ou s2
+            if (sp < 4) return false;
+            stack[sp - 4] =
+                stack[sp - 2] <= stack[sp - 1] ? stack[sp - 4] : stack[sp - 3];
+            sp -= 3;
+            break;
+          case 23: // random
+            if (sp >= stack.length) return false;
+            // LCG determinístico: renderizações repetidas devem ser idênticas.
+            randomState = (1103515245 * randomState + 12345) & 0x7fffffff;
+            stack[sp++] = (randomState + 1) / 0x80000000;
+            break;
+          case 24: // mul
+            if (sp < 2) return false;
+            stack[sp - 2] *= stack[sp - 1];
+            sp--;
+            break;
+          case 26: // sqrt
+            if (sp < 1 || stack[sp - 1] < 0) return false;
+            stack[sp - 1] = math.sqrt(stack[sp - 1]);
+            break;
+          case 27: // dup
+            if (sp < 1 || sp >= stack.length) return false;
+            stack[sp] = stack[sp - 1];
+            sp++;
+            break;
+          case 28: // exch
+            if (sp < 2) return false;
+            final value = stack[sp - 1];
+            stack[sp - 1] = stack[sp - 2];
+            stack[sp - 2] = value;
+            break;
+          case 29: // index
+            if (sp < 1) return false;
+            final requestedIndex = stack[sp - 1].toInt();
+            // A especificação manda tratar índice negativo como zero.
+            final index = requestedIndex < 0 ? 0 : requestedIndex;
+            if (index >= sp - 1) return false;
+            stack[sp - 1] = stack[sp - 2 - index];
+            break;
+          case 30: // roll
+            if (sp < 2) return false;
+            final shift = stack[sp - 1].toInt();
+            final count = stack[sp - 2].toInt();
+            sp -= 2;
+            if (count < 0 || count > sp) return false;
+            if (count > 1) {
+              final normalized = ((shift % count) + count) % count;
+              if (normalized != 0) {
+                final values =
+                    List<double>.generate(count, (i) => stack[sp - count + i]);
+                for (var i = 0; i < count; i++) {
+                  stack[sp - count + ((i + normalized) % count)] = values[i];
+                }
+              }
+            }
+            break;
           case 34: // hflex
             if (sp >= 7) {
               curveTo(stack[0], 0, stack[1], stack[2], stack[3], 0);

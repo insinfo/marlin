@@ -159,6 +159,87 @@ Uint8List _rectCharstring(int x0, int y0, int x1, int y1) {
   return out.toBytes();
 }
 
+/// Retângulo cujas coordenadas dependem de operadores aritméticos Type 2.
+Uint8List _arithmeticRectCharstring() {
+  final out = BytesBuilder();
+  _csNum(out, 100);
+  _csNum(out, 20);
+  _dictOp(out, 1210); // add -> 120
+  _csNum(out, 50);
+  _csNum(out, 10);
+  _dictOp(out, 1211); // sub -> 40
+  _u8(out, 21); // rmoveto(120, 40)
+
+  for (final delta in const <(int, int)>[
+    (100, 0),
+    (0, 100),
+    (-100, 0),
+    (0, -100),
+  ]) {
+    _csNum(out, delta.$1);
+    _csNum(out, 2);
+    _dictOp(out, 1224); // mul
+    _csNum(out, delta.$2);
+    _csNum(out, 2);
+    _dictOp(out, 1224); // mul
+    _u8(out, 5); // rlineto
+  }
+  _u8(out, 14); // endchar
+  return out.toBytes();
+}
+
+/// Exercita armazenamento, condicionais e manipulação da pilha Type 2.
+Uint8List _stackRectCharstring() {
+  final out = BytesBuilder();
+  _csNum(out, 120);
+  _csNum(out, 0);
+  _dictOp(out, 1220); // put 120 em transient[0]
+  _csNum(out, 0);
+  _dictOp(out, 1221); // get -> 120
+  _csNum(out, 60);
+  _csNum(out, 2);
+  _dictOp(out, 1212); // div -> 30
+  _csNum(out, 10);
+  _dictOp(out, 1210); // add -> 40
+  _csNum(out, 2);
+  _csNum(out, 1);
+  _dictOp(out, 1230); // roll -> 40, 120
+  _dictOp(out, 1228); // exch -> 120, 40
+  _csNum(out, -1);
+  _dictOp(out, 1229); // index negativo duplica o topo
+  _dictOp(out, 1218); // drop
+  _u8(out, 21); // rmoveto(120, 40)
+
+  _csNum(out, 100);
+  _dictOp(out, 1227); // dup
+  _dictOp(out, 1210); // add -> 200
+  _csNum(out, 1);
+  _dictOp(out, 1205); // not -> 0
+  _u8(out, 5); // rlineto(200, 0)
+
+  _csNum(out, 0);
+  _csNum(out, -200);
+  _dictOp(out, 1209); // abs -> 200
+  _u8(out, 5); // rlineto(0, 200)
+
+  _csNum(out, -200); // s1
+  _csNum(out, -100); // s2
+  _csNum(out, 1); // v1
+  _csNum(out, 2); // v2
+  _dictOp(out, 1222); // ifelse -> -200
+  _csNum(out, 0);
+  _u8(out, 5); // rlineto(-200, 0)
+
+  _csNum(out, 0);
+  _csNum(out, 100);
+  _csNum(out, 2);
+  _dictOp(out, 1224); // mul -> 200
+  _dictOp(out, 1214); // neg -> -200
+  _u8(out, 5); // rlineto(0, -200)
+  _u8(out, 14); // endchar
+  return out.toBytes();
+}
+
 /// Charstring vazia (`.notdef` em branco).
 Uint8List _emptyCharstring() => Uint8List.fromList(<int>[14]);
 
@@ -783,6 +864,38 @@ void main() {
       expect(box.right, closeTo(3500, 0.001));
       expect(box.top, closeTo(-2000, 0.001));
       expect(box.bottom, closeTo(0, 0.001));
+    });
+
+    test('executa aritmética antes de construir o contorno', () {
+      final computed = buildBareCFF(
+        charstrings: <Uint8List>[
+          _emptyCharstring(),
+          _arithmeticRectCharstring(),
+        ],
+        charsetSids: const <int>[sidA],
+      );
+      final box = _boxOf(BLFontFace.parse(computed).glyphOutlineUnits(1)!);
+
+      expect(box.left, closeTo(120, 0.001));
+      expect(box.right, closeTo(320, 0.001));
+      expect(box.top, closeTo(-240, 0.001));
+      expect(box.bottom, closeTo(-40, 0.001));
+    });
+
+    test('executa armazenamento, condicionais e operações de pilha', () {
+      final computed = buildBareCFF(
+        charstrings: <Uint8List>[
+          _emptyCharstring(),
+          _stackRectCharstring(),
+        ],
+        charsetSids: const <int>[sidA],
+      );
+      final box = _boxOf(BLFontFace.parse(computed).glyphOutlineUnits(1)!);
+
+      expect(box.left, closeTo(120, 0.001));
+      expect(box.right, closeTo(320, 0.001));
+      expect(box.top, closeTo(-240, 0.001));
+      expect(box.bottom, closeTo(-40, 0.001));
     });
 
     test('interpreta uma chamada a subrotina local', () {
