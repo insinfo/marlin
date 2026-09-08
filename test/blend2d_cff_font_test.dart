@@ -179,6 +179,7 @@ Uint8List buildBareCFF({
   String? fontMatrixScale,
   List<int> fontBBox = const <int>[0, -200, 1000, 800],
   int charsetFormat = 0,
+  int? predefinedEncoding,
   List<Uint8List> localSubrs = const <Uint8List>[],
 }) {
   final nameIndex = _cffIndex(<Uint8List>[_latin1(name)]);
@@ -250,6 +251,10 @@ Uint8List buildBareCFF({
     }
     _dictInt(out, charsetOff);
     _dictOp(out, 15); // charset
+    if (predefinedEncoding != null) {
+      _dictInt(out, predefinedEncoding);
+      _dictOp(out, 16); // Encoding (0 = Standard, 1 = Expert)
+    }
     _dictInt(out, charStringsOff);
     _dictOp(out, 17); // CharStrings
     _dictInt(out, privateDict.length);
@@ -602,6 +607,26 @@ void main() {
       expect(face.hasTrueTypeOutlines, isFalse);
       expect(face.cffOffset, isZero);
       expect(face.cffLength, equals(simple.length));
+    });
+
+    test('resolve todos os códigos presentes no Expert Encoding', () {
+      final expert = buildBareCFF(
+        charstrings: <Uint8List>[
+          _emptyCharstring(),
+          _rectCharstring(0, 0, 100, 100),
+          _rectCharstring(0, 0, 200, 200),
+          _rectCharstring(0, 0, 300, 300),
+        ],
+        // exclamsmall, onequarter e Ydieresissmall.
+        charsetSids: const <int>[229, 158, 378],
+        predefinedEncoding: 1,
+      );
+      final encoding = BLFontFace.parse(expert).cffInfo!.codeToGlyphId;
+
+      expect(encoding[33], equals(1));
+      expect(encoding[188], equals(2));
+      expect(encoding[255], equals(3));
+      expect(encoding, isNot(contains(35))); // .notdef na tabela normativa.
     });
 
     test('usa o FontMatrix padrao como um em de 1000', () {

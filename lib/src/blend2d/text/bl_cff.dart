@@ -1042,17 +1042,20 @@ Map<int, int> _buildCodeToGlyphId(
 ) {
   final out = <int, int>{};
 
-  if (encodingOffset == 0) {
-    // Standard Encoding: código -> SID -> nome -> GID.
-    for (var code = 0; code < cffStandardEncodingSids.length; code++) {
-      final sid = cffStandardEncodingSids[code];
+  if (encodingOffset == 0 || encodingOffset == 1) {
+    // Encodings predefinidos: código -> SID -> nome -> GID.
+    final entries = encodingOffset == 0
+        ? cffStandardEncodingSids.asMap().entries
+        : cffExpertEncodingSids.entries;
+    for (final entry in entries) {
+      final code = entry.key;
+      final sid = entry.value;
       if (sid == 0) continue;
       final gid = nameToGlyphId[cffStandardStrings[sid]];
       if (gid != null && gid != 0) out[code] = gid;
     }
     return out;
   }
-  if (encodingOffset == 1) return out; // Expert Encoding: não tabelado aqui
 
   final base = cffOffset + encodingOffset;
   if (base < 0 || base >= view.lengthInBytes) return out;
