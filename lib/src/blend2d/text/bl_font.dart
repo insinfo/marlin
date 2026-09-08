@@ -260,6 +260,7 @@ class BLFontFace {
   BLPathData? glyphOutlineUnits(
     int glyphId, {
     int maxCompoundDepth = 16,
+    List<double> variationCoordinates = const <double>[],
   }) {
     if (glyphCount <= 0) return null;
 
@@ -267,7 +268,8 @@ class BLFontFace {
     if (gid < 0) gid = 0;
     if (gid >= glyphCount) gid = glyphCount - 1;
 
-    final cached = _glyphOutlineUnitsCache[gid];
+    final useDefaultInstance = variationCoordinates.isEmpty;
+    final cached = useDefaultInstance ? _glyphOutlineUnitsCache[gid] : null;
     if (cached != null) return cached;
 
     BLPathData? out;
@@ -290,11 +292,13 @@ class BLFontFace {
         cffOffset,
         cffLength,
         gid,
+        variationCoordinates: variationCoordinates,
       );
     }
 
     if (out == null) return null;
 
+    if (!useDefaultInstance) return out;
     if (_glyphOutlineUnitsCache.length >= 2048 &&
         !_glyphOutlineUnitsCache.containsKey(gid)) {
       _glyphOutlineUnitsCache.remove(_glyphOutlineUnitsCache.keys.first);
@@ -1563,11 +1567,19 @@ class BLFontFace {
 class BLFont {
   final BLFontFace face;
   final double size;
+  final List<double> variationCoordinates;
   final Map<int, BLPathData> _glyphOutlineCache = <int, BLPathData>{};
 
-  BLFont(this.face, this.size);
+  BLFont(this.face, this.size, {this.variationCoordinates = const <double>[]});
 
-  BLFont withSize(double newSize) => BLFont(face, newSize);
+  BLFont withSize(double newSize) =>
+      BLFont(face, newSize, variationCoordinates: variationCoordinates);
+
+  /// Returns an instance at normalized OpenType variation coordinates.
+  /// Values outside `[-1, 1]` are clamped by the CFF2 variation store.
+  BLFont withVariationCoordinates(List<double> coordinates) =>
+      BLFont(face, size,
+          variationCoordinates: List<double>.unmodifiable(coordinates));
 
   double glyphAdvance(int glyphId) => face.glyphAdvance(size, glyphId);
 
@@ -1591,7 +1603,8 @@ class BLFont {
     final cached = _glyphOutlineCache[gid];
     if (cached != null) return cached;
 
-    final unitsPath = face.glyphOutlineUnits(gid);
+    final unitsPath =
+        face.glyphOutlineUnits(gid, variationCoordinates: variationCoordinates);
     if (unitsPath == null) return null;
 
     final upm = face.unitsPerEm > 0 ? face.unitsPerEm : 1000;

@@ -881,6 +881,39 @@ void main() {
       expect(box.top, closeTo(-330, .001));
       expect(box.bottom, closeTo(-30, .001));
     });
+
+    test('blend aplica deltas em coordenadas normalizadas não padrão', () {
+      final program = BytesBuilder();
+      _csNum(program, 0);
+      _u8(program, 15); // vsindex
+      for (final value in <int>[20, 30, 500, 600, 2]) {
+        _csNum(program, value);
+      }
+      _u8(program, 16); // blend
+      _u8(program, 21); // rmoveto
+      for (final value in <int>[200, 0, 0, 300, -200, 0]) {
+        _csNum(program, value);
+      }
+      _u8(program, 5);
+      final variable =
+          _buildCff2(<Uint8List>[program.toBytes()], withVariationStore: true);
+      final face =
+          BLFontFace.parse(wrapInOpenType(variable, 1, 1000, cffTag: 'CFF2'));
+
+      final half = _boxOf(BLFont(face, 1000)
+          .withVariationCoordinates(const <double>[.5]).glyphOutline(0)!);
+      expect(half.left, closeTo(270, .001));
+      expect(half.right, closeTo(470, .001));
+      expect(half.top, closeTo(-630, .001));
+      expect(half.bottom, closeTo(-330, .001));
+
+      final peak = _boxOf(
+          face.glyphOutlineUnits(0, variationCoordinates: const <double>[1])!);
+      expect(peak.left, closeTo(520, .001));
+      expect(peak.right, closeTo(720, .001));
+      expect(peak.top, closeTo(-930, .001));
+      expect(peak.bottom, closeTo(-630, .001));
+    });
   });
 
   group('CID-keyed CFF escolhe o Font DICT por glifo', () {

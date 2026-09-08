@@ -147,7 +147,7 @@ bool _interpretCharstring(
   double offsetY, {
   _CFFIndex? localSubrs,
   _CFFIndex? globalSubrs,
-  List<int> variationRegionCounts = const <int>[],
+  List<List<double>> variationScalars = const <List<double>>[],
 }) {
   final stack = Float64List(48); // CFF operand stack (max 48 per spec)
   int sp = 0; // stack pointer
@@ -446,23 +446,29 @@ bool _interpretCharstring(
       case _T2Op.vsindex:
         if (sp < 1) return false;
         variationIndex = stack[--sp].toInt();
-        if (variationIndex < 0 ||
-            variationIndex >= variationRegionCounts.length) {
+        if (variationIndex < 0 || variationIndex >= variationScalars.length) {
           return false;
         }
         break;
 
       case _T2Op.blend:
-        if (sp < 1 || variationIndex >= variationRegionCounts.length) {
+        if (sp < 1 || variationIndex >= variationScalars.length) {
           return false;
         }
         final valueCount = stack[sp - 1].toInt();
-        final regionCount = variationRegionCounts[variationIndex];
+        final scalars = variationScalars[variationIndex];
+        final regionCount = scalars.length;
         final required = valueCount * (regionCount + 1) + 1;
         if (valueCount < 0 || required > sp) return false;
-        // A instância padrão tem todas as coordenadas normalizadas em zero:
-        // os deltas desaparecem e permanecem apenas os valores-base.
         final first = sp - required;
+        for (var value = 0; value < valueCount; value++) {
+          var blended = stack[first + value];
+          for (var region = 0; region < regionCount; region++) {
+            blended += stack[first + valueCount * (region + 1) + value] *
+                scalars[region];
+          }
+          stack[first + value] = blended;
+        }
         sp = first + valueCount;
         break;
 
@@ -688,7 +694,7 @@ class _CFFStructure {
   final Map<int, List<double>> topDict;
   final _CFFIndex charStrings;
   final bool isCff2;
-  final List<int> variationRegionCounts;
+  final _CFFVariationStore? variationStore;
 
   const _CFFStructure({
     required this.view,
@@ -701,7 +707,7 @@ class _CFFStructure {
     required this.topDict,
     required this.charStrings,
     required this.isCff2,
-    this.variationRegionCounts = const <int>[],
+    this.variationStore,
   });
 
   /// INDEX de subrotinas locais, extraido do Private DICT (se houver).
@@ -824,8 +830,7 @@ class _CFFStructure {
         topDict: topDict,
         charStrings: charStrings,
         isCff2: true,
-        variationRegionCounts:
-            _parseVariationRegionCounts(view, cffOffset, cffEnd, topDict),
+        variationStore: _parseVariationStore(view, cffOffset, cffEnd, topDict),
       );
     }
 
@@ -879,23 +884,84 @@ class _CFFStructure {
   }
 }
 
-List<int> _parseVariationRegionCounts(
+class _CFFVariationStore {
+  final List<List<(double, double, double)>> regions;
+  final List<List<int>> regionIndices;
+
+  const _CFFVariationStore(this.regions, this.regionIndices);
+
+  List<List<double>> scalars(List<double> coordinates) => <List<double>>[
+        for (final indices in regionIndices)
+          <double>[
+            for (final index in indices) _scalar(regions[index], coordinates)
+          ]
+      ];
+
+  static double _scalar(
+      List<(double, double, double)> axes, List<double> coordinates) {
+    var result = 1.0;
+    for (var axis = 0; axis < axes.length; axis++) {
+      final (start, peak, end) = axes[axis];
+      final coordinate =
+          axis < coordinates.length ? coordinates[axis].clamp(-1.0, 1.0) : 0.0;
+      if (peak == 0 || start > peak || peak > end) continue;
+      if (coordinate < start || coordinate > end) return 0;
+      if (coordinate == peak) continue;
+      if (coordinate < peak) {
+        if (peak == start) continue;
+        result *= (coordinate - start) / (peak - start);
+      } else {
+        if (peak == end) continue;
+        result *= (end - coordinate) / (end - peak);
+      }
+    }
+    return result;
+  }
+}
+
+_CFFVariationStore? _parseVariationStore(
     ByteData view, int cffOffset, int cffEnd, Map<int, List<double>> topDict) {
   final operands = topDict[_CFFOp.vstore];
-  if (operands == null || operands.isEmpty) return const <int>[0];
+  if (operands == null || operands.isEmpty) return null;
   final start = cffOffset + operands.last.toInt();
-  if (start < cffOffset || start + 8 > cffEnd) return const <int>[];
-  if (view.getUint16(start, Endian.big) != 1) return const <int>[];
+  if (start < cffOffset || start + 8 > cffEnd) return null;
+  if (view.getUint16(start, Endian.big) != 1) return null;
+  final regionListOffset = view.getUint32(start + 2, Endian.big);
   final count = view.getUint16(start + 6, Endian.big);
-  if (count == 0 || start + 8 + count * 4 > cffEnd) return const <int>[];
-  final result = <int>[];
+  if (count == 0 || start + 8 + count * 4 > cffEnd) return null;
+  final regionIndices = <List<int>>[];
   for (var i = 0; i < count; i++) {
     final relative = view.getUint32(start + 8 + i * 4, Endian.big);
     final data = start + relative;
-    if (data < start || data + 6 > cffEnd) return const <int>[];
-    result.add(view.getUint16(data + 4, Endian.big));
+    if (data < start || data + 6 > cffEnd) return null;
+    final regionCount = view.getUint16(data + 4, Endian.big);
+    if (data + 6 + regionCount * 2 > cffEnd) return null;
+    regionIndices.add(<int>[
+      for (var j = 0; j < regionCount; j++)
+        view.getUint16(data + 6 + j * 2, Endian.big)
+    ]);
   }
-  return List<int>.unmodifiable(result);
+  final regionList = start + regionListOffset;
+  if (regionList < start || regionList + 4 > cffEnd) return null;
+  final axisCount = view.getUint16(regionList, Endian.big);
+  final regionCount = view.getUint16(regionList + 2, Endian.big);
+  final bytes = axisCount * regionCount * 6;
+  if (regionList + 4 + bytes > cffEnd) return null;
+  final regions = <List<(double, double, double)>>[];
+  var at = regionList + 4;
+  for (var region = 0; region < regionCount; region++) {
+    final axes = <(double, double, double)>[];
+    for (var axis = 0; axis < axisCount; axis++) {
+      double fixed(int offset) => view.getInt16(offset, Endian.big) / 16384.0;
+      axes.add((fixed(at), fixed(at + 2), fixed(at + 4)));
+      at += 6;
+    }
+    regions.add(axes);
+  }
+  if (regionIndices.any((set) => set.any((index) => index >= regions.length))) {
+    return null;
+  }
+  return _CFFVariationStore(regions, regionIndices);
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,6 +1333,7 @@ class BLCFFDecoder {
     int glyphId, {
     double scaleX = 1.0,
     double scaleY = 1.0,
+    List<double> variationCoordinates = const <double>[],
   }) {
     final cff = _CFFStructure.parse(view, cffOffset, cffLength);
     if (cff == null) return null;
@@ -1286,7 +1353,8 @@ class BLCFFDecoder {
       0,
       localSubrs: cff.localSubrsForGlyph(glyphId),
       globalSubrs: cff.globalSubrs,
-      variationRegionCounts: cff.variationRegionCounts,
+      variationScalars: cff.variationStore?.scalars(variationCoordinates) ??
+          const <List<double>>[<double>[]],
     );
     if (!ok) return null;
 
